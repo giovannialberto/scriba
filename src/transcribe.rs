@@ -109,23 +109,10 @@ async fn show_transcription_typing_effect(text: &str) {
         lines.push(current_line);
     }
     
-    // Show each line with typing effect
-    for line in lines {
-        print!("│ ");
-        stdout().flush().unwrap();
-        
-        for char in line.chars() {
-            print!("{}", char);
-            stdout().flush().unwrap();
-            sleep(Duration::from_millis(20)).await;
-        }
-        
-        // Add padding to reach the box width using Unicode-aware width calculation
-        let line_width = line.width();
-        let padding = CONTENT_WIDTH - line_width;
-        print!("{} │", " ".repeat(padding));
-        println!();
-    }
+    // Show completion message without typewriter delay
+    println!("│ ✅ Transcription completed successfully!{} │", " ".repeat(CONTENT_WIDTH - 37));
+    println!("│{} │", " ".repeat(CONTENT_WIDTH));
+    println!("│ 📋 Use 'D' in dashboard to view, copy, and manage transcripts{} │", " ".repeat(CONTENT_WIDTH - 57));
     
     println!("╰────────────────────────────────────────────────────────╯");
 }

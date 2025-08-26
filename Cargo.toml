@@ -1,6 +1,6 @@
 [package]
 name = "scriba"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 description = "A simple CLI tool for recording and transcribing audio using OpenAI's Whisper API"
 authors = ["Giovanni Alberto Falcione"]
