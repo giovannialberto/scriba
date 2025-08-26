@@ -42,6 +42,7 @@ pub struct Dashboard {
     message: String,
     show_transcript: bool,
     transcript_content: String,
+    transcript_scroll_offset: usize,
     show_delete_confirm: bool,
     delete_candidate: Option<Recording>,
     current_playback_pid: Option<u32>,
@@ -83,6 +84,7 @@ impl Dashboard {
             message: String::new(),
             show_transcript: false,
             transcript_content: String::new(),
+            transcript_scroll_offset: 0,
             show_delete_confirm: false,
             delete_candidate: None,
             current_playback_pid: None,
@@ -166,9 +168,7 @@ impl Dashboard {
         }
 
         if self.show_transcript {
-            self.show_transcript = false;
-            self.transcript_content.clear();
-            return Ok(DashboardAction::Continue);
+            return self.handle_transcript_keys(key_code).await;
         }
 
         if self.show_delete_confirm {
@@ -537,6 +537,63 @@ impl Dashboard {
         }
     }
 
+    async fn handle_transcript_keys(&mut self, key_code: KeyCode) -> Result<DashboardAction> {
+        match key_code {
+            KeyCode::Up => {
+                // Scroll up (decrease offset)
+                if self.transcript_scroll_offset > 0 {
+                    self.transcript_scroll_offset = self.transcript_scroll_offset.saturating_sub(1);
+                }
+                Ok(DashboardAction::Continue)
+            },
+            KeyCode::Down => {
+                // Scroll down (increase offset)
+                let lines: Vec<&str> = self.transcript_content.lines().collect();
+                if self.transcript_scroll_offset + 20 < lines.len() { // Leave some buffer for display
+                    self.transcript_scroll_offset += 1;
+                }
+                Ok(DashboardAction::Continue)
+            },
+            KeyCode::Char('c') | KeyCode::Char('C') => {
+                // Copy transcript to clipboard
+                match self.copy_transcript_to_clipboard() {
+                    Ok(()) => {
+                        self.message = "📋 Transcript copied to clipboard!".to_string();
+                        self.show_message = true;
+                    },
+                    Err(e) => {
+                        self.message = format!("❌ Failed to copy to clipboard: {}", e);
+                        self.show_message = true;
+                    }
+                }
+                Ok(DashboardAction::Continue)
+            },
+            KeyCode::PageUp => {
+                // Page up (scroll up by larger amount)
+                self.transcript_scroll_offset = self.transcript_scroll_offset.saturating_sub(10);
+                Ok(DashboardAction::Continue)
+            },
+            KeyCode::PageDown => {
+                // Page down (scroll down by larger amount)
+                let lines: Vec<&str> = self.transcript_content.lines().collect();
+                if self.transcript_scroll_offset + 20 < lines.len() {
+                    self.transcript_scroll_offset = std::cmp::min(
+                        self.transcript_scroll_offset + 10,
+                        lines.len().saturating_sub(20)
+                    );
+                }
+                Ok(DashboardAction::Continue)
+            },
+            _ => {
+                // Any other key closes the transcript
+                self.show_transcript = false;
+                self.transcript_content.clear();
+                self.transcript_scroll_offset = 0;
+                Ok(DashboardAction::Continue)
+            }
+        }
+    }
+
     async fn handle_delete_confirmation(&mut self, key_code: KeyCode) -> Result<DashboardAction> {
         match key_code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
@@ -616,6 +673,18 @@ impl Dashboard {
         } else {
             Err(anyhow::anyhow!("Transcript file not found"))
         }
+    }
+
+    fn copy_transcript_to_clipboard(&self) -> Result<()> {
+        use arboard::Clipboard;
+        
+        let mut clipboard = Clipboard::new()
+            .context("Failed to access clipboard")?;
+        
+        clipboard.set_text(&self.transcript_content)
+            .context("Failed to copy text to clipboard")?;
+        
+        Ok(())
     }
 
     fn ui(&mut self, f: &mut Frame) {
@@ -852,6 +921,12 @@ impl Dashboard {
             Line::from("  H/F1       - Show this help"),
             Line::from("  Q/Esc      - Quit"),
             Line::from(""),
+            Line::from("Transcript Viewer:"),
+            Line::from("  ↑/↓        - Scroll up/down"),
+            Line::from("  PgUp/PgDn  - Page up/down"),
+            Line::from("  C          - Copy transcript to clipboard"),
+            Line::from("  ESC        - Close transcript"),
+            Line::from(""),
             Line::from("Features:"),
             Line::from("  • Statistics always visible at bottom"),
             Line::from("  • Full-text search through transcripts"),
@@ -929,13 +1004,37 @@ impl Dashboard {
 
         f.render_widget(Clear, popup_area);
 
-        let para = Paragraph::new(self.transcript_content.clone())
+        // Calculate available height for content (subtract borders)
+        let content_height = popup_area.height.saturating_sub(2) as usize;
+        
+        // Split transcript into lines and handle scrolling
+        let lines: Vec<&str> = self.transcript_content.lines().collect();
+        let total_lines = lines.len();
+        
+        let visible_lines = if total_lines > content_height {
+            let start = std::cmp::min(self.transcript_scroll_offset, total_lines.saturating_sub(content_height));
+            let end = std::cmp::min(start + content_height, total_lines);
+            lines[start..end].join("\n")
+        } else {
+            self.transcript_content.clone()
+        };
+        
+        // Create title with scroll info and controls
+        let scroll_info = if total_lines > content_height {
+            format!("📝 Transcript [{}/{}] - ↑↓/PgUp/PgDn: scroll, C: copy, ESC: close", 
+                   self.transcript_scroll_offset + 1, 
+                   total_lines.saturating_sub(content_height) + 1)
+        } else {
+            "📝 Transcript - C: copy, ESC: close".to_string()
+        };
+        
+        let para = Paragraph::new(visible_lines)
             .style(Style::default().fg(Color::White))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .style(Style::default().fg(Color::Cyan))
-                    .title("📝 Transcript (press any key to close)")
+                    .title(scroll_info)
             )
             .wrap(Wrap { trim: true });
 
