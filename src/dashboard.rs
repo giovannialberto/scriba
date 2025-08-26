@@ -547,9 +547,12 @@ impl Dashboard {
                 Ok(DashboardAction::Continue)
             },
             KeyCode::Down => {
-                // Scroll down (increase offset)
-                let lines: Vec<&str> = self.transcript_content.lines().collect();
-                if self.transcript_scroll_offset + 20 < lines.len() { // Leave some buffer for display
+                // Scroll down (increase offset) 
+                let content_width = 120; // Conservative estimate for terminal width
+                let content_height = 25; // Conservative estimate for terminal height
+                let wrapped_lines = self.wrap_text_to_lines(&self.transcript_content, content_width);
+                let max_scroll = wrapped_lines.len().saturating_sub(content_height);
+                if self.transcript_scroll_offset < max_scroll {
                     self.transcript_scroll_offset += 1;
                 }
                 Ok(DashboardAction::Continue)
@@ -575,13 +578,65 @@ impl Dashboard {
             },
             KeyCode::PageDown => {
                 // Page down (scroll down by larger amount)
-                let lines: Vec<&str> = self.transcript_content.lines().collect();
-                if self.transcript_scroll_offset + 20 < lines.len() {
-                    self.transcript_scroll_offset = std::cmp::min(
-                        self.transcript_scroll_offset + 10,
-                        lines.len().saturating_sub(20)
-                    );
+                let content_width = 120; // Conservative estimate for terminal width
+                let content_height = 25; // Conservative estimate for terminal height
+                let wrapped_lines = self.wrap_text_to_lines(&self.transcript_content, content_width);
+                let max_offset = wrapped_lines.len().saturating_sub(content_height);
+                self.transcript_scroll_offset = std::cmp::min(
+                    self.transcript_scroll_offset + 10,
+                    max_offset
+                );
+                Ok(DashboardAction::Continue)
+            },
+            KeyCode::Home => {
+                // Jump to top of transcript
+                self.transcript_scroll_offset = 0;
+                Ok(DashboardAction::Continue)
+            },
+            KeyCode::End => {
+                // Jump to bottom of transcript
+                let content_width = 120; // Conservative estimate for terminal width
+                let content_height = 25; // Conservative estimate for terminal height
+                let wrapped_lines = self.wrap_text_to_lines(&self.transcript_content, content_width);
+                if wrapped_lines.len() > content_height {
+                    self.transcript_scroll_offset = wrapped_lines.len().saturating_sub(content_height);
+                } else {
+                    self.transcript_scroll_offset = 0;
                 }
+                Ok(DashboardAction::Continue)
+            },
+            KeyCode::Char('g') => {
+                // Jump to top of transcript (vim-style, alternative to Home)
+                self.transcript_scroll_offset = 0;
+                Ok(DashboardAction::Continue)
+            },
+            KeyCode::Char('G') => {
+                // Jump to bottom of transcript (vim-style, alternative to End)
+                let content_width = 120; // Conservative estimate for terminal width
+                let content_height = 25; // Conservative estimate for terminal height
+                let wrapped_lines = self.wrap_text_to_lines(&self.transcript_content, content_width);
+                if wrapped_lines.len() > content_height {
+                    self.transcript_scroll_offset = wrapped_lines.len().saturating_sub(content_height);
+                } else {
+                    self.transcript_scroll_offset = 0;
+                }
+                Ok(DashboardAction::Continue)
+            },
+            KeyCode::Char('b') => {
+                // Page up (vim-style, alternative to PageUp)
+                self.transcript_scroll_offset = self.transcript_scroll_offset.saturating_sub(10);
+                Ok(DashboardAction::Continue)
+            },
+            KeyCode::Char('f') => {
+                // Page down (vim-style, alternative to PageDown)
+                let content_width = 120; // Conservative estimate for terminal width
+                let content_height = 25; // Conservative estimate for terminal height
+                let wrapped_lines = self.wrap_text_to_lines(&self.transcript_content, content_width);
+                let max_offset = wrapped_lines.len().saturating_sub(content_height);
+                self.transcript_scroll_offset = std::cmp::min(
+                    self.transcript_scroll_offset + 10,
+                    max_offset
+                );
                 Ok(DashboardAction::Continue)
             },
             _ => {
@@ -673,6 +728,91 @@ impl Dashboard {
         } else {
             Err(anyhow::anyhow!("Transcript file not found"))
         }
+    }
+
+    fn wrap_text_to_lines(&self, text: &str, max_width: usize) -> Vec<String> {
+        let mut result = Vec::new();
+        
+        for line in text.lines() {
+            if line.len() <= max_width {
+                result.push(line.to_string());
+            } else {
+                // Split long lines into multiple wrapped lines
+                let words: Vec<&str> = line.split_whitespace().collect();
+                let mut current_line = String::new();
+                
+                for word in words {
+                    if word.len() > max_width {
+                        // Handle extremely long words by character breaking
+                        if !current_line.is_empty() {
+                            result.push(current_line);
+                            current_line = String::new();
+                        }
+                        
+                        let chars: Vec<char> = word.chars().collect();
+                        for chunk in chars.chunks(max_width) {
+                            result.push(chunk.iter().collect());
+                        }
+                    } else {
+                        let test_line = if current_line.is_empty() {
+                            word.to_string()
+                        } else {
+                            format!("{} {}", current_line, word)
+                        };
+                        
+                        if test_line.len() <= max_width {
+                            current_line = test_line;
+                        } else {
+                            result.push(current_line);
+                            current_line = word.to_string();
+                        }
+                    }
+                }
+                
+                if !current_line.is_empty() {
+                    result.push(current_line);
+                }
+            }
+        }
+        
+        // Handle edge case where text has no newlines at all
+        if result.is_empty() && !text.is_empty() {
+            let words: Vec<&str> = text.split_whitespace().collect();
+            let mut current_line = String::new();
+            
+            for word in words {
+                if word.len() > max_width {
+                    if !current_line.is_empty() {
+                        result.push(current_line);
+                        current_line = String::new();
+                    }
+                    
+                    let chars: Vec<char> = word.chars().collect();
+                    for chunk in chars.chunks(max_width) {
+                        result.push(chunk.iter().collect());
+                    }
+                } else {
+                    let test_line = if current_line.is_empty() {
+                        word.to_string()
+                    } else {
+                        format!("{} {}", current_line, word)
+                    };
+                    
+                    if test_line.len() <= max_width {
+                        current_line = test_line;
+                    } else {
+                        result.push(current_line);
+                        current_line = word.to_string();
+                    }
+                }
+            }
+            
+            if !current_line.is_empty() {
+                result.push(current_line);
+            }
+        }
+        
+        result
     }
 
     fn copy_transcript_to_clipboard(&self) -> Result<()> {
@@ -923,7 +1063,8 @@ impl Dashboard {
             Line::from(""),
             Line::from("Transcript Viewer:"),
             Line::from("  ↑/↓        - Scroll up/down"),
-            Line::from("  PgUp/PgDn  - Page up/down"),
+            Line::from("  PgUp/PgDn  - Page up/down (or 'b'/'f')"),
+            Line::from("  Home/End   - Jump to top/bottom (or 'g'/'G')"),
             Line::from("  C          - Copy transcript to clipboard"),
             Line::from("  ESC        - Close transcript"),
             Line::from(""),
@@ -1004,31 +1145,30 @@ impl Dashboard {
 
         f.render_widget(Clear, popup_area);
 
-        // Calculate available height for content (subtract borders)
+        // Calculate available height and width for content (subtract borders)
         let content_height = popup_area.height.saturating_sub(2) as usize;
+        let content_width = popup_area.width.saturating_sub(4) as usize; // Account for borders and padding
         
-        // Split transcript into lines and handle scrolling
-        let lines: Vec<&str> = self.transcript_content.lines().collect();
-        let total_lines = lines.len();
+        // Handle text wrapping for very long lines
+        let wrapped_lines = self.wrap_text_to_lines(&self.transcript_content, content_width);
+        let total_lines = wrapped_lines.len();
         
-        let visible_lines = if total_lines > content_height {
-            let start = std::cmp::min(self.transcript_scroll_offset, total_lines.saturating_sub(content_height));
-            let end = std::cmp::min(start + content_height, total_lines);
-            lines[start..end].join("\n")
+        // Create scrollable content
+        let (visible_content, scroll_info) = if total_lines > content_height {
+            let max_scroll = total_lines.saturating_sub(content_height);
+            let actual_offset = std::cmp::min(self.transcript_scroll_offset, max_scroll);
+            let end = std::cmp::min(actual_offset + content_height, total_lines);
+            
+            let visible_lines = wrapped_lines[actual_offset..end].join("\n");
+            let scroll_info = format!("📝 Transcript [Line {}/{}] - ↑↓/b/f/g/G: scroll, C: copy, ESC: close", 
+                                    actual_offset + 1, 
+                                    total_lines);
+            (visible_lines, scroll_info)
         } else {
-            self.transcript_content.clone()
+            (self.transcript_content.clone(), "📝 Transcript - C: copy, ESC: close".to_string())
         };
         
-        // Create title with scroll info and controls
-        let scroll_info = if total_lines > content_height {
-            format!("📝 Transcript [{}/{}] - ↑↓/PgUp/PgDn: scroll, C: copy, ESC: close", 
-                   self.transcript_scroll_offset + 1, 
-                   total_lines.saturating_sub(content_height) + 1)
-        } else {
-            "📝 Transcript - C: copy, ESC: close".to_string()
-        };
-        
-        let para = Paragraph::new(visible_lines)
+        let para = Paragraph::new(visible_content)
             .style(Style::default().fg(Color::White))
             .block(
                 Block::default()
@@ -1036,7 +1176,7 @@ impl Dashboard {
                     .style(Style::default().fg(Color::Cyan))
                     .title(scroll_info)
             )
-            .wrap(Wrap { trim: true });
+            .scroll((0, 0)); // Disable internal scrolling and wrapping since we handle it manually
 
         f.render_widget(para, popup_area);
     }
