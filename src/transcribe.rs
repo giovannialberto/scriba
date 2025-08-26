@@ -131,16 +131,42 @@ pub async fn transcribe_file(
     output_path: &PathBuf,
     api_key: &str,
 ) -> Result<(), anyhow::Error> {
-    // Find the audio file (could be WAV or MP3)
-    let recording_dir = BASE_PATH.join(input_path);
-    let (audio_file_path, filename) = if recording_dir.join("recording.mp3").exists() {
-        let path = recording_dir.join("recording.mp3");
-        (path, "recording.mp3".to_string())
-    } else if recording_dir.join("recording.wav").exists() {
-        let path = recording_dir.join("recording.wav");
-        (path, "recording.wav".to_string())
+    // Find the audio file - handle both directory names and full file paths
+    let (audio_file_path, filename) = if input_path.is_absolute() {
+        // User provided an absolute path - use it directly
+        if input_path.exists() {
+            let filename = input_path.file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+            (input_path.clone(), filename)
+        } else {
+            return Err(anyhow::anyhow!("Audio file not found: {}", input_path.display()));
+        }
+    } else if input_path.extension().is_some() {
+        // User provided a relative path with file extension (like "dir/recording.wav")
+        let full_path = BASE_PATH.join(input_path);
+        if full_path.exists() {
+            let filename = input_path.file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+            (full_path, filename)
+        } else {
+            return Err(anyhow::anyhow!("Audio file not found: {}", full_path.display()));
+        }
     } else {
-        return Err(anyhow::anyhow!("No audio file found (recording.wav or recording.mp3) in {}", recording_dir.display()));
+        // User provided just a directory name - look for recording.mp3 or recording.wav inside it
+        let recording_dir = BASE_PATH.join(input_path);
+        if recording_dir.join("recording.mp3").exists() {
+            let path = recording_dir.join("recording.mp3");
+            (path, "recording.mp3".to_string())
+        } else if recording_dir.join("recording.wav").exists() {
+            let path = recording_dir.join("recording.wav");
+            (path, "recording.wav".to_string())
+        } else {
+            return Err(anyhow::anyhow!("No audio file found (recording.wav or recording.mp3) in {}", recording_dir.display()));
+        }
     };
     
     let audio_file = std::fs::read(&audio_file_path)
