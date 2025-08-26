@@ -217,13 +217,10 @@ pub async fn transcribe_file(
         let json: Value = serde_json::from_str(&text)?;
         let transcription_text = json["text"].as_str().unwrap_or(&text);
 
-        // Save the transcript to the specified or default file
-        let transcript_file_path = BASE_PATH.join(output_path).join("transcript.txt");
-        
-        // Ensure the directory exists
-        if let Some(parent) = transcript_file_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        // Store transcript in same folder as the audio file
+        let audio_dir = audio_file_path.parent()
+            .context("Could not determine audio file directory")?;
+        let transcript_file_path = audio_dir.join("transcript.txt");
         
         let transcript_file = File::create(&transcript_file_path)?;
         let mut transcript_writer = BufWriter::new(transcript_file);
@@ -235,14 +232,17 @@ pub async fn transcribe_file(
         // Show the transcription with typing effect
         show_transcription_typing_effect(transcription_text).await;
 
-        println!("\n📁 Transcript saved to: ~/scriba_recordings/{}/transcript.txt", output_path.display());
+        println!("\n📁 Transcript saved to: {}", transcript_file_path.display());
 
-        // Save transcript to database
+        // Save transcript to database and link to existing recording
         let mut db = Database::new().context("Failed to connect to database")?;
         
-        // Find the recording by directory name
-        let directory_name = output_path.to_string_lossy().to_string();
-        match db.get_recording_by_directory(&directory_name) {
+        // Find the recording by looking for the directory name that contains this audio file
+        let directory_name = audio_dir.file_name()
+            .and_then(|name| name.to_str())
+            .context("Could not determine directory name")?;
+            
+        match db.get_recording_by_directory(directory_name) {
             Ok(Some(recording)) => {
                 if let Some(recording_id) = recording.id {
                     // Create transcript record
