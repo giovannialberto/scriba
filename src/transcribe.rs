@@ -111,13 +111,15 @@ async fn show_transcription_typing_effect(text: &str) {
     
     // Show completion message without typewriter delay
     let success_msg = "✅ Transcription completed successfully!";
-    let success_padding = CONTENT_WIDTH.saturating_sub(success_msg.len());
+    let success_width = success_msg.width();
+    let success_padding = CONTENT_WIDTH.saturating_sub(success_width);
     println!("│ {}{} │", success_msg, " ".repeat(success_padding));
     
-    println!("│{} │", " ".repeat(CONTENT_WIDTH));
+    println!("│{}  │", " ".repeat(CONTENT_WIDTH));
     
     let dashboard_msg = "📋 Use dashboard to view and copy transcripts";
-    let dashboard_padding = CONTENT_WIDTH.saturating_sub(dashboard_msg.len());
+    let dashboard_width = dashboard_msg.width();
+    let dashboard_padding = CONTENT_WIDTH.saturating_sub(dashboard_width);
     println!("│ {}{} │", dashboard_msg, " ".repeat(dashboard_padding));
     
     println!("╰────────────────────────────────────────────────────────╯");
