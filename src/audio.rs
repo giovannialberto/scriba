@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use anyhow::{Result, Context};
 use serde::{Deserialize, Serialize};
 
@@ -203,8 +203,6 @@ pub fn convert_wav_to_mp3(
     let sample_rate = settings.sample_rate;
     let channels = if settings.channels == 1 { "mono" } else { "stereo" };
     
-    println!("🔄 Converting to MP3 ({} kbps, {} Hz, {})...", bitrate, sample_rate, channels);
-    
     // Use ffmpeg for reliable, high-quality MP3 conversion
     let output = std::process::Command::new("ffmpeg")
         .arg("-i").arg(wav_path)
@@ -222,17 +220,7 @@ pub fn convert_wav_to_mp3(
         return Err(anyhow::anyhow!("FFmpeg conversion failed: {}", error_msg));
     }
     
-    println!("✅ Converted {} to {}", 
-             wav_path.file_name().unwrap().to_string_lossy(),
-             mp3_path.file_name().unwrap().to_string_lossy());
-    
-    // Show compression statistics
-    let wav_size = std::fs::metadata(wav_path)?.len();
-    let mp3_size = std::fs::metadata(mp3_path)?.len();
-    let reduction = (1.0 - (mp3_size as f64 / wav_size as f64)) * 100.0;
-    
-    println!("📊 Compression: {} bytes → {} bytes ({:.1}% reduction)",
-             wav_size, mp3_size, reduction);
+    // Conversion completed silently
     
     Ok(())
 }

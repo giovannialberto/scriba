@@ -250,10 +250,29 @@ async fn interactive_mode() -> Result<()> {
 async fn main() -> Result<()> {
     let cli = Cli::from_args();
 
-    // If no command is provided, start interactive mode
+    // If no command is provided, launch dashboard directly
     let result = match cli.command {
         None => {
-            interactive_mode().await
+            // Load environment variables from .env file
+            dotenv::dotenv().ok();
+            
+            // Show ASCII art banner
+            print_banner();
+            
+            // Launch dashboard directly
+            println!("\n╭─ SCRIBA DASHBOARD ─────────────────────────────────────╮");
+            println!("│ Launching dashboard interface...                       │");
+            println!("╰───────────────────────────────────────────────────────╯\n");
+            
+            match Dashboard::new() {
+                Ok(mut dashboard) => {
+                    dashboard.run().await
+                }
+                Err(err) => {
+                    eprintln!("❌ Failed to open dashboard: {err}");
+                    Err(err)
+                }
+            }
         }
         Some(command) => {
             // Load environment variables for CLI mode

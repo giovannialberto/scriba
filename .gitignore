@@ -46,3 +46,4 @@ sample_*.mp3
 
 # Claude/LLM artifacts
 /.claude
+AGENTS.md
