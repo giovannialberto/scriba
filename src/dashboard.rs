@@ -1,7 +1,8 @@
 use crate::database::{Database, Recording, RecordingStats};
-use crate::record::record;
+use crate::record::record_with_control;
 use crate::transcribe::{transcribe_file, transcribe_file_silent};
 use crate::audio::CompressionSettings;
+use tokio::sync::mpsc;
 use anyhow::Result;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
@@ -20,10 +21,17 @@ use ratatui::{
 };
 use std::env;
 use std::io::{self, Write};
+
+const ASCII_ART: &str = r#" ███████  ██████ ██████  ██ ██████   █████  
+██      ██      ██   ██ ██ ██   ██ ██   ██ 
+███████ ██      ██████  ██ ██████  ███████ 
+     ██ ██      ██   ██ ██ ██   ██ ██   ██ 
+███████  ██████ ██   ██ ██ ██████  ██   ██"#;
 use std::path::PathBuf;
 use std::time::Duration;
 use chrono::Local;
 use tokio::process::Command as TokioCommand;
+use std::process::Stdio;
 use dirs::home_dir;
 use anyhow::Context;
 
@@ -46,16 +54,28 @@ pub struct Dashboard {
     show_delete_confirm: bool,
     delete_candidate: Option<Recording>,
     current_playback_pid: Option<u32>,
+    playback_finished_rx: Option<mpsc::Receiver<()>>, // Channel to receive playback completion
     last_transcribe_warning: Option<usize>, // Track which recording showed overwrite warning
     progress_animation: Option<String>, // Base message for progress animation
     progress_frame: usize, // Animation frame counter
     transcription_task: Option<tokio::task::JoinHandle<Result<(), anyhow::Error>>>, // Background transcription task
+    recording_task: Option<tokio::task::JoinHandle<Result<String, anyhow::Error>>>, // Background recording task (returns recording name)
+    recording_mode: Option<RecordingMode>, // Track if we should transcribe after recording
+    recording_stop_tx: Option<mpsc::Sender<()>>, // Channel to stop recording
+    recording_level_rx: Option<mpsc::Receiver<f32>>, // Channel to receive volume levels
+    current_volume_level: f32, // Current recording volume for display
 }
 
 #[derive(Debug, PartialEq)]
 enum DashboardView {
     Main,
     Help,
+}
+
+#[derive(Debug, Clone)]
+enum RecordingMode {
+    RecordOnly,
+    RecordAndTranscribe,
 }
 
 #[derive(Debug)]
@@ -93,10 +113,16 @@ impl Dashboard {
             show_delete_confirm: false,
             delete_candidate: None,
             current_playback_pid: None,
+            playback_finished_rx: None,
             last_transcribe_warning: None,
             progress_animation: None,
             progress_frame: 0,
             transcription_task: None,
+            recording_task: None,
+            recording_mode: None,
+            recording_stop_tx: None,
+            recording_level_rx: None,
+            current_volume_level: 0.0,
         })
     }
 
@@ -128,6 +154,70 @@ impl Dashboard {
 
     async fn run_app<B: ratatui::backend::Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
         loop {
+            // Check if recording task completed
+            if let Some(task) = &mut self.recording_task {
+                if task.is_finished() {
+                    let completed_task = self.recording_task.take().unwrap();
+                    let recording_mode = self.recording_mode.take();
+                    
+                    // Clean up channels
+                    self.recording_stop_tx = None;
+                    self.recording_level_rx = None;
+                    self.current_volume_level = 0.0;
+                    
+                    match completed_task.await {
+                        Ok(Ok(recording_name)) => {
+                            // Recording completed successfully
+                            if let Some(RecordingMode::RecordAndTranscribe) = recording_mode {
+                                // Start transcription phase
+                                let api_key = match std::env::var("OPENAI_API_KEY") {
+                                    Ok(key) => key,
+                                    Err(_) => {
+                                        self.stop_progress_animation();
+                                        self.message = "❌ OPENAI_API_KEY required for transcription".to_string();
+                                        self.show_message = true;
+                                        // Reload data to show new recording
+                                        let _ = self.load_recordings();
+                                        let _ = self.load_stats();
+                                        continue;
+                                    }
+                                };
+                                
+                                // Update progress message for transcription phase
+                                self.progress_animation = Some("📝 Transcribing recording".to_string());
+                                self.progress_frame = 0;
+                                
+                                // Start transcription
+                                let input_path = PathBuf::from(&recording_name);
+                                let api_key_clone = api_key.clone();
+                                let input_path_clone = input_path.clone();
+                                self.transcription_task = Some(tokio::spawn(async move {
+                                    transcribe_file_silent(&input_path_clone, &api_key_clone).await
+                                }));
+                            } else {
+                                // Recording only mode - complete
+                                self.stop_progress_animation();
+                                self.message = "✅ Recording complete!".to_string();
+                                self.show_message = true;
+                                // Reload data to show new recording
+                                let _ = self.load_recordings();
+                                let _ = self.load_stats();
+                            }
+                        }
+                        Ok(Err(err)) => {
+                            self.stop_progress_animation();
+                            self.message = format!("❌ Recording failed: {}", err);
+                            self.show_message = true;
+                        }
+                        Err(_) => {
+                            self.stop_progress_animation();
+                            self.message = "❌ Recording task failed".to_string();
+                            self.show_message = true;
+                        }
+                    }
+                }
+            }
+            
             // Check if transcription task completed
             if let Some(task) = &mut self.transcription_task {
                 if task.is_finished() {
@@ -135,7 +225,7 @@ impl Dashboard {
                     match completed_task.await {
                         Ok(Ok(())) => {
                             self.stop_progress_animation();
-                            self.message = "✅ Transcription complete!".to_string();
+                            self.message = "✅ Recording and transcription complete!".to_string();
                             self.show_message = true;
                             // Reload data to show new transcript
                             let _ = self.load_recordings();
@@ -152,6 +242,21 @@ impl Dashboard {
                             self.show_message = true;
                         }
                     }
+                }
+            }
+            
+            // Receive volume levels from recording
+            if let Some(level_rx) = &mut self.recording_level_rx {
+                if let Ok(level) = level_rx.try_recv() {
+                    self.current_volume_level = level;
+                }
+            }
+            
+            // Check for playback completion
+            if let Some(finished_rx) = &mut self.playback_finished_rx {
+                if finished_rx.try_recv().is_ok() {
+                    self.current_playback_pid = None;
+                    self.playback_finished_rx = None;
                 }
             }
             
@@ -182,19 +287,45 @@ impl Dashboard {
     }
 
     async fn handle_key_event(&mut self, key_code: KeyCode) -> Result<DashboardAction> {
-        // If audio is playing, any key press stops it
-        if let Some(pid) = self.current_playback_pid {
-            self.stop_audio_playback(pid)?;
-            self.current_playback_pid = None;
-            self.message = "🛑 Audio playback stopped".to_string();
-            self.show_message = true;
+        // If audio is playing and ESC is pressed, stop it immediately
+        if matches!(key_code, KeyCode::Esc) {
+            // Check if we're in audio playback mode (either with PID or with playback message)
+            let is_playing_audio = self.current_playback_pid.is_some() || 
+                                  (self.show_message && self.message.contains("Playing:"));
+            
+            if is_playing_audio {
+                // Try both methods to ensure reliable stopping
+                if let Some(pid) = self.current_playback_pid {
+                    self.stop_audio_playback(pid)?;
+                }
+                // Also use emergency stop as a fallback (in case PID method fails)
+                self.emergency_stop_all_audio_players()?;
+                
+                // Clear playback state
+                self.current_playback_pid = None;
+                self.playback_finished_rx = None;
+                self.show_message = false;
+                self.message.clear();
+                
+                // Audio playback stops immediately - return to dashboard
+                return Ok(DashboardAction::Continue);
+            }
+        }
+        
+        // If recording is active and Escape is pressed, stop recording
+        if self.recording_task.is_some() && matches!(key_code, KeyCode::Esc) {
+            // Send stop signal to recording task
+            if let Some(stop_tx) = self.recording_stop_tx.take() {
+                let _ = stop_tx.send(()).await;
+            }
+            // The recording task will handle cleanup and completion
             return Ok(DashboardAction::Continue);
         }
         
         if self.show_message {
             // Don't close message if progress animation is active
-            if self.progress_animation.is_none() {
-                // Any key press closes the message popup
+            if self.progress_animation.is_none() && matches!(key_code, KeyCode::Esc) {
+                // Only Esc key closes the message popup (consistent behavior)
                 self.show_message = false;
                 self.message.clear();
             }
@@ -463,6 +594,8 @@ impl Dashboard {
                 #[cfg(not(target_os = "windows"))]
                 for (prog, base_args) in candidates {
                     let mut cmd = TokioCommand::new(prog);
+                    // Detach from TTY so player doesn't consume keyboard (Esc) input
+                    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
                     
                     // For afplay on macOS, check if this is a mono WAV file and needs special handling
                     if prog == "afplay" && recording.channels == 1 && !is_mp3 {
@@ -482,15 +615,25 @@ impl Dashboard {
                         Ok(mut child) => { 
                             launched_with = Some(prog.to_string()); 
                             
-                            // Store child process for potential termination
-                            let child_id = child.id();
-                            tokio::spawn(async move {
-                                let _ = child.wait().await;
-                            });
-                            
-                            // Store the process ID for killing on key press
-                            self.current_playback_pid = child_id;
-                            break; 
+                            // Store child process for potential termination - ensure we have a valid PID
+                            if let Some(child_id) = child.id() {
+                                // Store the process ID for killing on key press immediately
+                                self.current_playback_pid = Some(child_id);
+                                
+                                // Create channel for playback completion notification
+                                let (finished_tx, finished_rx) = mpsc::channel(1);
+                                self.playback_finished_rx = Some(finished_rx);
+                                
+                                tokio::spawn(async move {
+                                    let _ = child.wait().await;
+                                    let _ = finished_tx.send(()).await;
+                                });
+                                break;
+                            } else {
+                                // If we can't get PID, we can't control the process
+                                launched_with = None;
+                                continue;
+                            }
                         }
                         Err(e) => { 
                             // Store error for debugging if no player works
@@ -506,10 +649,27 @@ impl Dashboard {
                     // Try standard players first (mpv, ffplay), then fallback to PowerShell
                     for (prog, base_args) in &candidates[..candidates.len()-1] { // All except powershell
                         let mut cmd = TokioCommand::new(prog);
+                        // Detach from TTY so player doesn't consume keyboard (Esc) input
+                        cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
                         for a in base_args { cmd.arg(a); }
                         cmd.arg(&audio_path);
                         match cmd.spawn() {
-                            Ok(_child) => { launched_with = Some(prog.to_string()); break; }
+                            Ok(mut child) => { 
+                                if let Some(child_id) = child.id() {
+                                    launched_with = Some(prog.to_string()); 
+                                    self.current_playback_pid = Some(child_id);
+                                    
+                                    // Create channel for playback completion notification
+                                    let (finished_tx, finished_rx) = mpsc::channel(1);
+                                    self.playback_finished_rx = Some(finished_rx);
+                                    
+                                    tokio::spawn(async move {
+                                        let _ = child.wait().await;
+                                        let _ = finished_tx.send(()).await;
+                                    });
+                                    break;
+                                }
+                            }
                             Err(_e) => continue,
                         }
                     }
@@ -521,13 +681,30 @@ impl Dashboard {
                             "$p=New-Object Media.SoundPlayer '{}';$p.Play();",
                             escaped
                         );
-                        match TokioCommand::new("powershell")
+                        let mut pscmd = TokioCommand::new("powershell");
+                        // Detach from TTY so player doesn't consume keyboard (Esc) input
+                        pscmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+                        match pscmd
                             .arg("-NoProfile")
                             .arg("-Command")
                             .arg(ps)
                             .spawn()
                         {
-                            Ok(_child) => { launched_with = Some("powershell".to_string()); }
+                            Ok(mut child) => { 
+                                if let Some(child_id) = child.id() {
+                                    launched_with = Some("powershell".to_string());
+                                    self.current_playback_pid = Some(child_id);
+                                    
+                                    // Create channel for playback completion notification
+                                    let (finished_tx, finished_rx) = mpsc::channel(1);
+                                    self.playback_finished_rx = Some(finished_rx);
+                                    
+                                    tokio::spawn(async move {
+                                        let _ = child.wait().await;
+                                        let _ = finished_tx.send(()).await;
+                                    });
+                                }
+                            }
                             Err(_e) => {}
                         }
                     }
@@ -538,7 +715,7 @@ impl Dashboard {
                         .display_name
                         .as_ref()
                         .unwrap_or(&recording.directory_name);
-                    self.message = format!("▶ Playing: {}\nUsing player: {}\n\n(Playback runs externally; return here when done.)", name, player);
+                    self.message = format!("▶ Playing: {}\nUsing player: {}\n\nPress ESC to stop playback", name, player);
                     self.show_message = true;
                     return Ok(());
                 }
@@ -686,11 +863,15 @@ impl Dashboard {
                 );
                 Ok(DashboardAction::Continue)
             },
-            _ => {
-                // Any other key closes the transcript
+            KeyCode::Esc => {
+                // Only Esc key closes the transcript (consistent behavior)
                 self.show_transcript = false;
                 self.transcript_content.clear();
                 self.transcript_scroll_offset = 0;
+                Ok(DashboardAction::Continue)
+            },
+            _ => {
+                // Other keys are ignored (consistent behavior)
                 Ok(DashboardAction::Continue)
             }
         }
@@ -903,7 +1084,7 @@ impl Dashboard {
         let main_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3),  // Header
+                Constraint::Length(8),  // Header (increased for ASCII art)
                 Constraint::Min(6),     // Recordings Table
                 Constraint::Length(4),  // Statistics
                 Constraint::Length(3),  // Footer
@@ -929,9 +1110,12 @@ impl Dashboard {
     }
 
     fn render_header(&self, f: &mut Frame, area: ratatui::layout::Rect) {
-        let header = Paragraph::new("🎵 SCRIBA - RECORDING LIBRARY WITH STATISTICS 🎵")
+        let header_text = format!("{}\n🎵 RECORDING ON STEROIDS 🎵", ASCII_ART);
+        
+        let header = Paragraph::new(header_text)
             .style(Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))
             .alignment(Alignment::Center)
+            .wrap(Wrap { trim: false })
             .block(
                 Block::default()
                     .borders(Borders::ALL)
@@ -1092,8 +1276,8 @@ impl Dashboard {
             Line::from("🎵 SCRIBA - RECORDING LIBRARY WITH STATISTICS HELP 🎵"),
             Line::from(""),
             Line::from("Quick Actions:"),
-            Line::from("  R          - Record Audio + Auto-Transcribe"),
-            Line::from("  A          - Record Audio Only"),
+            Line::from("  R          - Record Audio + Auto-Transcribe (Esc to stop)"),
+            Line::from("  A          - Record Audio Only (Esc to stop)"),
             Line::from("  T          - Transcribe Selected Recording"),
             Line::from(""),
             Line::from("Navigation:"),
@@ -1115,13 +1299,18 @@ impl Dashboard {
             Line::from("  C          - Copy transcript to clipboard"),
             Line::from("  ESC        - Close transcript"),
             Line::from(""),
+            Line::from("Recording Control:"),
+            Line::from("  • Press R/A to start recording immediately"),
+            Line::from("  • Press Esc during recording to stop and save"),
+            Line::from("  • Real-time progress indicators for all operations"),
+            Line::from(""),
             Line::from("Features:"),
             Line::from("  • Statistics always visible at bottom"),
             Line::from("  • Full-text search through transcripts"),
             Line::from("  • Integrated playback support"),
-            Line::from("  • Quick recording actions available"),
+            Line::from("  • Direct recording from dashboard"),
             Line::from(""),
-            Line::from("Press any key to continue..."),
+            Line::from("Press Esc to continue..."),
         ];
 
         let help_paragraph = Paragraph::new(help_text)
@@ -1164,7 +1353,7 @@ impl Dashboard {
                 Block::default()
                     .borders(Borders::ALL)
                     .style(Style::default().fg(Color::Red))
-                    .title("Message (press any key)")
+                    .title("Message (press Esc)")
             )
             .wrap(Wrap { trim: true });
 
@@ -1307,123 +1496,50 @@ impl Dashboard {
     }
 
     async fn execute_record_and_transcribe(&mut self) -> Result<()> {
-        // Temporarily restore terminal for input
-        disable_raw_mode()?;
-        
-        print!("\n📝 Enter recording name (optional, press Enter to skip): ");
-        io::stdout().flush()?;
-        let mut name_input = String::new();
-        io::stdin().read_line(&mut name_input)?;
-        let name_input = name_input.trim();
-        
-        let name = if name_input.is_empty() { None } else { Some(name_input.to_string()) };
-        
-        // Get API key
-        let api_key = match env::var("OPENAI_API_KEY") {
-            Ok(key) => key,
-            Err(_) => {
-                print!("🔑 Enter OpenAI API key: ");
-                io::stdout().flush()?;
-                let mut api_input = String::new();
-                io::stdin().read_line(&mut api_input)?;
-                api_input.trim().to_string()
-            }
-        };
-        
-        if api_key.is_empty() {
-            println!("❌ API key required for transcription. Operation cancelled.");
-            print!("Press Enter to continue...");
-            io::stdout().flush()?;
-            let mut _input = String::new();
-            io::stdin().read_line(&mut _input)?;
-            enable_raw_mode()?;
+        // Check if already recording or transcribing
+        if self.recording_task.is_some() || self.transcription_task.is_some() {
+            self.message = "⚠️ Recording or transcription already in progress".to_string();
+            self.show_message = true;
             return Ok(());
         }
         
-        println!("\n🎙️ Starting recording session...");
-        
-        // Generate filename
-        let recording_name = self.generate_filename(name);
-        let audio_output = PathBuf::from(&recording_name);
-        
-        // Record audio
-        // Use speech-optimized WAV compression (device adaptation happens in record function)
-        let compression_settings = CompressionSettings::speech_optimized();
-        let record_result = record(audio_output.clone(), Some(compression_settings)).await;
-        
-        if record_result.is_ok() {
-            println!("\n📝 Recording complete! Starting transcription...");
-            
-            match transcribe_file(&audio_output, &audio_output, &api_key).await {
-                Ok(()) => {
-                    println!("✅ Transcription complete!");
-                    println!("📁 Files saved in: ~/scriba_recordings/{}/", recording_name);
-                }
-                Err(err) => {
-                    println!("❌ Transcription failed: {}", err);
-                }
-            }
-        } else if let Err(err) = record_result {
-            println!("❌ Recording failed: {}", err);
+        // Check API key availability
+        if env::var("OPENAI_API_KEY").is_err() {
+            self.message = "⚠️ OPENAI_API_KEY environment variable not set".to_string();
+            self.show_message = true;
+            return Ok(());
         }
         
-        print!("\nPress Enter to continue...");
-        io::stdout().flush()?;
-        let mut _input = String::new();
-        io::stdin().read_line(&mut _input)?;
+        // Show immediate progress animation
+        self.progress_animation = Some("🎙️ Recording... (Press Esc to stop)".to_string());
+        self.progress_frame = 0;
+        self.show_message = true;
+        self.recording_mode = Some(RecordingMode::RecordAndTranscribe);
         
-        // Restore terminal for TUI
-        enable_raw_mode()?;
-        
-        // Reload dashboard data
-        self.load_recordings()?;
-        self.load_stats()?;
+        // Generate filename and start recording task (no name prompt, consistent with A command)
+        let recording_name = self.generate_filename(None);
+        self.start_recording_task(recording_name).await?;
         
         Ok(())
     }
     
     async fn execute_record_only(&mut self) -> Result<()> {
-        // Temporarily restore terminal for input
-        disable_raw_mode()?;
-        
-        print!("\n📝 Enter recording name (optional, press Enter to skip): ");
-        io::stdout().flush()?;
-        let mut name_input = String::new();
-        io::stdin().read_line(&mut name_input)?;
-        let name_input = name_input.trim();
-        
-        let name = if name_input.is_empty() { None } else { Some(name_input.to_string()) };
-        
-        println!("\n🔴 Starting recording session...");
-        
-        // Generate filename
-        let recording_name = self.generate_filename(name);
-        let audio_output = PathBuf::from(&recording_name);
-        
-        // Record audio
-        // Use speech-optimized WAV compression (device adaptation happens in record function)
-        let compression_settings = CompressionSettings::speech_optimized();
-        match record(audio_output, Some(compression_settings)).await {
-            Ok(()) => {
-                println!("✅ Recording complete!");
-                println!("📁 File saved in: ~/scriba_recordings/{}/", recording_name);
-            }
-            Err(err) => {
-                println!("❌ Recording failed: {}", err);
-            }
+        // Check if already recording or transcribing
+        if self.recording_task.is_some() || self.transcription_task.is_some() {
+            self.message = "⚠️ Recording or transcription already in progress".to_string();
+            self.show_message = true;
+            return Ok(());
         }
         
-        print!("\nPress Enter to continue...");
-        io::stdout().flush()?;
-        let mut _input = String::new();
-        io::stdin().read_line(&mut _input)?;
+        // Show immediate progress animation
+        self.progress_animation = Some("🎙️ Recording... (Press Esc to stop)".to_string());
+        self.progress_frame = 0;
+        self.show_message = true;
+        self.recording_mode = Some(RecordingMode::RecordOnly);
         
-        // Restore terminal for TUI
-        enable_raw_mode()?;
-        
-        // Reload dashboard data
-        self.load_recordings()?;
-        self.load_stats()?;
+        // Generate filename and start recording task
+        let recording_name = self.generate_filename(None); // No name prompt for now
+        self.start_recording_task(recording_name).await?;
         
         Ok(())
     }
@@ -1717,10 +1833,49 @@ impl Dashboard {
     }
     
     
+    fn emergency_stop_all_audio_players(&self) -> Result<()> {
+        // Kill all common audio players as a fallback when PID is not available
+        #[cfg(unix)]
+        {
+            use std::process::Command;
+            // Try to kill common audio players
+            let players = ["mpv", "ffplay", "afplay"];
+            for player in &players {
+                let _ = Command::new("killall")
+                    .arg(player)
+                    .output();
+            }
+        }
+        
+        #[cfg(windows)]
+        {
+            use std::process::Command;
+            // Try to kill common audio players on Windows
+            let players = ["mpv.exe", "ffplay.exe"];
+            for player in &players {
+                let _ = Command::new("taskkill")
+                    .arg("/IM")
+                    .arg(player)
+                    .arg("/F")
+                    .output();
+            }
+        }
+        Ok(())
+    }
+
     fn stop_audio_playback(&self, pid: u32) -> Result<()> {
         #[cfg(unix)]
         {
             use std::process::Command;
+            // Use SIGTERM first for graceful shutdown, then SIGKILL if needed
+            let _ = Command::new("kill")
+                .arg("-TERM")
+                .arg(pid.to_string())
+                .output();
+                
+            // Give a very brief moment for graceful shutdown
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            
             // Use SIGKILL immediately for faster termination (audio players can be stubborn)
             let kill_result = Command::new("kill")
                 .arg("-KILL")
@@ -1735,7 +1890,7 @@ impl Dashboard {
                 
             match kill_result {
                 Ok(_) => Ok(()),
-                Err(e) => {
+                Err(_e) => {
                     // If direct kill fails, try killall on common audio players
                     let _ = Command::new("killall")
                         .arg("mpv")
@@ -1773,26 +1928,67 @@ impl Dashboard {
             let spinners = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
             let spinner = spinners[self.progress_frame % spinners.len()];
             
-            // Create progress bar
-            let _progress_chars = ["▱", "▰"];
-            let bar_width = 20;
-            let progress_pos = (self.progress_frame / 2) % (bar_width * 2);
-            let mut bar = vec!["▱"; bar_width];
-            
-            if progress_pos < bar_width {
-                for i in 0..=progress_pos.min(bar_width - 1) {
-                    bar[i] = "▰";
-                }
+            // If recording is active, show volume level instead of progress bar
+            if self.recording_task.is_some() {
+                let volume_bar = self.create_volume_bar(self.current_volume_level);
+                self.message = format!("{} {} [{}]", spinner, base_msg, volume_bar);
             } else {
-                let reverse_pos = (bar_width * 2 - 1) - progress_pos;
-                for i in reverse_pos..bar_width {
-                    bar[i] = "▰";
+                // Regular progress bar for transcription
+                let bar_width = 20;
+                let progress_pos = (self.progress_frame / 2) % (bar_width * 2);
+                let mut bar = vec!["▱"; bar_width];
+                
+                if progress_pos < bar_width {
+                    for i in 0..=progress_pos.min(bar_width - 1) {
+                        bar[i] = "▰";
+                    }
+                } else {
+                    let reverse_pos = (bar_width * 2 - 1) - progress_pos;
+                    for i in reverse_pos..bar_width {
+                        bar[i] = "▰";
+                    }
                 }
+                
+                let bar_str = bar.join("");
+                self.message = format!("{} {} [{}]", spinner, base_msg, bar_str);
             }
             
-            let bar_str = bar.join("");
-            self.message = format!("{} {} [{}]", spinner, base_msg, bar_str);
             self.progress_frame += 1;
         }
+    }
+    
+    fn create_volume_bar(&self, level: f32) -> String {
+        let bar_width = 20;
+        // Scale the level (0.0 to 1.0) to bar width and apply some amplification for visibility
+        let scaled_level = (level * 50.0).min(1.0); // Amplify for visibility
+        let filled_chars = (scaled_level * bar_width as f32) as usize;
+        
+        let mut bar = vec!["▱"; bar_width];
+        for i in 0..filled_chars.min(bar_width) {
+            bar[i] = "▰";
+        }
+        
+        format!("{}|{}%", bar.join(""), (scaled_level * 100.0) as u8)
+    }
+    
+    async fn start_recording_task(&mut self, recording_name: String) -> Result<()> {
+        // Create channels for recording control
+        let (stop_tx, stop_rx) = mpsc::channel(1);
+        let (level_tx, level_rx) = mpsc::channel(100);
+        
+        // Store the channels for control and feedback
+        self.recording_stop_tx = Some(stop_tx);
+        self.recording_level_rx = Some(level_rx);
+        
+        // Use speech-optimized compression settings
+        let compression_settings = CompressionSettings::speech_optimized();
+        let output_path = PathBuf::from(&recording_name);
+        
+        // Start the recording task
+        self.recording_task = Some(tokio::spawn(async move {
+            record_with_control(output_path, Some(compression_settings), stop_rx, level_tx).await
+        }));
+        
+        Ok(())
     }
 }
