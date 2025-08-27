@@ -152,19 +152,4 @@ jobs:
           git commit -m "feat: update Homebrew formula to v${{ steps.release.outputs.version }}"
           git push origin main
 
-      - name: Update Homebrew tap repository
-        run: |
-          # Clone the tap repository using PAT
-          git clone https://${{ secrets.HOMEBREW_TAP_TOKEN }}@github.com/giovannialberto/homebrew-scriba.git tap-repo
-          cd tap-repo
-          
-          # Copy the updated formula
-          mkdir -p Formula
-          cp ../Formula/scriba.rb Formula/scriba.rb
-          
-          # Commit and push to tap
-          git config user.email "action@github.com"
-          git config user.name "GitHub Action"
-          git add Formula/scriba.rb
-          git commit -m "feat: update Scriba formula to v${{ steps.release.outputs.version }}"
-          git push origin main
+      # Removed external tap update: formula is maintained in this repo
