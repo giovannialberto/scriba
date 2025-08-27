@@ -82,12 +82,7 @@ impl RecordingLibrary {
                 LibraryChoice::MoveUp | LibraryChoice::MoveDown => {
                     // Navigation handled in get_user_choice, just refresh display
                 }
-                LibraryChoice::SelectCurrent => {
-                    // Handle current selection if needed
-                    if let Some(recording) = self.recordings.get(self.selected_index) {
-                        self.play_recording(recording)?;
-                    }
-                }
+                // Current selection handled via Enter mapping to Play(self.selected_index)
             }
         }
 
@@ -531,5 +526,4 @@ enum LibraryChoice {
     Search,
     MoveUp,
     MoveDown,
-    SelectCurrent,
 }

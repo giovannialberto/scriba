@@ -1,6 +1,6 @@
 use crate::database::{Database, Recording, RecordingStats};
 use crate::record::record_with_control;
-use crate::transcribe::{transcribe_file, transcribe_file_silent};
+use crate::transcribe::transcribe_file_silent;
 use crate::audio::CompressionSettings;
 use tokio::sync::mpsc;
 use anyhow::Result;
@@ -20,7 +20,7 @@ use ratatui::{
     Frame, Terminal,
 };
 use std::env;
-use std::io::{self, Write};
+use std::io;
 
 const ASCII_ART: &str = r#" ███████  ██████ ██████  ██ ██████   █████  
 ██      ██      ██   ██ ██ ██   ██ ██   ██ 
@@ -84,7 +84,6 @@ enum DashboardAction {
     Quit,
     RecordAndTranscribe,
     RecordOnly,
-    TranscribeFile,
     TranscribeSelected,
 }
 
@@ -418,9 +417,6 @@ impl Dashboard {
             }
             DashboardAction::RecordOnly => {
                 self.execute_record_only().await?;
-            }
-            DashboardAction::TranscribeFile => {
-                self.execute_transcribe_file().await?;
             }
             DashboardAction::TranscribeSelected => {
                 self.execute_transcribe_selected().await?;
@@ -1544,92 +1540,7 @@ impl Dashboard {
         Ok(())
     }
     
-    async fn execute_transcribe_file(&mut self) -> Result<()> {
-        // Temporarily restore terminal for input
-        disable_raw_mode()?;
-        
-        print!("\n📁 Enter path to audio file: ");
-        io::stdout().flush()?;
-        let mut path_input = String::new();
-        io::stdin().read_line(&mut path_input)?;
-        let input_path = path_input.trim();
-        
-        if input_path.is_empty() {
-            println!("❌ File path required. Operation cancelled.");
-            print!("Press Enter to continue...");
-            io::stdout().flush()?;
-            let mut _input = String::new();
-            io::stdin().read_line(&mut _input)?;
-            enable_raw_mode()?;
-            return Ok(());
-        }
-        
-        print!("📝 Enter transcript name (optional, press Enter to skip): ");
-        io::stdout().flush()?;
-        let mut name_input = String::new();
-        io::stdin().read_line(&mut name_input)?;
-        let name_input = name_input.trim();
-        
-        let name = if name_input.is_empty() { None } else { Some(name_input.to_string()) };
-        
-        // Get API key
-        let api_key = match env::var("OPENAI_API_KEY") {
-            Ok(key) => key,
-            Err(_) => {
-                print!("🔑 Enter OpenAI API key: ");
-                io::stdout().flush()?;
-                let mut api_input = String::new();
-                io::stdin().read_line(&mut api_input)?;
-                api_input.trim().to_string()
-            }
-        };
-        
-        if api_key.is_empty() {
-            println!("❌ API key required for transcription. Operation cancelled.");
-            print!("Press Enter to continue...");
-            io::stdout().flush()?;
-            let mut _input = String::new();
-            io::stdin().read_line(&mut _input)?;
-            enable_raw_mode()?;
-            return Ok(());
-        }
-        
-        // Generate output filename
-        let output = if let Some(n) = name {
-            let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
-            let sanitized = n.replace(' ', "-").replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_");
-            PathBuf::from(format!("{}_{}_transcript", timestamp, sanitized))
-        } else {
-            let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
-            PathBuf::from(format!("{}_transcript", timestamp))
-        };
-        
-        println!("\n📝 Starting transcription...");
-        
-        match transcribe_file(&PathBuf::from(input_path), &output, &api_key).await {
-            Ok(()) => {
-                println!("✅ Transcription complete!");
-                println!("📁 File saved in: ~/scriba_recordings/{}/", output.display());
-            }
-            Err(err) => {
-                println!("❌ Transcription failed: {}", err);
-            }
-        }
-        
-        print!("\nPress Enter to continue...");
-        io::stdout().flush()?;
-        let mut _input = String::new();
-        io::stdin().read_line(&mut _input)?;
-        
-        // Restore terminal for TUI
-        enable_raw_mode()?;
-        
-        // Reload dashboard data
-        self.load_recordings()?;
-        self.load_stats()?;
-        
-        Ok(())
-    }
+    // Removed unused execute_transcribe_file; dashboard uses TranscribeSelected (T) instead
     
     async fn execute_transcribe_selected(&mut self) -> Result<()> {
         // Check if transcription is already running
@@ -1914,10 +1825,7 @@ impl Dashboard {
         }
     }
     
-    async fn start_progress_animation(&mut self, base_message: String) {
-        self.progress_animation = Some(base_message);
-        self.progress_frame = 0;
-    }
+    // start_progress_animation not used; progress is updated directly via fields
     
     fn stop_progress_animation(&mut self) {
         self.progress_animation = None;

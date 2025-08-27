@@ -87,7 +87,7 @@ impl CompressionSettings {
 
     /// Create optimized settings based on device capabilities
     /// Automatically reduces sample rate and forces mono for efficiency
-    pub fn optimized_for_device(device_sample_rate: u32, device_channels: u16) -> Self {
+    pub fn optimized_for_device(device_sample_rate: u32, _device_channels: u16) -> Self {
         // Reduce sample rate to roughly half for efficiency
         let optimized_rate = match device_sample_rate {
             48000 => 24000, // 48kHz -> 24kHz (50% reduction)
@@ -201,7 +201,7 @@ pub fn convert_wav_to_mp3(
 ) -> Result<()> {
     let bitrate = settings.bitrate_kbps.unwrap_or(32);
     let sample_rate = settings.sample_rate;
-    let channels = if settings.channels == 1 { "mono" } else { "stereo" };
+    // Note: conversion parameters are applied via ffmpeg flags below
     
     // Use ffmpeg for reliable, high-quality MP3 conversion
     let output = std::process::Command::new("ffmpeg")
@@ -224,4 +224,3 @@ pub fn convert_wav_to_mp3(
     
     Ok(())
 }
-

@@ -85,6 +85,7 @@ fn print_banner() {
     println!();
 }
 
+#[allow(dead_code)]
 fn print_main_menu() {
     println!("┌────────────────────────────────────────────────────────┐");
     println!("│                    MAIN MENU                           │");
@@ -98,6 +99,7 @@ fn print_main_menu() {
     println!();
 }
 
+#[allow(dead_code)]
 fn get_user_input(prompt: &str) -> Result<String> {
     print!(">> {}: ", prompt);
     io::stdout().flush()?;
@@ -106,6 +108,7 @@ fn get_user_input(prompt: &str) -> Result<String> {
     Ok(input.trim().to_string())
 }
 
+#[allow(dead_code)]
 fn get_optional_input(prompt: &str) -> Result<Option<String>> {
     let input = get_user_input(prompt)?;
     if input.is_empty() {
@@ -115,6 +118,7 @@ fn get_optional_input(prompt: &str) -> Result<Option<String>> {
     }
 }
 
+#[allow(dead_code)]
 async fn interactive_mode() -> Result<()> {
     // Load environment variables from .env file
     dotenv::dotenv().ok();
@@ -351,4 +355,3 @@ async fn main() -> Result<()> {
     
     Ok(())
 }
-

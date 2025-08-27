@@ -3,7 +3,6 @@ use anyhow::Context;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use cpal::traits::{HostTrait, DeviceTrait, StreamTrait};
-use std::io::Write;
 use tokio::signal;
 use lazy_static::lazy_static;
 use dirs::home_dir;
@@ -52,33 +51,7 @@ impl AudioLevelMonitor {
         }
     }
 
-    fn display_level(&self) {
-        // Create a retro ASCII VU meter style with better scaling for normal speech
-        // Apply logarithmic scaling and amplify for realistic percentages
-        let scaled_level = (self.level * 10.0).min(1.0); // Amplify by 10x, cap at 100%
-        let level_percent = (scaled_level * 100.0) as usize;
-        let level_bars = (scaled_level * 30.0) as usize;
-        
-        // Build the classic VU meter with different characters for different levels
-        let mut meter = String::new();
-        for i in 0..30 {
-            if i < level_bars {
-                if i < 10 {
-                    meter.push('=');      // Low levels: ===
-                } else if i < 20 {
-                    meter.push('#');      // Mid levels: ###
-                } else {
-                    meter.push('!');      // High levels: !!!
-                }
-            } else {
-                meter.push('-');         // Empty: ---
-            }
-        }
-        
-        // Classic terminal style with brackets and percentage
-        print!("\r>> REC [{}] {:3}% <<   ", meter, level_percent.min(99));
-        std::io::stdout().flush().unwrap();
-    }
+    // Legacy terminal VU output removed; TUI shows levels now
 }
 
 // Main recording function
@@ -262,24 +235,7 @@ pub async fn record(output_path: PathBuf, compression_settings: Option<Compressi
     Ok(())
 }
 
-fn wav_spec_from_config(config: &cpal::SupportedStreamConfig) -> hound::WavSpec {
-    hound::WavSpec {
-        channels: config.channels() as _,
-        sample_rate: config.sample_rate().0 as _,
-        bits_per_sample: (config.sample_format().sample_size() * 8) as _,
-        sample_format: sample_format(config.sample_format()),
-    }
-}
-
 type AudioEncoderHandle = Arc<Mutex<Option<Box<dyn AudioEncoder>>>>;
-
-fn sample_format(format: cpal::SampleFormat) -> hound::SampleFormat {
-    if format.is_float() {
-        hound::SampleFormat::Float
-    } else {
-        hound::SampleFormat::Int
-    }
-}
 
 // Specialized functions for level monitoring with audio level feedback
 fn write_input_data_with_monitoring_f32(input: &[f32], encoder: &AudioEncoderHandle, level_monitor: &Arc<Mutex<AudioLevelMonitor>>) {
