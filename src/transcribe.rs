@@ -9,6 +9,7 @@ use tokio::time::sleep;
 use std::io::stdout;
 use unicode_width::UnicodeWidthStr;
 use crate::database::{Database, Transcript};
+use crate::config::{TranscriptionMode, LocalModelSize, ScribaConfig};
 use chrono::Utc;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 use std::ffi::{c_char, c_void};
@@ -20,8 +21,9 @@ extern "C" {
     );
 }
 use std::process::Command;
-use reqwest::Client;
+use reqwest::{Client, multipart::{Form, Part}};
 use futures_util::StreamExt;
+use serde_json::Value;
 
 lazy_static! {
     static ref BASE_PATH: PathBuf = home_dir().expect("error home dir").join("scriba_recordings");
@@ -52,18 +54,18 @@ impl TranscriptionProgress {
         }
     }
 
-    async fn show_progress(&mut self) {
+    async fn show_progress(&mut self, mode_message: Option<&str>) {
         let elapsed = self.start_time.elapsed().as_secs();
         
         // Rotating spinner animation
         let spinner_chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let spinner = spinner_chars[self.animation_frame % spinner_chars.len()];
         
-        // Progress messages that change over time
+        // Progress messages that change over time (will be overridden by specific mode)
         let message = match elapsed {
-            0..=3 => "Preparing audio (16kHz mono)",
-            4..=8 => "Loading Whisper model",
-            9..=25 => "Running local transcription",
+            0..=3 => "Preparing audio",
+            4..=8 => "Processing",
+            9..=25 => "Transcribing",
             _ => "Almost there, hang tight",
         };
         
@@ -92,7 +94,8 @@ impl TranscriptionProgress {
         
         let bar_str: String = bar.into_iter().collect();
         
-        print!("\r🎵 {} [{}] {} - {}", spinner, bar_str, message, time_display);
+        let display_message = mode_message.unwrap_or(message);
+        print!("\r🎵 {} [{}] {} - {}", spinner, bar_str, display_message, time_display);
         stdout().flush().unwrap();
         
         self.animation_frame += 1;
@@ -145,53 +148,124 @@ async fn show_transcription_typing_effect(text: &str) {
     println!("╰────────────────────────────────────────────────────────╯");
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum ModelSize {
-    Tiny,
-    Base,
-    Small,
-    Medium,
-    Large,
-    Turbo,
+fn find_ffmpeg() -> Result<String> {
+    let possible_paths = [
+        "ffmpeg",
+        "/opt/homebrew/bin/ffmpeg", // macOS Homebrew
+        "/usr/bin/ffmpeg",         // Linux
+        "/usr/local/bin/ffmpeg",   // Linux alternative
+        "C:\\ffmpeg\\bin\\ffmpeg.exe", // Windows
+    ];
+    
+    for path in &possible_paths {
+        match Command::new(path).arg("-version").output() {
+            Ok(output) => {
+                if output.status.success() {
+                    return Ok(path.to_string());
+                }
+            }
+            Err(_) => {
+                // Continue to next path on error
+                continue;
+            }
+        }
+    }
+    
+    // If we reach here, none of the standard paths worked
+    // Try to use the system PATH by just calling 'ffmpeg'
+    match Command::new("ffmpeg").arg("-version").output() {
+        Ok(output) if output.status.success() => {
+            return Ok("ffmpeg".to_string());
+        }
+        _ => {}
+    }
+    
+    Err(anyhow::anyhow!(
+        "FFmpeg not found. Please install FFmpeg and ensure it's in your PATH. Visit https://ffmpeg.org/download.html"
+    ))
 }
 
-impl std::fmt::Display for ModelSize {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            ModelSize::Tiny => "tiny",
-            ModelSize::Base => "base",
-            ModelSize::Small => "small",
-            ModelSize::Medium => "medium",
-            ModelSize::Large => "large",
-            ModelSize::Turbo => "turbo",
-        };
-        write!(f, "{}", s)
+fn validate_audio_file(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Err(anyhow::anyhow!("Audio file not found: {}", path.display()));
+    }
+    
+    let metadata = std::fs::metadata(path)
+        .context("Failed to read file metadata")?;
+    
+    if metadata.len() == 0 {
+        return Err(anyhow::anyhow!("Audio file is empty"));
+    }
+    
+    if metadata.len() < 1024 {
+        return Err(anyhow::anyhow!("Audio file too small (< 1KB), likely corrupted"));
+    }
+    
+    // Check file extension
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        match ext.to_lowercase().as_str() {
+            "wav" | "mp3" | "m4a" | "flac" | "ogg" | "aac" => Ok(()),
+            _ => Err(anyhow::anyhow!(
+                "Unsupported audio format: {}. Supported: wav, mp3, m4a, flac, ogg, aac", 
+                ext
+            ))
+        }
+    } else {
+        Err(anyhow::anyhow!("File has no extension, cannot determine audio format"))
     }
 }
 
-impl std::str::FromStr for ModelSize {
-    type Err = anyhow::Error;
-    fn from_str(s: &str) -> Result<Self> {
-        match s.to_lowercase().as_str() {
-            "tiny" => Ok(ModelSize::Tiny),
-            "base" => Ok(ModelSize::Base),
-            "small" => Ok(ModelSize::Small),
-            "medium" => Ok(ModelSize::Medium),
-            "large" => Ok(ModelSize::Large),
-            "turbo" => Ok(ModelSize::Turbo),
-            _ => Err(anyhow::anyhow!("Invalid model size: {} (use tiny|base|small|medium|large)", s)),
+async fn download_model_with_timeout(model_size: LocalModelSize) -> Result<PathBuf> {
+    ensure_model_path_local(model_size, true).await
+}
+
+fn resolve_audio_path(input_path: &PathBuf) -> Result<PathBuf> {
+    if input_path.is_absolute() {
+        if input_path.exists() {
+            validate_audio_file(input_path)?;
+            Ok(input_path.clone())
+        } else {
+            Err(anyhow::anyhow!("Audio file not found: {}", input_path.display()))
         }
+    } else if input_path.extension().is_some() {
+        let full_path = BASE_PATH.join(input_path);
+        if full_path.exists() {
+            validate_audio_file(&full_path)?;
+            Ok(full_path)
+        } else {
+            Err(anyhow::anyhow!("Audio file not found: {}", full_path.display()))
+        }
+    } else {
+        let recording_dir = BASE_PATH.join(input_path);
+        for audio_file in ["recording.mp3", "recording.wav"] {
+            let path = recording_dir.join(audio_file);
+            if path.exists() {
+                validate_audio_file(&path)?;
+                return Ok(path);
+            }
+        }
+        Err(anyhow::anyhow!(
+            "No audio file found (recording.wav or recording.mp3) in {}", 
+            recording_dir.display()
+        ))
     }
 }
 
 // Silent transcription function for TUI usage (no stdout prints)
-pub async fn transcribe_file_silent(input_path: &PathBuf, model: Option<ModelSize>) -> Result<(), anyhow::Error> {
+pub async fn transcribe_file_silent(input_path: &PathBuf, model: Option<LocalModelSize>) -> Result<(), anyhow::Error> {
     // Suppress any whisper/ggml logs globally to avoid interfering with TUI
     ensure_whisper_logs_suppressed();
+    
     let audio_file_path = resolve_audio_path(input_path)?;
     let tmp_wav = ensure_mono_16k_wav(&audio_file_path)?;
-    let model_choice = model.unwrap_or(ModelSize::Turbo);
-    let model_path = ensure_model_path(model_choice, true).await?;
+    let model_choice = model.unwrap_or(LocalModelSize::Turbo);
+    
+    // Add timeout wrapper for model operations
+    let download_future = download_model_with_timeout(model_choice);
+    let model_path = tokio::time::timeout(Duration::from_secs(300), download_future)
+        .await
+        .context("Model download timed out after 5 minutes")?
+        .context("Failed to download model")?;
 
     let transcript = run_whisper_transcription(&model_path, &tmp_wav)?;
 
@@ -234,79 +308,91 @@ pub async fn transcribe_file_silent(input_path: &PathBuf, model: Option<ModelSiz
     Ok(())
 }
 
-// Enhanced transcription function with delightful UX
+// Enhanced transcription function with delightful UX and dual mode support
 pub async fn transcribe_file(
     input_path: &PathBuf,
     _output_path: &PathBuf,
-    model: Option<ModelSize>,
+    mode_override: Option<TranscriptionMode>,
 ) -> Result<(), anyhow::Error> {
-    // Find the audio file - handle both directory names and full file paths
-    let audio_file_path = if input_path.is_absolute() {
-        // User provided an absolute path - use it directly
-        if input_path.exists() {
-            input_path.clone()
-        } else {
-            return Err(anyhow::anyhow!("Audio file not found: {}", input_path.display()));
-        }
-    } else if input_path.extension().is_some() {
-        // User provided a relative path with file extension (like "dir/recording.wav")
-        let full_path = BASE_PATH.join(input_path);
-        if full_path.exists() {
-            full_path
-        } else {
-            return Err(anyhow::anyhow!("Audio file not found: {}", full_path.display()));
-        }
-    } else {
-        // User provided just a directory name - look for recording.mp3 or recording.wav inside it
-        let recording_dir = BASE_PATH.join(input_path);
-        if recording_dir.join("recording.mp3").exists() {
-            let path = recording_dir.join("recording.mp3");
-            path
-        } else if recording_dir.join("recording.wav").exists() {
-            let path = recording_dir.join("recording.wav");
-            path
-        } else {
-            return Err(anyhow::anyhow!("No audio file found (recording.wav or recording.mp3) in {}", recording_dir.display()));
-        }
-    };
+    let audio_file_path = resolve_audio_path(input_path)?;
+    
+    // Determine which transcription mode to use
+    let config = ScribaConfig::load()?;
+    let transcription_mode = mode_override.unwrap_or_else(|| config.transcription.clone());
     
     // Create progress indicator
-    let mut progress = TranscriptionProgress::new();
+    let progress = TranscriptionProgress::new();
     
-    // Show initial progress
-    println!("\n🎤 → 📝 Transcribing your audio...\n");
-
-    // Start the progress animation in background
-    let progress_task = tokio::spawn(async move {
-        loop {
-            progress.show_progress().await;
+    // Show initial progress with mode-specific message
+    let mode_description = match &transcription_mode {
+        TranscriptionMode::Local { model_size } => {
+            format!("🎤 → 📝 Transcribing locally using Whisper {} model...", model_size)
         }
-    });
+        TranscriptionMode::Api { .. } => {
+            "🎤 → ☁️ Transcribing using OpenAI Whisper API...".to_string()
+        }
+    };
+    println!("\n{}\n", mode_description);
 
-    // Prepare audio and model
-    let wav_path = ensure_mono_16k_wav(&audio_file_path)
-        .context("Failed to prepare 16kHz mono WAV for transcription")?;
-    let model_choice = model.unwrap_or(ModelSize::Medium);
-    let model_path = ensure_model_path(model_choice, false)
-        .await
-        .context("Failed to locate Whisper model file")?;
+    let transcription_text = match transcription_mode {
+        TranscriptionMode::Local { model_size } => {
+            // Start the progress animation for local mode
+            let mut local_progress = progress;
+            let progress_task = tokio::spawn(async move {
+                loop {
+                    let message = match local_progress.start_time.elapsed().as_secs() {
+                        0..=3 => Some("Preparing audio (16kHz mono)"),
+                        4..=8 => Some("Loading Whisper model"),
+                        9..=25 => Some("Running local transcription"),
+                        _ => Some("Almost there, hang tight"),
+                    };
+                    local_progress.show_progress(message).await;
+                }
+            });
+            
+            // Prepare audio and model
+            let wav_path = ensure_mono_16k_wav(&audio_file_path)
+                .context("Failed to prepare 16kHz mono WAV for transcription")?;
+                
+            let model_path = {
+                let download_future = download_model_with_timeout(model_size);
+                tokio::time::timeout(Duration::from_secs(300), download_future)
+                    .await
+                    .context("Model download timed out after 5 minutes")?
+                    .context("Failed to download model")?
+            };
 
-    // Run local transcription
-    let transcription_text = run_whisper_transcription(&model_path, &wav_path)
-        .context("Local Whisper transcription failed")?;
+            // Run local transcription
+            let result = run_whisper_transcription(&model_path, &wav_path)
+                .context("Local Whisper transcription failed")?;
+                
+            progress_task.abort();
+            result
+        }
+        TranscriptionMode::Api { api_key } => {
+            // Start the progress animation for API mode
+            let mut api_progress = progress;
+            let progress_task = tokio::spawn(async move {
+                loop {
+                    let message = match api_progress.start_time.elapsed().as_secs() {
+                        0..=3 => Some("Uploading audio file"),
+                        4..=8 => Some("OpenAI is processing your audio"),
+                        9..=15 => Some("Converting speech to text"),
+                        16..=25 => Some("This is taking longer than usual"),
+                        _ => Some("Almost there, hang tight"),
+                    };
+                    api_progress.show_progress(message).await;
+                }
+            });
+            
+            let result = transcribe_with_openai_api(&audio_file_path, &api_key).await
+                .context("OpenAI API transcription failed")?;
+                
+            progress_task.abort();
+            result
+        }
+    };
 
-        // Store transcript in same folder as the audio file
-        let audio_dir = audio_file_path.parent()
-            .context("Could not determine audio file directory")?;
-        let transcript_file_path = audio_dir.join("transcript.txt");
-        
-        let transcript_file = File::create(&transcript_file_path)?;
-        let mut transcript_writer = BufWriter::new(transcript_file);
-        transcript_writer.write_all(transcription_text.as_bytes())?;
-
-    // Stop the progress animation
-    progress_task.abort();
-    
     // Clear progress line
     print!("\r{}", " ".repeat(80));
     print!("\r");
@@ -317,6 +403,15 @@ pub async fn transcribe_file(
     
     // Show the transcription with typing effect
     show_transcription_typing_effect(&transcription_text).await;
+
+    // Store transcript in same folder as the audio file
+    let audio_dir = audio_file_path.parent()
+        .context("Could not determine audio file directory")?;
+    let transcript_file_path = audio_dir.join("transcript.txt");
+    
+    let transcript_file = File::create(&transcript_file_path)?;
+    let mut transcript_writer = BufWriter::new(transcript_file);
+    transcript_writer.write_all(transcription_text.as_bytes())?;
 
     println!("\n📁 Transcript saved to: {}", transcript_file_path.display());
 
@@ -369,34 +464,54 @@ pub async fn transcribe_file(
     Ok(())
 }
 
-fn resolve_audio_path(input_path: &Path) -> Result<PathBuf> {
-    if input_path.is_absolute() {
-        if input_path.exists() {
-            Ok(input_path.to_path_buf())
-        } else {
-            Err(anyhow::anyhow!("Audio file not found: {}", input_path.display()))
-        }
-    } else if input_path.extension().is_some() {
-        let full_path = BASE_PATH.join(input_path);
-        if full_path.exists() {
-            Ok(full_path)
-        } else {
-            Err(anyhow::anyhow!("Audio file not found: {}", full_path.display()))
-        }
-    } else {
-        let recording_dir = BASE_PATH.join(input_path);
-        if recording_dir.join("recording.mp3").exists() {
-            Ok(recording_dir.join("recording.mp3"))
-        } else if recording_dir.join("recording.wav").exists() {
-            Ok(recording_dir.join("recording.wav"))
-        } else {
-            Err(anyhow::anyhow!(
-                "No audio file found (recording.wav or recording.mp3) in {}",
-                recording_dir.display()
-            ))
-        }
+async fn transcribe_with_openai_api(audio_path: &PathBuf, api_key: &str) -> Result<String> {
+    let audio_file = std::fs::read(audio_path)
+        .context("Unable to read audio file")?;
+        
+    let filename = audio_path.file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("audio")
+        .to_string();
+    
+    let client = Client::new();
+    
+    let part = Part::bytes(audio_file)
+        .file_name(filename.clone())
+        .mime_str("audio/mpeg")
+        .context("Failed to create multipart form data")?;
+
+    let form = Form::new()
+        .part("file", part)
+        .text("model", "whisper-1");
+
+    let response = client
+        .post("https://api.openai.com/v1/audio/transcriptions")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .multipart(form)
+        .send()
+        .await
+        .context("Failed to send transcription request to OpenAI")?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+        return Err(anyhow::anyhow!(
+            "OpenAI API request failed with status {}: {}", 
+            status, 
+            error_text
+        ));
     }
+
+    let response_json: Value = response.json().await
+        .context("Failed to parse OpenAI response as JSON")?;
+
+    response_json
+        .get("text")
+        .and_then(|t| t.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow::anyhow!("No 'text' field found in OpenAI response"))
 }
+
 
 fn ensure_mono_16k_wav(input: &Path) -> Result<PathBuf> {
     // Always normalize using ffmpeg for simplicity and robustness
@@ -405,7 +520,10 @@ fn ensure_mono_16k_wav(input: &Path) -> Result<PathBuf> {
         .unwrap_or_else(|| Path::new("."))
         .join("_tmp_whisper_16k.wav");
 
-    let output = Command::new("ffmpeg")
+    let ffmpeg_path = find_ffmpeg()
+        .context("FFmpeg is required for audio processing")?;
+
+    let output = Command::new(&ffmpeg_path)
         .args([
             "-y",
             "-i",
@@ -419,7 +537,7 @@ fn ensure_mono_16k_wav(input: &Path) -> Result<PathBuf> {
             out.to_string_lossy().as_ref(),
         ])
         .output()
-        .context("Failed to run ffmpeg - make sure it's installed")?;
+        .with_context(|| format!("Failed to run ffmpeg from path: {}", ffmpeg_path))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -429,18 +547,18 @@ fn ensure_mono_16k_wav(input: &Path) -> Result<PathBuf> {
     Ok(out)
 }
 
-async fn ensure_model_path(size: ModelSize, quiet: bool) -> Result<PathBuf> {
+async fn ensure_model_path_local(size: LocalModelSize, quiet: bool) -> Result<PathBuf> {
     let models_dir = BASE_PATH.join("models");
     std::fs::create_dir_all(&models_dir).ok();
 
     // Prefer local candidates first (supports both GGML and GGUF file names)
     let local_candidates: Vec<&str> = match size {
-        ModelSize::Tiny => vec!["ggml-tiny.bin", "tiny.gguf", "ggml-tiny-q5_0.gguf"],
-        ModelSize::Base => vec!["ggml-base.bin", "base.gguf", "ggml-base-q5_0.gguf"],
-        ModelSize::Small => vec!["ggml-small.bin", "small.gguf", "ggml-small-q5_0.gguf"],
-        ModelSize::Medium => vec!["ggml-medium.bin", "medium.gguf", "ggml-medium-q5_0.gguf"],
-        ModelSize::Large => vec!["ggml-large-v3.bin", "large-v3.gguf", "ggml-large-v3-q5_0.gguf"],
-        ModelSize::Turbo => vec![
+        LocalModelSize::Tiny => vec!["ggml-tiny.bin", "tiny.gguf", "ggml-tiny-q5_0.gguf"],
+        LocalModelSize::Base => vec!["ggml-base.bin", "base.gguf", "ggml-base-q5_0.gguf"],
+        LocalModelSize::Small => vec!["ggml-small.bin", "small.gguf", "ggml-small-q5_0.gguf"],
+        LocalModelSize::Medium => vec!["ggml-medium.bin", "medium.gguf", "ggml-medium-q5_0.gguf"],
+        LocalModelSize::Large => vec!["ggml-large-v3.bin", "large-v3.gguf", "ggml-large-v3-q5_0.gguf"],
+        LocalModelSize::Turbo => vec![
             "ggml-large-v3-turbo.gguf",
             "ggml-large-v3-turbo-q5_0.gguf",
             "large-v3-turbo.gguf",
@@ -457,7 +575,7 @@ async fn ensure_model_path(size: ModelSize, quiet: bool) -> Result<PathBuf> {
 
     // Remote URL selection (prefer GGUF where appropriate)
     match size {
-        ModelSize::Tiny => {
+        LocalModelSize::Tiny => {
             let name = "ggml-tiny.bin";
             let url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin";
             let dest = models_dir.join(name);
@@ -467,7 +585,7 @@ async fn ensure_model_path(size: ModelSize, quiet: bool) -> Result<PathBuf> {
             if !quiet { println!("✅ Model downloaded to {}", dest.display()); }
             Ok(dest)
         }
-        ModelSize::Base => {
+        LocalModelSize::Base => {
             let name = "ggml-base.bin";
             let url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin";
             let dest = models_dir.join(name);
@@ -477,7 +595,7 @@ async fn ensure_model_path(size: ModelSize, quiet: bool) -> Result<PathBuf> {
             if !quiet { println!("✅ Model downloaded to {}", dest.display()); }
             Ok(dest)
         }
-        ModelSize::Small => {
+        LocalModelSize::Small => {
             let name = "ggml-small.bin";
             let url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin";
             let dest = models_dir.join(name);
@@ -487,7 +605,7 @@ async fn ensure_model_path(size: ModelSize, quiet: bool) -> Result<PathBuf> {
             if !quiet { println!("✅ Model downloaded to {}", dest.display()); }
             Ok(dest)
         }
-        ModelSize::Medium => {
+        LocalModelSize::Medium => {
             let name = "ggml-medium.bin";
             let url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin";
             let dest = models_dir.join(name);
@@ -497,7 +615,7 @@ async fn ensure_model_path(size: ModelSize, quiet: bool) -> Result<PathBuf> {
             if !quiet { println!("✅ Model downloaded to {}", dest.display()); }
             Ok(dest)
         }
-        ModelSize::Large => {
+        LocalModelSize::Large => {
             let name = "ggml-large-v3.bin";
             let url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin";
             let dest = models_dir.join(name);
@@ -507,7 +625,7 @@ async fn ensure_model_path(size: ModelSize, quiet: bool) -> Result<PathBuf> {
             if !quiet { println!("✅ Model downloaded to {}", dest.display()); }
             Ok(dest)
         }
-        ModelSize::Turbo => {
+        LocalModelSize::Turbo => {
             // Try a few known turbo filenames/URLs commonly used in the whisper.cpp repo
             let candidates = vec![
                 ("ggml-large-v3-turbo-q5_0.gguf", "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.gguf"),
@@ -536,11 +654,30 @@ async fn ensure_model_path(size: ModelSize, quiet: bool) -> Result<PathBuf> {
 }
 
 fn run_whisper_transcription(model_path: &Path, wav_path: &Path) -> Result<String> {
-    // Load model
+    // Validate inputs
+    if !model_path.exists() {
+        return Err(anyhow::anyhow!("Whisper model file not found: {}", model_path.display()));
+    }
+    if !wav_path.exists() {
+        return Err(anyhow::anyhow!("Audio file not found: {}", wav_path.display()));
+    }
+    
+    // Load model with enhanced error messages
     let params_ctx = WhisperContextParameters::default();
-    let ctx = WhisperContext::new_with_params(model_path.to_string_lossy().as_ref(), params_ctx)
-        .context("Failed to load Whisper model")?;
-    let mut state = ctx.create_state().context("Failed to create Whisper state")?;
+    let model_path_str = model_path.to_string_lossy();
+    let ctx = match WhisperContext::new_with_params(&model_path_str, params_ctx) {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "Failed to load Whisper model '{}': {}. Check if model file is valid and you have enough memory",
+                model_path.display(),
+                e
+            ))
+        }
+    };
+    
+    let mut state = ctx.create_state()
+        .with_context(|| format!("Failed to create Whisper state for model: {}", model_path.display()))?;
 
     // Read WAV into f32 PCM
     let mut reader = hound::WavReader::open(wav_path)

@@ -4,3 +4,4 @@ pub mod database;
 pub mod library;
 pub mod dashboard;
 pub mod audio;
+pub mod config;

@@ -1,7 +1,8 @@
 use crate::database::{Database, Recording, RecordingStats};
 use crate::record::record_with_control;
-use crate::transcribe::{transcribe_file_silent, ModelSize};
+use crate::transcribe::transcribe_file_silent;
 use crate::audio::CompressionSettings;
+use crate::config::{ScribaConfig, TranscriptionMode, LocalModelSize};
 use tokio::sync::mpsc;
 use anyhow::Result;
 use crossterm::{
@@ -63,12 +64,18 @@ pub struct Dashboard {
     recording_stop_tx: Option<mpsc::Sender<()>>, // Channel to stop recording
     recording_level_rx: Option<mpsc::Receiver<f32>>, // Channel to receive volume levels
     current_volume_level: f32, // Current recording volume for display
+    config: ScribaConfig, // App configuration
+    settings_selection: usize, // Current setting selection
+    editing_api_key: bool, // Whether we're editing API key
+    api_key_input: String, // API key input buffer
+    return_to_view: Option<DashboardView>, // View to return to after message dismissal
 }
 
 #[derive(Debug, PartialEq)]
 enum DashboardView {
     Main,
     Help,
+    Settings,
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +98,7 @@ impl Dashboard {
         let db = Database::new()?;
         let mut table_state = TableState::default();
         table_state.select(Some(0));
+        let config = ScribaConfig::load()?;
 
         Ok(Self {
             db,
@@ -121,6 +129,11 @@ impl Dashboard {
             recording_stop_tx: None,
             recording_level_rx: None,
             current_volume_level: 0.0,
+            config,
+            settings_selection: 0,
+            editing_api_key: false,
+            api_key_input: String::new(),
+            return_to_view: None,
         })
     }
 
@@ -176,7 +189,7 @@ impl Dashboard {
                                 let input_path = PathBuf::from(&recording_name);
                                 let input_path_clone = input_path.clone();
                                 self.transcription_task = Some(tokio::spawn(async move {
-                                    transcribe_file_silent(&input_path_clone, Some(ModelSize::Turbo)).await
+                                    transcribe_file_silent(&input_path_clone, Some(LocalModelSize::Turbo)).await
                                 }));
                             } else {
                                 // Recording only mode - complete
@@ -312,6 +325,11 @@ impl Dashboard {
                 // Only Esc key closes the message popup (consistent behavior)
                 self.show_message = false;
                 self.message.clear();
+                
+                // Return to the previous view if one was set
+                if let Some(return_view) = self.return_to_view.take() {
+                    self.current_view = return_view;
+                }
             }
             return Ok(DashboardAction::Continue);
         }
@@ -324,6 +342,10 @@ impl Dashboard {
             self.show_help = false;
             self.current_view = DashboardView::Main;
             return Ok(DashboardAction::Continue);
+        }
+        
+        if self.current_view == DashboardView::Settings {
+            return self.handle_settings_keys(key_code).await;
         }
 
         if self.show_transcript {
@@ -339,6 +361,10 @@ impl Dashboard {
             KeyCode::Char('h') | KeyCode::Char('H') | KeyCode::F(1) => {
                 self.show_help = true;
                 self.current_view = DashboardView::Help;
+            }
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                self.current_view = DashboardView::Settings;
+                self.settings_selection = 0;
             }
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 return Ok(DashboardAction::RecordAndTranscribe);
@@ -857,6 +883,145 @@ impl Dashboard {
             }
         }
     }
+    
+    async fn handle_settings_keys(&mut self, key_code: KeyCode) -> Result<DashboardAction> {
+        match key_code {
+            KeyCode::Esc => {
+                self.current_view = DashboardView::Main;
+                self.editing_api_key = false;
+                Ok(DashboardAction::Continue)
+            }
+            KeyCode::Up => {
+                if !self.editing_api_key {
+                    match &self.config.transcription {
+                        TranscriptionMode::Local { .. } => {
+                            // Local mode: 0=Mode, 1=ModelSize
+                            self.settings_selection = self.settings_selection.saturating_sub(1);
+                        }
+                        TranscriptionMode::Api { .. } => {
+                            // API mode: 0=Mode, 1=APIKey
+                            self.settings_selection = self.settings_selection.saturating_sub(1);
+                        }
+                    }
+                }
+                Ok(DashboardAction::Continue)
+            }
+            KeyCode::Down => {
+                if !self.editing_api_key {
+                    match &self.config.transcription {
+                        TranscriptionMode::Local { .. } => {
+                            // Local mode: 0=Mode, 1=ModelSize (max index 1)
+                            self.settings_selection = std::cmp::min(self.settings_selection + 1, 1);
+                        }
+                        TranscriptionMode::Api { .. } => {
+                            // API mode: 0=Mode, 1=APIKey (max index 1)
+                            self.settings_selection = std::cmp::min(self.settings_selection + 1, 1);
+                        }
+                    }
+                }
+                Ok(DashboardAction::Continue)
+            }
+            KeyCode::Enter => {
+                if self.editing_api_key {
+                    // Save API key
+                    let new_mode = TranscriptionMode::Api { api_key: self.api_key_input.clone() };
+                    match self.config.set_transcription_mode(new_mode) {
+                        Ok(()) => {
+                            self.config = ScribaConfig::load()?; // Reload config
+                            // Stay in settings, no success message
+                        }
+                        Err(e) => {
+                            // Show error message only for actual errors
+                            self.message = format!("❌ Failed to save API key: {}", e);
+                            self.show_message = true;
+                            self.return_to_view = Some(DashboardView::Settings);
+                        }
+                    }
+                    self.editing_api_key = false;
+                    self.api_key_input.clear();
+                } else {
+                    match self.settings_selection {
+                        0 => {
+                            // Toggle transcription mode
+                            let new_mode = match &self.config.transcription {
+                                TranscriptionMode::Local { .. } => {
+                                    TranscriptionMode::Api { api_key: String::new() }
+                                }
+                                TranscriptionMode::Api { .. } => {
+                                    TranscriptionMode::Local { model_size: LocalModelSize::Medium }
+                                }
+                            };
+                            match self.config.set_transcription_mode(new_mode) {
+                                Ok(()) => {
+                                    self.config = ScribaConfig::load()?;
+                                    // Reset selection to mode (index 0) when changing modes
+                                    self.settings_selection = 0;
+                                    // Stay in settings, no success message
+                                }
+                                Err(e) => {
+                                    // Show error message only for actual errors
+                                    self.message = format!("❌ Failed to change mode: {}", e);
+                                    self.show_message = true;
+                                    self.return_to_view = Some(DashboardView::Settings);
+                                }
+                            }
+                        }
+                        1 => {
+                            match &self.config.transcription {
+                                TranscriptionMode::Local { model_size } => {
+                                    // In local mode: index 1 = Model Size
+                                    let new_model = match model_size {
+                                        LocalModelSize::Tiny => LocalModelSize::Base,
+                                        LocalModelSize::Base => LocalModelSize::Small,
+                                        LocalModelSize::Small => LocalModelSize::Medium,
+                                        LocalModelSize::Medium => LocalModelSize::Large,
+                                        LocalModelSize::Large => LocalModelSize::Turbo,
+                                        LocalModelSize::Turbo => LocalModelSize::Tiny,
+                                    };
+                                    let new_mode = TranscriptionMode::Local { model_size: new_model };
+                                    match self.config.set_transcription_mode(new_mode) {
+                                        Ok(()) => {
+                                            self.config = ScribaConfig::load()?;
+                                            // Stay in settings, no success message
+                                        }
+                                        Err(e) => {
+                                            // Show error message only for actual errors
+                                            self.message = format!("❌ Failed to change model: {}", e);
+                                            self.show_message = true;
+                                            self.return_to_view = Some(DashboardView::Settings);
+                                        }
+                                    }
+                                }
+                                TranscriptionMode::Api { .. } => {
+                                    // In API mode: index 1 = API Key
+                                    self.editing_api_key = true;
+                                    self.api_key_input = match &self.config.transcription {
+                                        TranscriptionMode::Api { api_key } => api_key.clone(),
+                                        _ => String::new(),
+                                    };
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(DashboardAction::Continue)
+            }
+            KeyCode::Char(c) => {
+                if self.editing_api_key {
+                    self.api_key_input.push(c);
+                }
+                Ok(DashboardAction::Continue)
+            }
+            KeyCode::Backspace => {
+                if self.editing_api_key {
+                    self.api_key_input.pop();
+                }
+                Ok(DashboardAction::Continue)
+            }
+            _ => Ok(DashboardAction::Continue)
+        }
+    }
 
     async fn handle_delete_confirmation(&mut self, key_code: KeyCode) -> Result<DashboardAction> {
         match key_code {
@@ -1040,6 +1205,7 @@ impl Dashboard {
         match self.current_view {
             DashboardView::Main => self.render_main_dashboard(f),
             DashboardView::Help => self.render_help(f, f.size()),
+            DashboardView::Settings => self.render_settings(f, f.size()),
         }
     }
 
@@ -1216,7 +1382,7 @@ impl Dashboard {
         let controls = if self.search_mode {
             "ESC: Cancel | ENTER: Search | Type to search..."
         } else {
-            "↑↓: Navigate | ENTER: Transcript | P: Play | D/Del: Delete | /: Search | R/A/T: Quick Actions | H: Help | Q: Quit"
+"↑↓: Navigate | ENTER: Transcript | P: Play | D/Del: Delete | /: Search | R/A/T: Quick Actions | S: Settings | H: Help | Q: Quit"
         };
 
         let controls_paragraph = Paragraph::new(controls)
@@ -1270,6 +1436,7 @@ impl Dashboard {
             Line::from("Actions:"),
             Line::from("  D          - Delete recording (with confirmation)"),
             Line::from("  /          - Search recordings"),
+            Line::from("  S          - Settings (transcription mode, models)"),
             Line::from("  H/F1       - Show this help"),
             Line::from("  Q/Esc      - Quit"),
             Line::from(""),
@@ -1305,6 +1472,140 @@ impl Dashboard {
             .wrap(Wrap { trim: true });
 
         f.render_widget(help_paragraph, popup_area);
+    }
+    
+    fn render_settings(&self, f: &mut Frame, area: ratatui::layout::Rect) {
+        let popup_area = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(15),
+                Constraint::Percentage(70),
+                Constraint::Percentage(15),
+            ])
+            .split(area)[1];
+
+        let popup_area = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(15),
+                Constraint::Percentage(70),
+                Constraint::Percentage(15),
+            ])
+            .split(popup_area)[1];
+
+        f.render_widget(Clear, popup_area);
+        
+        let mut settings_text = vec![
+            Line::from(vec![
+                Span::styled("SETTINGS", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            ]),
+            Line::from(""),
+        ];
+        
+        // Current transcription mode
+        let mode_text = match &self.config.transcription {
+            TranscriptionMode::Local { model_size } => {
+                format!("⚙️ Local (Whisper {})  ← Press Enter to change", model_size)
+            }
+            TranscriptionMode::Api { .. } => {
+                "☁️ OpenAI API  ← Press Enter to change".to_string()
+            }
+        };
+        
+        let mode_style = if self.settings_selection == 0 {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        
+        settings_text.push(Line::from(vec![
+            Span::styled("Transcription Mode: ", Style::default().fg(Color::Green)),
+            Span::styled(mode_text, mode_style),
+        ]));
+        
+        // Model size (only for local mode)
+        if let TranscriptionMode::Local { model_size } = &self.config.transcription {
+            let model_style = if self.settings_selection == 1 {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            
+            settings_text.push(Line::from(vec![
+                Span::styled("Model Size: ", Style::default().fg(Color::Green)),
+                Span::styled(format!("{} ← Press Enter to cycle", model_size), model_style),
+            ]));
+        }
+        
+        // Add mode-specific settings
+        match &self.config.transcription {
+            TranscriptionMode::Api { api_key } => {
+                // API Mode: Show API Key configuration at index 1
+                let api_key_display = if self.editing_api_key {
+                    format!("{}_", self.api_key_input) // Show cursor
+                } else {
+                    if api_key.is_empty() {
+                        "[Not Set] ← Press Enter to edit".to_string()
+                    } else {
+                        format!("{}****** ← Press Enter to edit", &api_key[..api_key.len().min(4)])
+                    }
+                };
+                
+                let api_key_style = if self.settings_selection == 1 {
+                    if self.editing_api_key {
+                        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                    }
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                
+                settings_text.push(Line::from(vec![
+                    Span::styled("OpenAI API Key: ", Style::default().fg(Color::Green)),
+                    Span::styled(api_key_display, api_key_style),
+                ]));
+            }
+            TranscriptionMode::Local { .. } => {
+                // Local Mode: No API Key shown, Model Size is already shown above
+            }
+        }
+        
+        // Audio settings preview
+        settings_text.push(Line::from(""));
+        settings_text.push(Line::from(vec![
+            Span::styled("Audio Settings:", Style::default().fg(Color::Green)),
+        ]));
+        settings_text.push(Line::from(vec![
+            Span::styled(format!("  Sample Rate: {} Hz", self.config.audio_settings.sample_rate), Style::default().fg(Color::Gray)),
+        ]));
+        settings_text.push(Line::from(vec![
+            Span::styled(format!("  Bitrate: {} kbps", self.config.audio_settings.bitrate), Style::default().fg(Color::Gray)),
+        ]));
+        settings_text.push(Line::from(vec![
+            Span::styled(format!("  Channels: {}", self.config.audio_settings.channels), Style::default().fg(Color::Gray)),
+        ]));
+        settings_text.push(Line::from(vec![
+            Span::styled(format!("  Speech Optimized: {}", self.config.audio_settings.speech_optimized), Style::default().fg(Color::Gray)),
+        ]));
+        
+        settings_text.push(Line::from(""));
+        settings_text.push(Line::from(vec![
+            Span::styled("↑↓ Navigate  ⏎ Enter  ⎋ Esc", Style::default().fg(Color::Gray)),
+        ]));
+
+        let settings_paragraph = Paragraph::new(settings_text)
+            .style(Style::default().fg(Color::White))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Settings")
+                    .title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+                    .border_style(Style::default().fg(Color::Cyan))
+            )
+            .wrap(Wrap { trim: true });
+
+        f.render_widget(settings_paragraph, popup_area);
     }
 
     fn render_message_popup(&self, f: &mut Frame, area: ratatui::layout::Rect) {
@@ -1587,7 +1888,7 @@ impl Dashboard {
         // Start transcription in background task
         let input_path_clone = input_path.clone();
         self.transcription_task = Some(tokio::spawn(async move {
-            transcribe_file_silent(&input_path_clone, Some(ModelSize::Turbo)).await
+            transcribe_file_silent(&input_path_clone, Some(LocalModelSize::Turbo)).await
         }));
         
         Ok(())
