@@ -1,11 +1,10 @@
-use std::env;
 use std::path::PathBuf;
 use structopt::StructOpt;
 use scriba::record::record;
-use scriba::transcribe::transcribe_file;
+use scriba::transcribe::{transcribe_file, ModelSize};
 use scriba::dashboard::Dashboard;
 use scriba::audio::{AudioFormat, CompressionSettings};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::Local;
 use std::io::{self, Write};
 
@@ -26,8 +25,6 @@ enum Command {
         name: Option<String>,
         #[structopt(short = "s", long = "skip-transcription", help = "Skip transcription after recording")]
         skip_transcription: bool,
-        #[structopt(long = "api-key", help = "OpenAI API key (optional, falls back to OPENAI_API_KEY env var)")]
-        api_key: Option<String>,
         #[structopt(long = "format", help = "Audio format (wav, compressed, mp3)", default_value = "wav")]
         format: AudioFormat,
         #[structopt(long = "sample-rate", help = "Sample rate in Hz", default_value = "48000")]
@@ -38,14 +35,16 @@ enum Command {
         channels: u16,
         #[structopt(long = "speech-optimized", help = "Use speech-optimized compression settings")]
         speech_optimized: bool,
+        #[structopt(long = "model", help = "Whisper model size (tiny|base|small|medium|large|turbo)", default_value = "medium")]
+        model: ModelSize,
     },
     Transcribe {
         #[structopt(parse(from_os_str), help = "Path to the input recording file or directory name")]
         input: PathBuf,
         #[structopt(short = "n", long = "name", help = "Optional name for the transcript (auto-generated if not provided)")]
         name: Option<String>,
-        #[structopt(long = "api-key", help = "OpenAI API key (optional, falls back to OPENAI_API_KEY env var)")]
-        api_key: Option<String>,
+        #[structopt(long = "model", help = "Whisper model size (tiny|base|small|medium|large|turbo)", default_value = "medium")]
+        model: ModelSize,
     },
 }
 
@@ -54,15 +53,6 @@ enum Command {
 struct Cli {
     #[structopt(subcommand)]
     command: Option<Command>,
-}
-
-fn get_api_key(provided_key: Option<String>) -> Result<String> {
-    if let Some(key) = provided_key {
-        Ok(key)
-    } else {
-        env::var("OPENAI_API_KEY")
-            .context("Please provide an API key using --api-key or set the OPENAI_API_KEY environment variable")
-    }
 }
 
 fn generate_filename(name: Option<String>) -> String {
@@ -134,8 +124,6 @@ async fn interactive_mode() -> Result<()> {
             "1" => {
                 println!("\n╭─ RECORD + AUTO-TRANSCRIBE ─────────────────────────────╮");
                 let name = get_optional_input("Recording name (optional)")?;
-                let api_key = get_optional_input("OpenAI API key (optional)")?;
-                let api_key = get_api_key(api_key)?;
                 
                 println!("│ Starting recording session...                          │");
                 println!("╰────────────────────────────────────────────────────────╯\n");
@@ -151,7 +139,7 @@ async fn interactive_mode() -> Result<()> {
                     let transcript_output = audio_output.clone();
                     println!("\n🎙️ Recording complete! Starting transcription...");
                     
-                    match transcribe_file(&audio_output, &transcript_output, &api_key).await {
+                    match transcribe_file(&audio_output, &transcript_output, Some(ModelSize::Medium)).await {
                         Ok(()) => {
                             println!("✅ Transcription complete!");
                             println!("📁 Files saved in: ~/scriba_recordings/{}/", recording_name);
@@ -190,8 +178,6 @@ async fn interactive_mode() -> Result<()> {
                 println!("\n╭─ TRANSCRIBE EXISTING FILE ─────────────────────────────╮");
                 let input_path = get_user_input("Path to audio file")?;
                 let name = get_optional_input("Transcript name (optional)")?;
-                let api_key = get_optional_input("OpenAI API key (optional)")?;
-                let api_key = get_api_key(api_key)?;
                 
                 let output = if let Some(n) = name {
                     let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
@@ -205,7 +191,7 @@ async fn interactive_mode() -> Result<()> {
                 println!("│ Starting transcription...                              │");
                 println!("╰────────────────────────────────────────────────────────╯\n");
                 
-                match transcribe_file(&PathBuf::from(input_path), &output, &api_key).await {
+                match transcribe_file(&PathBuf::from(input_path), &output, Some(ModelSize::Medium)).await {
                     Ok(()) => {
                         println!("✅ Transcription complete!");
                         println!("📁 File saved in: ~/scriba_recordings/{}/", output.display());
@@ -286,12 +272,12 @@ async fn main() -> Result<()> {
                 Command::Record {
                     name,
                     skip_transcription,
-                    api_key,
                     format,
                     sample_rate,
                     bitrate,
                     channels,
                     speech_optimized,
+                    model,
                 } => {
                     // Generate automatic filename
                     let recording_name = generate_filename(name.clone());
@@ -306,8 +292,6 @@ async fn main() -> Result<()> {
                         speech_optimized,
                     };
                     
-                    // Get API key from parameter or environment
-                    let api_key = get_api_key(api_key)?;
                     // Start the recording task
                     let record_result = record(audio_output.clone(), Some(compression_settings)).await;
 
@@ -315,7 +299,7 @@ async fn main() -> Result<()> {
                         // Use the same directory as the recording
                         let transcript_output = audio_output.clone();
                         
-                        match transcribe_file(&audio_output, &transcript_output, &api_key).await {
+                        match transcribe_file(&audio_output, &transcript_output, Some(model)).await {
                             Ok(()) => {
                                 println!("Transcription saved to: {:?}", transcript_output);
                             }
@@ -328,7 +312,7 @@ async fn main() -> Result<()> {
                     // Return the result of the record task
                     record_result
                 }
-                Command::Transcribe { input, name, api_key } => {
+                Command::Transcribe { input, name, model } => {
                     // Generate automatic transcript filename if needed
                     let output = if let Some(n) = name {
                         let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
@@ -339,10 +323,8 @@ async fn main() -> Result<()> {
                         PathBuf::from(format!("{}_transcript", timestamp))
                     };
                     
-                    // Get API key from parameter or environment
-                    let api_key = get_api_key(api_key)?;
                     // Transcribe the specified file
-                    let transcription = transcribe_file(&input, &output, &api_key).await;
+                    let transcription = transcribe_file(&input, &output, Some(model)).await;
                     transcription
                 }
             }

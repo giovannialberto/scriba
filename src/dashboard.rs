@@ -1,6 +1,6 @@
 use crate::database::{Database, Recording, RecordingStats};
 use crate::record::record_with_control;
-use crate::transcribe::transcribe_file_silent;
+use crate::transcribe::{transcribe_file_silent, ModelSize};
 use crate::audio::CompressionSettings;
 use tokio::sync::mpsc;
 use anyhow::Result;
@@ -19,7 +19,6 @@ use ratatui::{
     },
     Frame, Terminal,
 };
-use std::env;
 use std::io;
 
 const ASCII_ART: &str = r#" ███████  ██████ ██████  ██ ██████   █████  
@@ -168,30 +167,16 @@ impl Dashboard {
                         Ok(Ok(recording_name)) => {
                             // Recording completed successfully
                             if let Some(RecordingMode::RecordAndTranscribe) = recording_mode {
-                                // Start transcription phase
-                                let api_key = match std::env::var("OPENAI_API_KEY") {
-                                    Ok(key) => key,
-                                    Err(_) => {
-                                        self.stop_progress_animation();
-                                        self.message = "❌ OPENAI_API_KEY required for transcription".to_string();
-                                        self.show_message = true;
-                                        // Reload data to show new recording
-                                        let _ = self.load_recordings();
-                                        let _ = self.load_stats();
-                                        continue;
-                                    }
-                                };
-                                
+                                // Start transcription phase (local, no API key)
                                 // Update progress message for transcription phase
                                 self.progress_animation = Some("📝 Transcribing recording".to_string());
                                 self.progress_frame = 0;
                                 
                                 // Start transcription
                                 let input_path = PathBuf::from(&recording_name);
-                                let api_key_clone = api_key.clone();
                                 let input_path_clone = input_path.clone();
                                 self.transcription_task = Some(tokio::spawn(async move {
-                                    transcribe_file_silent(&input_path_clone, &api_key_clone).await
+                                    transcribe_file_silent(&input_path_clone, Some(ModelSize::Turbo)).await
                                 }));
                             } else {
                                 // Recording only mode - complete
@@ -1499,13 +1484,6 @@ impl Dashboard {
             return Ok(());
         }
         
-        // Check API key availability
-        if env::var("OPENAI_API_KEY").is_err() {
-            self.message = "⚠️ OPENAI_API_KEY environment variable not set".to_string();
-            self.show_message = true;
-            return Ok(());
-        }
-        
         // Show immediate progress animation
         self.progress_animation = Some("🎙️ Recording... (Press Esc to stop)".to_string());
         self.progress_frame = 0;
@@ -1593,22 +1571,7 @@ impl Dashboard {
             self.last_transcribe_warning = None;
         }
         
-        // Get API key
-        let api_key = match env::var("OPENAI_API_KEY") {
-            Ok(key) => key,
-            Err(_) => {
-                self.message = "❌ OPENAI_API_KEY environment variable required".to_string();
-                self.show_message = true;
-                return Ok(());
-            }
-        };
-        
-        if api_key.is_empty() {
-            self.message = "❌ OPENAI_API_KEY environment variable is empty".to_string();
-            self.show_message = true;
-            return Ok(());
-        }
-        
+        // No API key required in local transcription mode
         let display_name = selected_recording.display_name
             .as_ref()
             .unwrap_or(&selected_recording.directory_name);
@@ -1622,10 +1585,9 @@ impl Dashboard {
         let input_path = PathBuf::from(&selected_recording.directory_name);
         
         // Start transcription in background task
-        let api_key_clone = api_key.clone();
         let input_path_clone = input_path.clone();
         self.transcription_task = Some(tokio::spawn(async move {
-            transcribe_file_silent(&input_path_clone, &api_key_clone).await
+            transcribe_file_silent(&input_path_clone, Some(ModelSize::Turbo)).await
         }));
         
         Ok(())

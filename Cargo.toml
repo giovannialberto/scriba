@@ -2,7 +2,7 @@
 name = "scriba"
 version = "0.8.1"
 edition = "2021"
-description = "A simple CLI tool for recording and transcribing audio using OpenAI's Whisper API"
+description = "A CLI tool for recording and transcribing audio locally using Whisper (whisper-rs)"
 authors = ["Giovanni Alberto Falcione"]
 license = "MIT"
 repository = "https://github.com/giovannialberto/scriba"
@@ -14,7 +14,7 @@ categories = ["command-line-utilities", "multimedia::audio"]
 
 [dependencies]
 structopt = "0.3"
-reqwest = { version = "0.11", features = ["multipart"] }
+reqwest = { version = "0.11", features = ["multipart", "stream"] }
 tokio = { version = "1", features = ["full"] }
 dotenv = "0.15.0"
 cpal = "0.15.2"
@@ -30,3 +30,6 @@ serde = { version = "1.0", features = ["derive"] }
 crossterm = "0.27"
 ratatui = "0.26"
 arboard = "3.3"
+whisper-rs = "0.15"
+num_cpus = "1.16"
+futures-util = "0.3"
