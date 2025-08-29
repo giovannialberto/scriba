@@ -1,19 +1,23 @@
-use std::path::PathBuf;
-use anyhow::Context;
-use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
-use cpal::traits::{HostTrait, DeviceTrait, StreamTrait};
-use tokio::signal;
-use lazy_static::lazy_static;
-use dirs::home_dir;
-use std::time::{Duration, Instant};
+use crate::audio::{
+    convert_wav_to_mp3, create_encoder, AudioEncoder, AudioFormat, CompressionSettings,
+};
 use crate::database::{Database, Recording};
-use crate::audio::{CompressionSettings, create_encoder, AudioEncoder, AudioFormat, convert_wav_to_mp3};
+use anyhow::Context;
 use chrono::Utc;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use dirs::home_dir;
+use lazy_static::lazy_static;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tokio::signal;
+use tokio::sync::mpsc;
 
 lazy_static! {
     static ref BASE_PATH: PathBuf = {
-        let path = home_dir().expect("error home dir").join("scriba_recordings");
+        let path = home_dir()
+            .expect("error home dir")
+            .join("scriba_recordings");
         if !path.exists() {
             std::fs::create_dir_all(&path).expect("Failed to create directory");
         }
@@ -38,10 +42,10 @@ impl AudioLevelMonitor {
         // Calculate RMS (Root Mean Square) for audio level
         let sum_of_squares: f32 = samples.iter().map(|&s| s * s).sum();
         let rms = (sum_of_squares / samples.len() as f32).sqrt();
-        
+
         // Smooth the level with a simple moving average
         self.level = self.level * 0.8 + rms * 0.2;
-        
+
         // Return level every 100ms for TUI updates
         if self.last_update.elapsed() >= Duration::from_millis(100) {
             self.last_update = Instant::now();
@@ -55,8 +59,10 @@ impl AudioLevelMonitor {
 }
 
 // Main recording function
-pub async fn record(output_path: PathBuf, compression_settings: Option<CompressionSettings>) -> Result<(), anyhow::Error> {
-
+pub async fn record(
+    output_path: PathBuf,
+    compression_settings: Option<CompressionSettings>,
+) -> Result<(), anyhow::Error> {
     // Get the default input device
     let host = cpal::default_host();
     let device = host
@@ -68,7 +74,7 @@ pub async fn record(output_path: PathBuf, compression_settings: Option<Compressi
         .default_input_config()
         .expect("Failed to get default input config");
     println!("Default input config: {:?}", config);
-    
+
     // Save config values for database insertion (before they're consumed)
     let (sample_rate, channels) = if let Some(ref settings) = compression_settings {
         (settings.sample_rate as i64, settings.channels as i64)
@@ -78,28 +84,33 @@ pub async fn record(output_path: PathBuf, compression_settings: Option<Compressi
 
     // Always record as WAV first (for perfect quality), then convert if needed
     let wav_file_path = BASE_PATH.join(&output_path).join("recording.wav");
-    
+
     // Determine final file path and format
-    let (final_file_path, audio_format_str, needs_conversion) = if let Some(ref settings) = compression_settings {
-        match settings.format {
-            AudioFormat::Mp3 => {
-                let mp3_path = BASE_PATH.join(&output_path).join("recording.mp3");
-                (mp3_path, "mp3".to_string(), true)
-            },
-            _ => {
-                let filename = settings.get_filename("recording");
-                (BASE_PATH.join(&output_path).join(filename), settings.format.to_string().to_lowercase(), false)
+    let (final_file_path, audio_format_str, needs_conversion) =
+        if let Some(ref settings) = compression_settings {
+            match settings.format {
+                AudioFormat::Mp3 => {
+                    let mp3_path = BASE_PATH.join(&output_path).join("recording.mp3");
+                    (mp3_path, "mp3".to_string(), true)
+                }
+                _ => {
+                    let filename = settings.get_filename("recording");
+                    (
+                        BASE_PATH.join(&output_path).join(filename),
+                        settings.format.to_string().to_lowercase(),
+                        false,
+                    )
+                }
             }
-        }
-    } else {
-        (wav_file_path.clone(), "wav".to_string(), false)
-    };
-    
+        } else {
+            (wav_file_path.clone(), "wav".to_string(), false)
+        };
+
     // Ensure the recording directory exists
     if let Some(parent) = wav_file_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    
+
     // Always create WAV encoder with device settings (perfect quality recording)
     let recording_settings = CompressionSettings {
         format: AudioFormat::Wav,
@@ -129,25 +140,33 @@ pub async fn record(output_path: PathBuf, compression_settings: Option<Compressi
     let stream = match config.sample_format() {
         cpal::SampleFormat::I8 => device.build_input_stream(
             &config.into(),
-            move |data, _: &_| write_input_data_with_monitoring_i8(data, &encoder_2, &level_monitor_2),
+            move |data, _: &_| {
+                write_input_data_with_monitoring_i8(data, &encoder_2, &level_monitor_2)
+            },
             err_fn,
             None,
         )?,
         cpal::SampleFormat::I16 => device.build_input_stream(
             &config.into(),
-            move |data, _: &_| write_input_data_with_monitoring_i16(data, &encoder_2, &level_monitor_2),
+            move |data, _: &_| {
+                write_input_data_with_monitoring_i16(data, &encoder_2, &level_monitor_2)
+            },
             err_fn,
             None,
         )?,
         cpal::SampleFormat::I32 => device.build_input_stream(
             &config.into(),
-            move |data, _: &_| write_input_data_with_monitoring_i32(data, &encoder_2, &level_monitor_2),
+            move |data, _: &_| {
+                write_input_data_with_monitoring_i32(data, &encoder_2, &level_monitor_2)
+            },
             err_fn,
             None,
         )?,
         cpal::SampleFormat::F32 => device.build_input_stream(
             &config.into(),
-            move |data, _: &_| write_input_data_with_monitoring_f32(data, &encoder_2, &level_monitor_2),
+            move |data, _: &_| {
+                write_input_data_with_monitoring_f32(data, &encoder_2, &level_monitor_2)
+            },
             err_fn,
             None,
         )?,
@@ -167,7 +186,7 @@ pub async fn record(output_path: PathBuf, compression_settings: Option<Compressi
     // Clear the level display line and show completion message
     print!("\r");
     println!("Recording {} complete!", wav_file_path.display());
-    
+
     // Finalize the encoder
     if let Some(encoder) = encoder.lock().unwrap().as_mut() {
         encoder.finalize()?;
@@ -178,26 +197,29 @@ pub async fn record(output_path: PathBuf, compression_settings: Option<Compressi
         if let Some(ref settings) = compression_settings {
             convert_wav_to_mp3(&wav_file_path, &final_file_path, settings)
                 .context("Failed to convert WAV to MP3")?;
-            
+
             // Optionally remove the WAV file after successful conversion
-            std::fs::remove_file(&wav_file_path)
-                .context("Failed to remove temporary WAV file")?;
+            std::fs::remove_file(&wav_file_path).context("Failed to remove temporary WAV file")?;
         }
     }
 
     // Use the final file path for metadata
-    let metadata_file_path = if needs_conversion { &final_file_path } else { &wav_file_path };
+    let metadata_file_path = if needs_conversion {
+        &final_file_path
+    } else {
+        &wav_file_path
+    };
 
     // Save recording metadata to database
     let mut db = Database::new().context("Failed to connect to database")?;
-    
+
     // Get file size and duration info
     let file_metadata = std::fs::metadata(metadata_file_path)?;
     let file_size_bytes = file_metadata.len() as i64;
-    
+
     // Calculate duration based on file format
     let duration_seconds = calculate_audio_duration(metadata_file_path, sample_rate, channels)?;
-    
+
     // Create recording record
     let recording = Recording {
         id: None,
@@ -223,27 +245,35 @@ pub async fn record(output_path: PathBuf, compression_settings: Option<Compressi
         search_index: None,
         categories: None,
         confidence_score: None,
-        audio_path: metadata_file_path.file_name().unwrap().to_string_lossy().to_string(),
+        audio_path: metadata_file_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string(),
         transcript_path: None,
     };
-    
+
     match db.insert_recording(&recording) {
         Ok(id) => println!("📊 Recording saved to database with ID: {}", id),
         Err(e) => eprintln!("⚠️ Warning: Failed to save recording to database: {}", e),
     }
-    
+
     Ok(())
 }
 
 type AudioEncoderHandle = Arc<Mutex<Option<Box<dyn AudioEncoder>>>>;
 
 // Specialized functions for level monitoring with audio level feedback
-fn write_input_data_with_monitoring_f32(input: &[f32], encoder: &AudioEncoderHandle, level_monitor: &Arc<Mutex<AudioLevelMonitor>>) {
+fn write_input_data_with_monitoring_f32(
+    input: &[f32],
+    encoder: &AudioEncoderHandle,
+    level_monitor: &Arc<Mutex<AudioLevelMonitor>>,
+) {
     // Update the level monitor with f32 samples
     if let Ok(mut monitor) = level_monitor.try_lock() {
         monitor.update_level(input);
     }
-    
+
     // Write audio data
     if let Ok(mut guard) = encoder.try_lock() {
         if let Some(encoder) = guard.as_mut() {
@@ -252,14 +282,18 @@ fn write_input_data_with_monitoring_f32(input: &[f32], encoder: &AudioEncoderHan
     }
 }
 
-fn write_input_data_with_monitoring_i16(input: &[i16], encoder: &AudioEncoderHandle, level_monitor: &Arc<Mutex<AudioLevelMonitor>>) {
+fn write_input_data_with_monitoring_i16(
+    input: &[i16],
+    encoder: &AudioEncoderHandle,
+    level_monitor: &Arc<Mutex<AudioLevelMonitor>>,
+) {
     // Convert i16 to f32 for level calculation and encoding
     let f32_samples: Vec<f32> = input.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
-    
+
     if let Ok(mut monitor) = level_monitor.try_lock() {
         monitor.update_level(&f32_samples);
     }
-    
+
     // Write audio data
     if let Ok(mut guard) = encoder.try_lock() {
         if let Some(encoder) = guard.as_mut() {
@@ -268,14 +302,18 @@ fn write_input_data_with_monitoring_i16(input: &[i16], encoder: &AudioEncoderHan
     }
 }
 
-fn write_input_data_with_monitoring_i32(input: &[i32], encoder: &AudioEncoderHandle, level_monitor: &Arc<Mutex<AudioLevelMonitor>>) {
+fn write_input_data_with_monitoring_i32(
+    input: &[i32],
+    encoder: &AudioEncoderHandle,
+    level_monitor: &Arc<Mutex<AudioLevelMonitor>>,
+) {
     // Convert i32 to f32 for level calculation and encoding
     let f32_samples: Vec<f32> = input.iter().map(|&s| s as f32 / i32::MAX as f32).collect();
-    
+
     if let Ok(mut monitor) = level_monitor.try_lock() {
         monitor.update_level(&f32_samples);
     }
-    
+
     // Write audio data
     if let Ok(mut guard) = encoder.try_lock() {
         if let Some(encoder) = guard.as_mut() {
@@ -284,14 +322,18 @@ fn write_input_data_with_monitoring_i32(input: &[i32], encoder: &AudioEncoderHan
     }
 }
 
-fn write_input_data_with_monitoring_i8(input: &[i8], encoder: &AudioEncoderHandle, level_monitor: &Arc<Mutex<AudioLevelMonitor>>) {
+fn write_input_data_with_monitoring_i8(
+    input: &[i8],
+    encoder: &AudioEncoderHandle,
+    level_monitor: &Arc<Mutex<AudioLevelMonitor>>,
+) {
     // Convert i8 to f32 for level calculation and encoding
     let f32_samples: Vec<f32> = input.iter().map(|&s| s as f32 / i8::MAX as f32).collect();
-    
+
     if let Ok(mut monitor) = level_monitor.try_lock() {
         monitor.update_level(&f32_samples);
     }
-    
+
     // Write audio data
     if let Ok(mut guard) = encoder.try_lock() {
         if let Some(encoder) = guard.as_mut() {
@@ -300,43 +342,51 @@ fn write_input_data_with_monitoring_i8(input: &[i8], encoder: &AudioEncoderHandl
     }
 }
 
-pub fn calculate_audio_duration(file_path: &std::path::Path, _sample_rate: i64, _channels: i64) -> Result<i64, anyhow::Error> {
-    let extension = file_path.extension()
+pub fn calculate_audio_duration(
+    file_path: &std::path::Path,
+    _sample_rate: i64,
+    _channels: i64,
+) -> Result<i64, anyhow::Error> {
+    let extension = file_path
+        .extension()
         .and_then(|ext| ext.to_str())
         .unwrap_or("");
-    
+
     match extension.to_lowercase().as_str() {
         "wav" => {
             // Use hound to properly read the WAV file header and get accurate info
             let reader = hound::WavReader::open(file_path)
                 .context("Failed to open WAV file for duration calculation")?;
-            
+
             let spec = reader.spec();
             let wav_sample_rate = spec.sample_rate as i64;
-            
+
             // Get the total number of samples
             let duration_samples = reader.duration() as i64;
-            
+
             // Calculate duration in seconds
             let duration_seconds = duration_samples / wav_sample_rate;
-            
+
             Ok(duration_seconds)
-        },
+        }
         "mp3" => {
             // For MP3, use ffprobe for accurate duration calculation
             let output = std::process::Command::new("ffprobe")
-                .arg("-v").arg("quiet")
-                .arg("-show_entries").arg("format=duration")
-                .arg("-of").arg("csv=p=0")
+                .arg("-v")
+                .arg("quiet")
+                .arg("-show_entries")
+                .arg("format=duration")
+                .arg("-of")
+                .arg("csv=p=0")
                 .arg(file_path)
                 .output();
-                
+
             match output {
                 Ok(output) if output.status.success() => {
                     let duration_str = String::from_utf8_lossy(&output.stdout);
                     let duration_f64: f64 = duration_str.trim().parse().unwrap_or(1.0);
                     Ok(duration_f64.round() as i64)
-                },
+                }
                 _ => {
                     // Fallback: estimate using 32kbps bitrate (our default)
                     let file_size = std::fs::metadata(file_path)?.len() as i64;
@@ -345,7 +395,7 @@ pub fn calculate_audio_duration(file_path: &std::path::Path, _sample_rate: i64, 
                     Ok(estimated_duration.max(1))
                 }
             }
-        },
+        }
         _ => {
             // Fallback: estimate based on provided sample rate and assume reasonable file size
             Ok(1) // Default to 1 second for unknown formats
@@ -370,7 +420,7 @@ pub async fn record_with_control(
     let config = device
         .default_input_config()
         .map_err(|e| anyhow::anyhow!("Failed to get default input config: {}", e))?;
-    
+
     // Save config values for database insertion (before they're consumed)
     let (sample_rate, channels) = if let Some(ref settings) = compression_settings {
         (settings.sample_rate as i64, settings.channels as i64)
@@ -380,28 +430,33 @@ pub async fn record_with_control(
 
     // Always record as WAV first (for perfect quality), then convert if needed
     let wav_file_path = BASE_PATH.join(&output_path).join("recording.wav");
-    
+
     // Determine final file path and format
-    let (final_file_path, audio_format_str, needs_conversion) = if let Some(ref settings) = compression_settings {
-        match settings.format {
-            AudioFormat::Mp3 => {
-                let mp3_path = BASE_PATH.join(&output_path).join("recording.mp3");
-                (mp3_path, "mp3".to_string(), true)
-            },
-            _ => {
-                let filename = settings.get_filename("recording");
-                (BASE_PATH.join(&output_path).join(filename), settings.format.to_string().to_lowercase(), false)
+    let (final_file_path, audio_format_str, needs_conversion) =
+        if let Some(ref settings) = compression_settings {
+            match settings.format {
+                AudioFormat::Mp3 => {
+                    let mp3_path = BASE_PATH.join(&output_path).join("recording.mp3");
+                    (mp3_path, "mp3".to_string(), true)
+                }
+                _ => {
+                    let filename = settings.get_filename("recording");
+                    (
+                        BASE_PATH.join(&output_path).join(filename),
+                        settings.format.to_string().to_lowercase(),
+                        false,
+                    )
+                }
             }
-        }
-    } else {
-        (wav_file_path.clone(), "wav".to_string(), false)
-    };
-    
+        } else {
+            (wav_file_path.clone(), "wav".to_string(), false)
+        };
+
     // Ensure the recording directory exists
     if let Some(parent) = wav_file_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    
+
     // Always create WAV encoder with device settings (perfect quality recording)
     let recording_settings = CompressionSettings {
         format: AudioFormat::Wav,
@@ -429,7 +484,12 @@ pub async fn record_with_control(
         cpal::SampleFormat::F32 => device.build_input_stream(
             &config.into(),
             move |data, _: &_| {
-                write_input_data_with_level_feedback_f32(data, &encoder_2, &level_monitor_2, &level_tx_2)
+                write_input_data_with_level_feedback_f32(
+                    data,
+                    &encoder_2,
+                    &level_monitor_2,
+                    &level_tx_2,
+                )
             },
             err_fn,
             None,
@@ -447,7 +507,7 @@ pub async fn record_with_control(
     // Wait for stop signal in a blocking way to avoid Send issues
     let stop_received = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let _stop_received_clone = stop_received.clone();
-    
+
     // Use a std thread to receive the stop signal
     let (stop_tx, stop_rx_std) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -457,11 +517,11 @@ pub async fn record_with_control(
             let _ = stop_tx.send(());
         });
     });
-    
+
     // Wait for stop signal
     let _ = stop_rx_std.recv();
     stop_received.store(true, std::sync::atomic::Ordering::Relaxed);
-    
+
     // Stop the stream
     drop(stream);
 
@@ -481,7 +541,7 @@ pub async fn record_with_control(
 
     // Store recording metadata in database
     let recording_duration = calculate_audio_duration(&final_file_path, sample_rate, channels)?;
-    
+
     let recording = Recording {
         id: None,
         directory_name: output_path.to_string_lossy().to_string(),
@@ -506,7 +566,11 @@ pub async fn record_with_control(
         search_index: None,
         categories: None,
         confidence_score: None,
-        audio_path: final_file_path.file_name().unwrap().to_string_lossy().to_string(),
+        audio_path: final_file_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string(),
         transcript_path: None,
     };
 

@@ -1,10 +1,9 @@
+use crate::audio::CompressionSettings;
+use crate::config::{LocalModelSize, ScribaConfig, TranscriptionMode};
 use crate::database::{Database, Recording, RecordingStats};
+use crate::record::calculate_audio_duration;
 use crate::record::record_with_control;
 use crate::transcribe::transcribe_file_silent_with_mode;
-use crate::record::calculate_audio_duration;
-use crate::audio::CompressionSettings;
-use crate::config::{ScribaConfig, TranscriptionMode, LocalModelSize};
-use tokio::sync::mpsc;
 use anyhow::Result;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
@@ -16,26 +15,25 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{
-        Block, Borders, Clear, Paragraph, Wrap, Row, Table, TableState, Cell,
-    },
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
     Frame, Terminal,
 };
 use std::io;
+use tokio::sync::mpsc;
 
 const ASCII_ART: &str = r#" ███████  ██████ ██████  ██ ██████   █████  
 ██      ██      ██   ██ ██ ██   ██ ██   ██ 
 ███████ ██      ██████  ██ ██████  ███████ 
      ██ ██      ██   ██ ██ ██   ██ ██   ██ 
 ███████  ██████ ██   ██ ██ ██████  ██   ██"#;
-use std::path::PathBuf;
-use std::fs;
-use std::time::Duration;
-use chrono::Local;
-use tokio::process::Command as TokioCommand;
-use std::process::Stdio;
-use dirs::home_dir;
 use anyhow::Context;
+use chrono::Local;
+use dirs::home_dir;
+use std::fs;
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::time::Duration;
+use tokio::process::Command as TokioCommand;
 
 pub struct Dashboard {
     db: Database,
@@ -58,24 +56,25 @@ pub struct Dashboard {
     current_playback_pid: Option<u32>,
     playback_finished_rx: Option<mpsc::Receiver<()>>, // Channel to receive playback completion
     last_transcribe_warning: Option<usize>, // Track which recording showed overwrite warning
-    progress_animation: Option<String>, // Base message for progress animation
-    progress_frame: usize, // Animation frame counter
+    progress_animation: Option<String>,     // Base message for progress animation
+    progress_frame: usize,                  // Animation frame counter
     transcription_task: Option<tokio::task::JoinHandle<Result<(), anyhow::Error>>>, // Background transcription task
     recording_task: Option<tokio::task::JoinHandle<Result<String, anyhow::Error>>>, // Background recording task (returns recording name)
     recording_mode: Option<RecordingMode>, // Track if we should transcribe after recording
     recording_stop_tx: Option<mpsc::Sender<()>>, // Channel to stop recording
     recording_level_rx: Option<mpsc::Receiver<f32>>, // Channel to receive volume levels
-    current_volume_level: f32, // Current recording volume for display
-    config: ScribaConfig, // App configuration
-    settings_selection: usize, // Current setting selection
-    editing_api_key: bool, // Whether we're editing API key
-    api_key_input: String, // API key input buffer
+    current_volume_level: f32,             // Current recording volume for display
+    config: ScribaConfig,                  // App configuration
+    settings_selection: usize,             // Current setting selection
+    editing_api_key: bool,                 // Whether we're editing API key
+    api_key_input: String,                 // API key input buffer
     return_to_view: Option<DashboardView>, // View to return to after message dismissal
     // File import dialog state
     show_file_dialog: bool,
     file_path_input: String,
     file_name_input: String,
     file_dialog_stage: FileDialogStage, // Current stage of file import process
+    is_retranscribing: bool,            // Track if current transcription is a re-transcription
 }
 
 #[derive(Debug, PartialEq)]
@@ -87,8 +86,8 @@ enum DashboardView {
 
 #[derive(Debug, PartialEq)]
 enum FileDialogStage {
-    FilePath,  // Asking for file path
-    FileName,  // Asking for display name (optional)
+    FilePath, // Asking for file path
+    FileName, // Asking for display name (optional)
 }
 
 #[derive(Debug, Clone)]
@@ -151,6 +150,7 @@ impl Dashboard {
             file_path_input: String::new(),
             file_name_input: String::new(),
             file_dialog_stage: FileDialogStage::FilePath,
+            is_retranscribing: false,
         })
     }
 
@@ -180,34 +180,50 @@ impl Dashboard {
         result
     }
 
-    async fn run_app<B: ratatui::backend::Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
+    async fn run_app<B: ratatui::backend::Backend>(
+        &mut self,
+        terminal: &mut Terminal<B>,
+    ) -> Result<()> {
         loop {
             // Check if recording task completed
             if let Some(task) = &mut self.recording_task {
                 if task.is_finished() {
                     let completed_task = self.recording_task.take().unwrap();
                     let recording_mode = self.recording_mode.take();
-                    
+
                     // Clean up channels
                     self.recording_stop_tx = None;
                     self.recording_level_rx = None;
                     self.current_volume_level = 0.0;
-                    
+
                     match completed_task.await {
                         Ok(Ok(recording_name)) => {
                             // Recording completed successfully
                             if let Some(RecordingMode::RecordAndTranscribe) = recording_mode {
                                 // Start transcription phase (local, no API key)
                                 // Update progress message for transcription phase
-                                self.progress_animation = Some("📝 Transcribing recording".to_string());
+                                let model_info = match &self.config.transcription {
+                                    crate::config::TranscriptionMode::Local { model_size } => {
+                                        format!("Local ({})", model_size)
+                                    }
+                                    crate::config::TranscriptionMode::Api { .. } => {
+                                        "OpenAI API".to_string()
+                                    }
+                                };
+                                self.progress_animation =
+                                    Some(format!("📝 Transcribing with {}", model_info));
                                 self.progress_frame = 0;
-                                
+
                                 // Start transcription
                                 let input_path = PathBuf::from(&recording_name);
                                 let input_path_clone = input_path.clone();
                                 let transcription_mode = self.config.transcription.clone();
                                 self.transcription_task = Some(tokio::spawn(async move {
-                                    transcribe_file_silent_with_mode(&input_path_clone, Some(transcription_mode)).await
+                                    transcribe_file_silent_with_mode(
+                                        &input_path_clone,
+                                        Some(transcription_mode),
+                                    )
+                                    .await
                                 }));
                             } else {
                                 // Recording only mode - complete
@@ -232,7 +248,7 @@ impl Dashboard {
                     }
                 }
             }
-            
+
             // Check if transcription task completed
             if let Some(task) = &mut self.transcription_task {
                 if task.is_finished() {
@@ -240,9 +256,14 @@ impl Dashboard {
                     match completed_task.await {
                         Ok(Ok(())) => {
                             self.stop_progress_animation();
-                            self.message = "✅ Recording and transcription complete!".to_string();
+                            self.message = if self.is_retranscribing {
+                                "✅ Re-transcription complete!".to_string()
+                            } else {
+                                "✅ Recording and transcription complete!".to_string()
+                            };
                             self.show_message = true;
-                            // Reload data to show new transcript
+                            self.is_retranscribing = false;
+                            // Reload data to show updated transcript
                             let _ = self.load_recordings();
                             let _ = self.load_stats();
                         }
@@ -250,23 +271,25 @@ impl Dashboard {
                             self.stop_progress_animation();
                             self.message = format!("❌ Transcription failed: {}", err);
                             self.show_message = true;
+                            self.is_retranscribing = false;
                         }
                         Err(_) => {
                             self.stop_progress_animation();
                             self.message = "❌ Transcription task failed".to_string();
                             self.show_message = true;
+                            self.is_retranscribing = false;
                         }
                     }
                 }
             }
-            
+
             // Receive volume levels from recording
             if let Some(level_rx) = &mut self.recording_level_rx {
                 if let Ok(level) = level_rx.try_recv() {
                     self.current_volume_level = level;
                 }
             }
-            
+
             // Check for playback completion
             if let Some(finished_rx) = &mut self.playback_finished_rx {
                 if finished_rx.try_recv().is_ok() {
@@ -274,12 +297,12 @@ impl Dashboard {
                     self.playback_finished_rx = None;
                 }
             }
-            
+
             // Update progress animation if active
             if self.progress_animation.is_some() {
                 self.update_progress_message();
             }
-            
+
             terminal.draw(|f| self.ui(f))?;
 
             if event::poll(Duration::from_millis(100))? {
@@ -305,9 +328,9 @@ impl Dashboard {
         // If audio is playing and ESC is pressed, stop it immediately
         if matches!(key_code, KeyCode::Esc) {
             // Check if we're in audio playback mode (either with PID or with playback message)
-            let is_playing_audio = self.current_playback_pid.is_some() || 
-                                  (self.show_message && self.message.contains("Playing:"));
-            
+            let is_playing_audio = self.current_playback_pid.is_some()
+                || (self.show_message && self.message.contains("Playing:"));
+
             if is_playing_audio {
                 // Try both methods to ensure reliable stopping
                 if let Some(pid) = self.current_playback_pid {
@@ -315,18 +338,18 @@ impl Dashboard {
                 }
                 // Also use emergency stop as a fallback (in case PID method fails)
                 self.emergency_stop_all_audio_players()?;
-                
+
                 // Clear playback state
                 self.current_playback_pid = None;
                 self.playback_finished_rx = None;
                 self.show_message = false;
                 self.message.clear();
-                
+
                 // Audio playback stops immediately - return to dashboard
                 return Ok(DashboardAction::Continue);
             }
         }
-        
+
         // If recording is active and Escape is pressed, stop recording
         if self.recording_task.is_some() && matches!(key_code, KeyCode::Esc) {
             // Send stop signal to recording task
@@ -336,18 +359,29 @@ impl Dashboard {
             // The recording task will handle cleanup and completion
             return Ok(DashboardAction::Continue);
         }
-        
+
         if self.show_file_dialog {
             return self.handle_file_dialog_keys(key_code).await;
         }
-        
+
         if self.show_message {
+            // Special-case: allow confirming re-transcribe overwrite with T while message is visible
+            if matches!(key_code, KeyCode::Char('t') | KeyCode::Char('T'))
+                && self.last_transcribe_warning.is_some()
+                && self.progress_animation.is_none()
+            {
+                // Dismiss the warning and trigger the action
+                self.show_message = false;
+                self.message.clear();
+                return Ok(DashboardAction::TranscribeSelected);
+            }
+
             // Don't close message if progress animation is active
             if self.progress_animation.is_none() && matches!(key_code, KeyCode::Esc) {
                 // Only Esc key closes the message popup (consistent behavior)
                 self.show_message = false;
                 self.message.clear();
-                
+
                 // Return to the previous view if one was set
                 if let Some(return_view) = self.return_to_view.take() {
                     self.current_view = return_view;
@@ -365,7 +399,7 @@ impl Dashboard {
             self.current_view = DashboardView::Main;
             return Ok(DashboardAction::Continue);
         }
-        
+
         if self.current_view == DashboardView::Settings {
             return self.handle_settings_keys(key_code).await;
         }
@@ -413,30 +447,26 @@ impl Dashboard {
             KeyCode::PageDown | KeyCode::Char(']') => {
                 self.next_page().await?;
             }
-            KeyCode::Enter => {
-                match self.show_selected_transcript().await {
-                    Ok(()) => {}
-                    Err(e) => {
-                        self.message = format!("❌ Failed to load transcript: {}", e);
-                        self.show_message = true;
-                    }
+            KeyCode::Enter => match self.show_selected_transcript().await {
+                Ok(()) => {}
+                Err(e) => {
+                    self.message = format!("❌ Failed to load transcript: {}", e);
+                    self.show_message = true;
                 }
-            }
+            },
             KeyCode::Char('d') => {
                 self.show_delete_confirmation();
             }
             KeyCode::Delete => {
                 self.show_delete_confirmation();
             }
-            KeyCode::Char('p') | KeyCode::Char('P') => {
-                match self.play_selected_recording().await {
-                    Ok(()) => {}
-                    Err(e) => {
-                        self.message = format!("❌ Failed to play recording: {}", e);
-                        self.show_message = true;
-                    }
+            KeyCode::Char('p') | KeyCode::Char('P') => match self.play_selected_recording().await {
+                Ok(()) => {}
+                Err(e) => {
+                    self.message = format!("❌ Failed to play recording: {}", e);
+                    self.show_message = true;
                 }
-            }
+            },
             _ => {}
         }
 
@@ -461,12 +491,16 @@ impl Dashboard {
 
     fn load_recordings(&mut self) -> Result<()> {
         let offset = (self.current_page * self.page_size) as i64;
-        
+
         self.recordings = if self.search_query.is_empty() {
-            self.db.list_recordings(Some(self.page_size as i64), Some(offset))?
+            self.db
+                .list_recordings(Some(self.page_size as i64), Some(offset))?
         } else {
             let search_results = self.db.search_transcripts(&self.search_query, None)?;
-            search_results.into_iter().map(|(recording, _)| recording).collect()
+            search_results
+                .into_iter()
+                .map(|(recording, _)| recording)
+                .collect()
         };
 
         if !self.recordings.is_empty() {
@@ -489,18 +523,18 @@ impl Dashboard {
                 self.search_mode = false;
                 self.search_query.clear();
                 self.load_recordings()?;
-            },
+            }
             KeyCode::Enter => {
                 self.search_mode = false;
                 self.load_recordings()?;
-            },
+            }
             KeyCode::Backspace => {
                 self.search_query.pop();
-            },
+            }
             KeyCode::Char(c) => {
                 self.search_query.push(c);
-            },
-            _ => {},
+            }
+            _ => {}
         }
         Ok(DashboardAction::Continue)
     }
@@ -538,13 +572,13 @@ impl Dashboard {
         let old_page = self.current_page;
         self.current_page += 1;
         self.load_recordings()?;
-        
+
         // If no recordings found on next page, go back to previous page
         if self.recordings.is_empty() {
             self.current_page = old_page;
             self.load_recordings()?;
         }
-        
+
         Ok(())
     }
 
@@ -571,7 +605,9 @@ impl Dashboard {
                         }
                     }
                 } else {
-                    self.message = "❌ No transcript available for this recording. Use P to play instead.".to_string();
+                    self.message =
+                        "❌ No transcript available for this recording. Use P to play instead."
+                            .to_string();
                     self.show_message = true;
                 }
             }
@@ -589,7 +625,8 @@ impl Dashboard {
                     .ok_or_else(|| anyhow!("Could not find an audio file for this recording"))?;
 
                 // Determine file extension to choose optimal players
-                let is_mp3 = audio_path.extension()
+                let is_mp3 = audio_path
+                    .extension()
                     .and_then(|ext| ext.to_str())
                     .map(|ext| ext.to_lowercase() == "mp3")
                     .unwrap_or(false);
@@ -599,29 +636,44 @@ impl Dashboard {
                 let candidates: Vec<(&str, &[&str])> = if is_mp3 {
                     vec![
                         ("mpv", &["--really-quiet", "--audio-channels=stereo"]),
-                        ("ffplay", &["-nodisp", "-autoexit", "-loglevel", "quiet", "-ac", "2"]),
-                        ("afplay", &[]),         // Last resort for MP3
+                        (
+                            "ffplay",
+                            &["-nodisp", "-autoexit", "-loglevel", "quiet", "-ac", "2"],
+                        ),
+                        ("afplay", &[]), // Last resort for MP3
                     ]
                 } else {
                     vec![
                         ("mpv", &["--really-quiet", "--audio-channels=stereo"]),
-                        ("ffplay", &["-nodisp", "-autoexit", "-loglevel", "quiet", "-ac", "2"]),
-                        ("afplay", &[]),         // Works well with WAV
+                        (
+                            "ffplay",
+                            &["-nodisp", "-autoexit", "-loglevel", "quiet", "-ac", "2"],
+                        ),
+                        ("afplay", &[]), // Works well with WAV
                     ]
                 };
 
                 #[cfg(all(unix, not(target_os = "macos")))]
                 let candidates: Vec<(&str, &[&str])> = vec![
                     ("mpv", &["--really-quiet", "--audio-channels=stereo"]),
-                    ("ffplay", &["-nodisp", "-autoexit", "-loglevel", "quiet", "-ac", "2"]),
-                    ("aplay", &["-c", "2"]),    // Force stereo output
+                    (
+                        "ffplay",
+                        &["-nodisp", "-autoexit", "-loglevel", "quiet", "-ac", "2"],
+                    ),
+                    ("aplay", &["-c", "2"]), // Force stereo output
                 ];
 
                 #[cfg(target_os = "windows")]
                 let candidates: Vec<(&str, &[&str])> = vec![
                     ("mpv", &["--really-quiet", "--audio-channels=stereo"]),
-                    ("ffplay", &["-nodisp", "-autoexit", "-loglevel", "quiet", "-ac", "2"]),
-                    ("powershell", &["-NoProfile", "-Command", "(New-Object Media.SoundPlayer '" ]), // will be handled specially
+                    (
+                        "ffplay",
+                        &["-nodisp", "-autoexit", "-loglevel", "quiet", "-ac", "2"],
+                    ),
+                    (
+                        "powershell",
+                        &["-NoProfile", "-Command", "(New-Object Media.SoundPlayer '"],
+                    ), // will be handled specially
                 ];
 
                 // Try each candidate until one spawns successfully
@@ -631,8 +683,10 @@ impl Dashboard {
                 for (prog, base_args) in candidates {
                     let mut cmd = TokioCommand::new(prog);
                     // Detach from TTY so player doesn't consume keyboard (Esc) input
-                    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-                    
+                    cmd.stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null());
+
                     // For afplay on macOS, check if this is a mono WAV file and needs special handling
                     if prog == "afplay" && recording.channels == 1 && !is_mp3 {
                         // Create a temporary stereo version of the mono WAV file
@@ -643,23 +697,25 @@ impl Dashboard {
                             cmd.arg(&audio_path);
                         }
                     } else {
-                        for a in base_args { cmd.arg(a); }
+                        for a in base_args {
+                            cmd.arg(a);
+                        }
                         cmd.arg(&audio_path);
                     }
-                    
+
                     match cmd.spawn() {
-                        Ok(mut child) => { 
-                            launched_with = Some(prog.to_string()); 
-                            
+                        Ok(mut child) => {
+                            launched_with = Some(prog.to_string());
+
                             // Store child process for potential termination - ensure we have a valid PID
                             if let Some(child_id) = child.id() {
                                 // Store the process ID for killing on key press immediately
                                 self.current_playback_pid = Some(child_id);
-                                
+
                                 // Create channel for playback completion notification
                                 let (finished_tx, finished_rx) = mpsc::channel(1);
                                 self.playback_finished_rx = Some(finished_rx);
-                                
+
                                 tokio::spawn(async move {
                                     let _ = child.wait().await;
                                     let _ = finished_tx.send(()).await;
@@ -671,7 +727,7 @@ impl Dashboard {
                                 continue;
                             }
                         }
-                        Err(e) => { 
+                        Err(e) => {
                             // Store error for debugging if no player works
                             if prog == "mpv" && is_mp3 {
                                 self.message = format!("⚠️ mpv failed to play MP3: {}", e);
@@ -683,22 +739,27 @@ impl Dashboard {
                 #[cfg(target_os = "windows")]
                 {
                     // Try standard players first (mpv, ffplay), then fallback to PowerShell
-                    for (prog, base_args) in &candidates[..candidates.len()-1] { // All except powershell
+                    for (prog, base_args) in &candidates[..candidates.len() - 1] {
+                        // All except powershell
                         let mut cmd = TokioCommand::new(prog);
                         // Detach from TTY so player doesn't consume keyboard (Esc) input
-                        cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-                        for a in base_args { cmd.arg(a); }
+                        cmd.stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null());
+                        for a in base_args {
+                            cmd.arg(a);
+                        }
                         cmd.arg(&audio_path);
                         match cmd.spawn() {
-                            Ok(mut child) => { 
+                            Ok(mut child) => {
                                 if let Some(child_id) = child.id() {
-                                    launched_with = Some(prog.to_string()); 
+                                    launched_with = Some(prog.to_string());
                                     self.current_playback_pid = Some(child_id);
-                                    
+
                                     // Create channel for playback completion notification
                                     let (finished_tx, finished_rx) = mpsc::channel(1);
                                     self.playback_finished_rx = Some(finished_rx);
-                                    
+
                                     tokio::spawn(async move {
                                         let _ = child.wait().await;
                                         let _ = finished_tx.send(()).await;
@@ -709,32 +770,28 @@ impl Dashboard {
                             Err(_e) => continue,
                         }
                     }
-                    
+
                     // PowerShell SoundPlayer fallback if no other player worked
                     if launched_with.is_none() {
                         let escaped = audio_path.to_string_lossy().replace("'", "''");
-                        let ps = format!(
-                            "$p=New-Object Media.SoundPlayer '{}';$p.Play();",
-                            escaped
-                        );
+                        let ps =
+                            format!("$p=New-Object Media.SoundPlayer '{}';$p.Play();", escaped);
                         let mut pscmd = TokioCommand::new("powershell");
                         // Detach from TTY so player doesn't consume keyboard (Esc) input
-                        pscmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-                        match pscmd
-                            .arg("-NoProfile")
-                            .arg("-Command")
-                            .arg(ps)
-                            .spawn()
-                        {
-                            Ok(mut child) => { 
+                        pscmd
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null());
+                        match pscmd.arg("-NoProfile").arg("-Command").arg(ps).spawn() {
+                            Ok(mut child) => {
                                 if let Some(child_id) = child.id() {
                                     launched_with = Some("powershell".to_string());
                                     self.current_playback_pid = Some(child_id);
-                                    
+
                                     // Create channel for playback completion notification
                                     let (finished_tx, finished_rx) = mpsc::channel(1);
                                     self.playback_finished_rx = Some(finished_rx);
-                                    
+
                                     tokio::spawn(async move {
                                         let _ = child.wait().await;
                                         let _ = finished_tx.send(()).await;
@@ -751,7 +808,10 @@ impl Dashboard {
                         .display_name
                         .as_ref()
                         .unwrap_or(&recording.directory_name);
-                    self.message = format!("▶ Playing: {}\nUsing player: {}\n\nPress ESC to stop playback", name, player);
+                    self.message = format!(
+                        "▶ Playing: {}\nUsing player: {}\n\nPress ESC to stop playback",
+                        name, player
+                    );
                     self.show_message = true;
                     return Ok(());
                 }
@@ -765,13 +825,21 @@ impl Dashboard {
                 let hint = "Ensure PowerShell is available or install a player like mpv.";
 
                 Err(anyhow!("No audio player found on PATH. {}", hint))
-            } else { Ok(()) }
-        } else { Ok(()) }
+            } else {
+                Ok(())
+            }
+        } else {
+            Ok(())
+        }
     }
 
     fn find_audio_file(&self, recording: &Recording) -> Option<PathBuf> {
-        let base_path = home_dir()?.join("scriba_recordings").join(&recording.directory_name);
-        if !base_path.exists() { return None; }
+        let base_path = home_dir()?
+            .join("scriba_recordings")
+            .join(&recording.directory_name);
+        if !base_path.exists() {
+            return None;
+        }
         let exts = [
             "wav", "mp3", "m4a", "aac", "flac", "ogg", "opus", "aiff", "aif", "caf",
         ];
@@ -786,6 +854,11 @@ impl Dashboard {
             }
         }
         None
+    }
+
+    fn get_current_recording(&self) -> Option<Recording> {
+        let selected_index = self.table_state.selected()?;
+        self.recordings.get(selected_index).cloned()
     }
 
     fn show_delete_confirmation(&mut self) {
@@ -805,114 +878,164 @@ impl Dashboard {
                     self.transcript_scroll_offset = self.transcript_scroll_offset.saturating_sub(1);
                 }
                 Ok(DashboardAction::Continue)
-            },
+            }
             KeyCode::Down => {
-                // Scroll down (increase offset) 
+                // Scroll down (increase offset)
                 let content_width = 120; // Conservative estimate for terminal width
                 let content_height = 25; // Conservative estimate for terminal height
-                let wrapped_lines = self.wrap_text_to_lines(&self.transcript_content, content_width);
+                let wrapped_lines =
+                    self.wrap_text_to_lines(&self.transcript_content, content_width);
                 let max_scroll = wrapped_lines.len().saturating_sub(content_height);
                 if self.transcript_scroll_offset < max_scroll {
                     self.transcript_scroll_offset += 1;
                 }
                 Ok(DashboardAction::Continue)
-            },
+            }
             KeyCode::Char('c') | KeyCode::Char('C') => {
                 // Copy transcript to clipboard
                 match self.copy_transcript_to_clipboard() {
                     Ok(()) => {
                         self.message = "📋 Transcript copied to clipboard!".to_string();
                         self.show_message = true;
-                    },
+                    }
                     Err(e) => {
                         self.message = format!("❌ Failed to copy to clipboard: {}", e);
                         self.show_message = true;
                     }
                 }
                 Ok(DashboardAction::Continue)
-            },
+            }
             KeyCode::PageUp => {
                 // Page up (scroll up by larger amount)
                 self.transcript_scroll_offset = self.transcript_scroll_offset.saturating_sub(10);
                 Ok(DashboardAction::Continue)
-            },
+            }
             KeyCode::PageDown => {
                 // Page down (scroll down by larger amount)
                 let content_width = 120; // Conservative estimate for terminal width
                 let content_height = 25; // Conservative estimate for terminal height
-                let wrapped_lines = self.wrap_text_to_lines(&self.transcript_content, content_width);
+                let wrapped_lines =
+                    self.wrap_text_to_lines(&self.transcript_content, content_width);
                 let max_offset = wrapped_lines.len().saturating_sub(content_height);
-                self.transcript_scroll_offset = std::cmp::min(
-                    self.transcript_scroll_offset + 10,
-                    max_offset
-                );
+                self.transcript_scroll_offset =
+                    std::cmp::min(self.transcript_scroll_offset + 10, max_offset);
                 Ok(DashboardAction::Continue)
-            },
+            }
             KeyCode::Home => {
                 // Jump to top of transcript
                 self.transcript_scroll_offset = 0;
                 Ok(DashboardAction::Continue)
-            },
+            }
             KeyCode::End => {
                 // Jump to bottom of transcript
                 let content_width = 120; // Conservative estimate for terminal width
                 let content_height = 25; // Conservative estimate for terminal height
-                let wrapped_lines = self.wrap_text_to_lines(&self.transcript_content, content_width);
+                let wrapped_lines =
+                    self.wrap_text_to_lines(&self.transcript_content, content_width);
                 if wrapped_lines.len() > content_height {
-                    self.transcript_scroll_offset = wrapped_lines.len().saturating_sub(content_height);
+                    self.transcript_scroll_offset =
+                        wrapped_lines.len().saturating_sub(content_height);
                 } else {
                     self.transcript_scroll_offset = 0;
                 }
                 Ok(DashboardAction::Continue)
-            },
+            }
             KeyCode::Char('g') => {
                 // Jump to top of transcript (vim-style, alternative to Home)
                 self.transcript_scroll_offset = 0;
                 Ok(DashboardAction::Continue)
-            },
+            }
             KeyCode::Char('G') => {
                 // Jump to bottom of transcript (vim-style, alternative to End)
                 let content_width = 120; // Conservative estimate for terminal width
                 let content_height = 25; // Conservative estimate for terminal height
-                let wrapped_lines = self.wrap_text_to_lines(&self.transcript_content, content_width);
+                let wrapped_lines =
+                    self.wrap_text_to_lines(&self.transcript_content, content_width);
                 if wrapped_lines.len() > content_height {
-                    self.transcript_scroll_offset = wrapped_lines.len().saturating_sub(content_height);
+                    self.transcript_scroll_offset =
+                        wrapped_lines.len().saturating_sub(content_height);
                 } else {
                     self.transcript_scroll_offset = 0;
                 }
                 Ok(DashboardAction::Continue)
-            },
+            }
             KeyCode::Char('b') => {
                 // Page up (vim-style, alternative to PageUp)
                 self.transcript_scroll_offset = self.transcript_scroll_offset.saturating_sub(10);
                 Ok(DashboardAction::Continue)
-            },
+            }
             KeyCode::Char('f') => {
                 // Page down (vim-style, alternative to PageDown)
                 let content_width = 120; // Conservative estimate for terminal width
                 let content_height = 25; // Conservative estimate for terminal height
-                let wrapped_lines = self.wrap_text_to_lines(&self.transcript_content, content_width);
+                let wrapped_lines =
+                    self.wrap_text_to_lines(&self.transcript_content, content_width);
                 let max_offset = wrapped_lines.len().saturating_sub(content_height);
-                self.transcript_scroll_offset = std::cmp::min(
-                    self.transcript_scroll_offset + 10,
-                    max_offset
-                );
+                self.transcript_scroll_offset =
+                    std::cmp::min(self.transcript_scroll_offset + 10, max_offset);
                 Ok(DashboardAction::Continue)
-            },
+            }
+            KeyCode::Char('t') | KeyCode::Char('T') => {
+                // Re-transcribe the current recording
+                if let Some(recording) = self.get_current_recording() {
+                    if self.transcription_task.is_some() {
+                        self.message = "⚠️ Transcription already in progress".to_string();
+                        self.show_message = true;
+                        return Ok(DashboardAction::Continue);
+                    }
+
+                    // Close transcript view
+                    self.show_transcript = false;
+                    self.transcript_content.clear();
+                    self.transcript_scroll_offset = 0;
+
+                    // Start re-transcription
+                    let recording_path = PathBuf::from(&recording.directory_name);
+                    let transcription_mode = self.config.transcription.clone();
+
+                    self.message = "🔄 Re-transcribing recording...".to_string();
+                    self.show_message = true;
+                    let model_info = match &self.config.transcription {
+                        crate::config::TranscriptionMode::Local { model_size } => {
+                            format!("Local ({})", model_size)
+                        }
+                        crate::config::TranscriptionMode::Api { .. } => "OpenAI API".to_string(),
+                    };
+                    self.progress_animation = Some(format!(
+                        "🔄 Re-transcribing with {}: {}",
+                        model_info,
+                        recording
+                            .display_name
+                            .as_ref()
+                            .unwrap_or(&recording.directory_name)
+                    ));
+                    self.is_retranscribing = true;
+
+                    let input_path_clone = recording_path.clone();
+                    self.transcription_task = Some(tokio::spawn(async move {
+                        transcribe_file_silent_with_mode(
+                            &input_path_clone,
+                            Some(transcription_mode),
+                        )
+                        .await
+                    }));
+                }
+                Ok(DashboardAction::Continue)
+            }
             KeyCode::Esc => {
                 // Only Esc key closes the transcript (consistent behavior)
                 self.show_transcript = false;
                 self.transcript_content.clear();
                 self.transcript_scroll_offset = 0;
                 Ok(DashboardAction::Continue)
-            },
+            }
             _ => {
                 // Other keys are ignored (consistent behavior)
                 Ok(DashboardAction::Continue)
             }
         }
     }
-    
+
     async fn handle_settings_keys(&mut self, key_code: KeyCode) -> Result<DashboardAction> {
         match key_code {
             KeyCode::Esc => {
@@ -953,11 +1076,13 @@ impl Dashboard {
             KeyCode::Enter => {
                 if self.editing_api_key {
                     // Save API key
-                    let new_mode = TranscriptionMode::Api { api_key: self.api_key_input.clone() };
+                    let new_mode = TranscriptionMode::Api {
+                        api_key: self.api_key_input.clone(),
+                    };
                     match self.config.set_transcription_mode(new_mode) {
                         Ok(()) => {
                             self.config = ScribaConfig::load()?; // Reload config
-                            // Stay in settings, no success message
+                                                                 // Stay in settings, no success message
                         }
                         Err(e) => {
                             // Show error message only for actual errors
@@ -975,14 +1100,17 @@ impl Dashboard {
                             let new_mode = match &self.config.transcription {
                                 TranscriptionMode::Local { .. } => {
                                     // Use preserved API key if available, otherwise empty
-                                    let api_key = self.config.last_api_key.as_ref()
+                                    let api_key = self
+                                        .config
+                                        .last_api_key
+                                        .as_ref()
                                         .map(|key| key.clone())
                                         .unwrap_or_else(String::new);
                                     TranscriptionMode::Api { api_key }
                                 }
-                                TranscriptionMode::Api { .. } => {
-                                    TranscriptionMode::Local { model_size: LocalModelSize::Medium }
-                                }
+                                TranscriptionMode::Api { .. } => TranscriptionMode::Local {
+                                    model_size: LocalModelSize::Medium,
+                                },
                             };
                             match self.config.set_transcription_mode(new_mode) {
                                 Ok(()) => {
@@ -1011,7 +1139,9 @@ impl Dashboard {
                                         LocalModelSize::Large => LocalModelSize::Turbo,
                                         LocalModelSize::Turbo => LocalModelSize::Tiny,
                                     };
-                                    let new_mode = TranscriptionMode::Local { model_size: new_model };
+                                    let new_mode = TranscriptionMode::Local {
+                                        model_size: new_model,
+                                    };
                                     match self.config.set_transcription_mode(new_mode) {
                                         Ok(()) => {
                                             self.config = ScribaConfig::load()?;
@@ -1019,7 +1149,8 @@ impl Dashboard {
                                         }
                                         Err(e) => {
                                             // Show error message only for actual errors
-                                            self.message = format!("❌ Failed to change model: {}", e);
+                                            self.message =
+                                                format!("❌ Failed to change model: {}", e);
                                             self.show_message = true;
                                             self.return_to_view = Some(DashboardView::Settings);
                                         }
@@ -1052,7 +1183,7 @@ impl Dashboard {
                 }
                 Ok(DashboardAction::Continue)
             }
-            _ => Ok(DashboardAction::Continue)
+            _ => Ok(DashboardAction::Continue),
         }
     }
 
@@ -1071,12 +1202,12 @@ impl Dashboard {
                 }
                 self.show_delete_confirm = false;
                 self.delete_candidate = None;
-            },
+            }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 // Cancel deletion
                 self.show_delete_confirm = false;
                 self.delete_candidate = None;
-            },
+            }
             _ => {
                 // Any other key, just ignore
             }
@@ -1105,7 +1236,7 @@ impl Dashboard {
                             self.show_file_dialog = false;
                             return Ok(DashboardAction::Continue);
                         }
-                        
+
                         // Check if file exists
                         let file_path = PathBuf::from(self.file_path_input.trim());
                         if !file_path.exists() {
@@ -1115,7 +1246,7 @@ impl Dashboard {
                             self.show_file_dialog = false;
                             return Ok(DashboardAction::Continue);
                         }
-                        
+
                         // Move to name input stage
                         self.file_dialog_stage = FileDialogStage::FileName;
                         // Pre-fill with file stem as default name
@@ -1127,17 +1258,19 @@ impl Dashboard {
                         // Use file name or default to file stem
                         let display_name = if self.file_name_input.trim().is_empty() {
                             let file_path = PathBuf::from(self.file_path_input.trim());
-                            file_path.file_stem()
+                            file_path
+                                .file_stem()
                                 .and_then(|s| s.to_str())
                                 .unwrap_or("imported_audio")
                                 .to_string()
                         } else {
                             self.file_name_input.trim().to_string()
                         };
-                        
+
                         // Start import process
                         self.show_file_dialog = false;
-                        self.start_file_import(self.file_path_input.clone(), display_name).await?;
+                        self.start_file_import(self.file_path_input.clone(), display_name)
+                            .await?;
                     }
                 }
                 Ok(DashboardAction::Continue)
@@ -1166,7 +1299,7 @@ impl Dashboard {
                 }
                 Ok(DashboardAction::Continue)
             }
-            _ => Ok(DashboardAction::Continue)
+            _ => Ok(DashboardAction::Continue),
         }
     }
 
@@ -1178,11 +1311,11 @@ impl Dashboard {
                         .context("Could not find home directory")?
                         .join("scriba_recordings");
                     let recording_dir = base_path.join(&recording.directory_name);
-                    
+
                     if recording_dir.exists() {
                         std::fs::remove_dir_all(&recording_dir).ok();
                     }
-                    
+
                     self.load_recordings()?;
                     self.load_stats()?;
                     self.message = "✅ Recording deleted successfully".to_string();
@@ -1196,7 +1329,9 @@ impl Dashboard {
                 }
             }
         } else {
-            return Err(anyhow::anyhow!("Selected recording has no database ID; cannot delete."));
+            return Err(anyhow::anyhow!(
+                "Selected recording has no database ID; cannot delete."
+            ));
         }
         Ok(())
     }
@@ -1208,24 +1343,35 @@ impl Dashboard {
                 return Ok(transcript.content);
             }
         }
-        
-        // Fallback: try to load from file
+
+        // Fallback: try to load from file (check both possible filenames)
         let base_path = home_dir()
             .context("Could not find home directory")?
             .join("scriba_recordings");
-        let transcript_path = base_path.join(&recording.directory_name).join("transcript.txt");
-        
+        let recording_dir = base_path.join(&recording.directory_name);
+
+        // Try transcript.txt first (newer format)
+        let transcript_path = recording_dir.join("transcript.txt");
         if transcript_path.exists() {
-            std::fs::read_to_string(&transcript_path)
-                .context("Failed to read transcript file")
-        } else {
-            Err(anyhow::anyhow!("Transcript file not found"))
+            return std::fs::read_to_string(&transcript_path)
+                .context("Failed to read transcript.txt file");
         }
+
+        // Try recording.txt (legacy format)
+        let recording_path = recording_dir.join("recording.txt");
+        if recording_path.exists() {
+            return std::fs::read_to_string(&recording_path)
+                .context("Failed to read recording.txt file");
+        }
+
+        Err(anyhow::anyhow!(
+            "No transcript file found (checked transcript.txt and recording.txt)"
+        ))
     }
 
     fn wrap_text_to_lines(&self, text: &str, max_width: usize) -> Vec<String> {
         let mut result = Vec::new();
-        
+
         for line in text.lines() {
             if line.len() <= max_width {
                 result.push(line.to_string());
@@ -1233,7 +1379,7 @@ impl Dashboard {
                 // Split long lines into multiple wrapped lines
                 let words: Vec<&str> = line.split_whitespace().collect();
                 let mut current_line = String::new();
-                
+
                 for word in words {
                     if word.len() > max_width {
                         // Handle extremely long words by character breaking
@@ -1241,7 +1387,7 @@ impl Dashboard {
                             result.push(current_line);
                             current_line = String::new();
                         }
-                        
+
                         let chars: Vec<char> = word.chars().collect();
                         for chunk in chars.chunks(max_width) {
                             result.push(chunk.iter().collect());
@@ -1252,7 +1398,7 @@ impl Dashboard {
                         } else {
                             format!("{} {}", current_line, word)
                         };
-                        
+
                         if test_line.len() <= max_width {
                             current_line = test_line;
                         } else {
@@ -1261,25 +1407,25 @@ impl Dashboard {
                         }
                     }
                 }
-                
+
                 if !current_line.is_empty() {
                     result.push(current_line);
                 }
             }
         }
-        
+
         // Handle edge case where text has no newlines at all
         if result.is_empty() && !text.is_empty() {
             let words: Vec<&str> = text.split_whitespace().collect();
             let mut current_line = String::new();
-            
+
             for word in words {
                 if word.len() > max_width {
                     if !current_line.is_empty() {
                         result.push(current_line);
                         current_line = String::new();
                     }
-                    
+
                     let chars: Vec<char> = word.chars().collect();
                     for chunk in chars.chunks(max_width) {
                         result.push(chunk.iter().collect());
@@ -1290,7 +1436,7 @@ impl Dashboard {
                     } else {
                         format!("{} {}", current_line, word)
                     };
-                    
+
                     if test_line.len() <= max_width {
                         current_line = test_line;
                     } else {
@@ -1299,24 +1445,24 @@ impl Dashboard {
                     }
                 }
             }
-            
+
             if !current_line.is_empty() {
                 result.push(current_line);
             }
         }
-        
+
         result
     }
 
     fn copy_transcript_to_clipboard(&self) -> Result<()> {
         use arboard::Clipboard;
-        
-        let mut clipboard = Clipboard::new()
-            .context("Failed to access clipboard")?;
-        
-        clipboard.set_text(&self.transcript_content)
+
+        let mut clipboard = Clipboard::new().context("Failed to access clipboard")?;
+
+        clipboard
+            .set_text(&self.transcript_content)
             .context("Failed to copy text to clipboard")?;
-        
+
         Ok(())
     }
 
@@ -1335,7 +1481,7 @@ impl Dashboard {
             self.render_file_dialog_popup(f, size);
             return;
         }
-        
+
         if self.show_message {
             self.render_message_popup(f, size);
             return;
@@ -1355,10 +1501,10 @@ impl Dashboard {
         let main_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(8),  // Header (increased for ASCII art)
-                Constraint::Min(6),     // Recordings Table
-                Constraint::Length(4),  // Statistics
-                Constraint::Length(3),  // Footer
+                Constraint::Length(8), // Header (increased for ASCII art)
+                Constraint::Min(6),    // Recordings Table
+                Constraint::Length(4), // Statistics
+                Constraint::Length(3), // Footer
             ])
             .split(size);
 
@@ -1382,9 +1528,13 @@ impl Dashboard {
 
     fn render_header(&self, f: &mut Frame, area: ratatui::layout::Rect) {
         let header_text = format!("{}\n🎵 RECORDING ON STEROIDS 🎵", ASCII_ART);
-        
+
         let header = Paragraph::new(header_text)
-            .style(Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))
+            .style(
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            )
             .alignment(Alignment::Center)
             .wrap(Wrap { trim: false })
             .block(
@@ -1397,74 +1547,135 @@ impl Dashboard {
     }
 
     fn render_recordings_table(&mut self, f: &mut Frame, area: ratatui::layout::Rect) {
-        let header_cells = ["#", "Status", "Name", "Duration", "Created"]
+        let header_cells = ["#", "Status", "Name", "Duration", "Model", "Created"]
             .iter()
-            .map(|h| Cell::from(*h).style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
-        
+            .map(|h| {
+                Cell::from(*h).style(
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )
+            });
+
         let header = Row::new(header_cells)
             .style(Style::default())
             .height(1)
             .bottom_margin(1);
 
-        let rows: Vec<Row> = self.recordings.iter().enumerate().map(|(i, recording)| {
-            let display_name = recording.display_name.as_ref()
-                .unwrap_or(&recording.directory_name);
-            
-            let duration = recording.duration_seconds
-                .map(|d| self.format_duration(d))
-                .unwrap_or_else(|| "Unknown".to_string());
+        let rows: Vec<Row> = self
+            .recordings
+            .iter()
+            .enumerate()
+            .map(|(i, recording)| {
+                let display_name = recording
+                    .display_name
+                    .as_ref()
+                    .unwrap_or(&recording.directory_name);
 
-            let status = if recording.has_transcript { "[T]" } else { "[A]" };
-            let created = recording.created_at.format("%m/%d %H:%M").to_string();
+                let duration = recording
+                    .duration_seconds
+                    .map(|d| self.format_duration(d))
+                    .unwrap_or_else(|| "Unknown".to_string());
 
-            // Calculate global index across all pages
-            let global_index = (self.current_page * self.page_size) + i + 1;
+                let status = if recording.has_transcript {
+                    "[T]"
+                } else {
+                    "[A]"
+                };
+                let created = recording.created_at.format("%m/%d %H:%M").to_string();
 
-            let cells = vec![
-                Cell::from(global_index.to_string()),
-                Cell::from(status).style(
-                    if recording.has_transcript {
+                // Calculate global index across all pages
+                let global_index = (self.current_page * self.page_size) + i + 1;
+
+                // Format model used for display
+                let model_display = if recording.has_transcript {
+                    // Parse the model_used field to show a user-friendly format
+                    match recording.model_used.as_str() {
+                        // API models
+                        "whisper-1" => "API",
+                        s if s.starts_with("gpt") || s.contains("openai") => "API",
+                        // Local models - extract size from format like "whisper-tiny", "whisper-turbo"
+                        s if s.starts_with("whisper-") => {
+                            let size = s.strip_prefix("whisper-").unwrap_or("");
+                            match size {
+                                "tiny" => "Tiny",
+                                "base" => "Base",
+                                "small" => "Small",
+                                "medium" => "Medium",
+                                "large" => "Large",
+                                "large-v2" => "Large-v2",
+                                "large-v3" => "Large-v3",
+                                "turbo" => "Turbo",
+                                _ => "Local",
+                            }
+                        }
+                        // Legacy formats
+                        "whisper" | "whisper.cpp" | "whisper-rs" => "Local",
+                        // Unknown/empty
+                        s if s.is_empty() => "-",
+                        _ => &recording.model_used,
+                    }
+                } else {
+                    "-"
+                };
+
+                let cells = vec![
+                    Cell::from(global_index.to_string()),
+                    Cell::from(status).style(if recording.has_transcript {
                         Style::default().fg(Color::Green)
                     } else {
                         Style::default().fg(Color::Blue)
-                    }
-                ),
-                Cell::from(display_name.clone()),
-                Cell::from(duration),
-                Cell::from(created),
-            ];
+                    }),
+                    Cell::from(display_name.clone()),
+                    Cell::from(duration),
+                    Cell::from(model_display).style(if model_display == "API" {
+                        Style::default().fg(Color::Cyan)
+                    } else if model_display == "-" {
+                        Style::default().fg(Color::Gray)
+                    } else {
+                        Style::default().fg(Color::Yellow)
+                    }),
+                    Cell::from(created),
+                ];
 
-            Row::new(cells).height(1).bottom_margin(0)
-        }).collect();
+                Row::new(cells).height(1).bottom_margin(0)
+            })
+            .collect();
 
         let table = Table::new(
             rows,
             [
-                Constraint::Length(4),   // #
-                Constraint::Length(8),   // Status
-                Constraint::Min(20),     // Name (flexible)
-                Constraint::Length(12),  // Duration
-                Constraint::Length(12),  // Created
-            ]
+                Constraint::Length(4),  // #
+                Constraint::Length(8),  // Status
+                Constraint::Min(15),    // Name (flexible)
+                Constraint::Length(10), // Duration
+                Constraint::Length(8),  // Model
+                Constraint::Length(12), // Created
+            ],
         )
-            .header(header)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .style(Style::default().fg(Color::Cyan))
-                    .title({
-                        let start_index = (self.current_page * self.page_size) + 1;
-                        let end_index = start_index + self.recordings.len() - 1;
-                        format!("Recordings (Page {} - #{}-#{})", self.current_page + 1, start_index, end_index)
-                    })
-            )
-            .highlight_style(
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            )
-            .highlight_symbol("▶ ");
+        .header(header)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .style(Style::default().fg(Color::Cyan))
+                .title({
+                    let start_index = (self.current_page * self.page_size) + 1;
+                    let end_index = start_index + self.recordings.len() - 1;
+                    format!(
+                        "Recordings (Page {} - #{}-#{})",
+                        self.current_page + 1,
+                        start_index,
+                        end_index
+                    )
+                }),
+        )
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
 
         f.render_stateful_widget(table, area, &mut self.table_state);
     }
@@ -1480,17 +1691,37 @@ impl Dashboard {
             vec![
                 Line::from(vec![
                     Span::styled("📊 Total: ", Style::default().fg(Color::White)),
-                    Span::styled(format!("{} recordings", stats.total_recordings), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        format!("{} recordings", stats.total_recordings),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                     Span::raw("    "),
                     Span::styled("🕒 Duration: ", Style::default().fg(Color::White)),
-                    Span::styled(stats.format_duration(), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        stats.format_duration(),
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                 ]),
                 Line::from(vec![
                     Span::styled("💾 Storage: ", Style::default().fg(Color::White)),
-                    Span::styled(stats.format_size(), Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        stats.format_size(),
+                        Style::default()
+                            .fg(Color::Blue)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                     Span::raw("      "),
                     Span::styled("📝 Transcribed: ", Style::default().fg(Color::White)),
-                    Span::styled(format!("{} ({}%)", stats.transcribed_count, transcribed_percentage), Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        format!("{} ({}%)", stats.transcribed_count, transcribed_percentage),
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                 ]),
             ]
         } else {
@@ -1513,7 +1744,7 @@ impl Dashboard {
         let controls = if self.search_mode {
             "ESC: Cancel | ENTER: Search | Type to search..."
         } else {
-"↑↓: Navigate | [/]: Pages | ENTER: Transcript | P: Play | D/Del: Delete | /: Search | R/A/T: Quick Actions | S: Settings | H: Help | Q: Quit"
+            "↑↓: Navigate | [/]: Pages | ENTER: Transcript | P: Play | D/Del: Delete | /: Search | R/A/T: Quick Actions | S: Settings | H: Help | Q: Quit"
         };
 
         let controls_paragraph = Paragraph::new(controls)
@@ -1523,7 +1754,7 @@ impl Dashboard {
                 Block::default()
                     .borders(Borders::ALL)
                     .style(Style::default().fg(Color::Blue))
-                    .title("Controls")
+                    .title("Controls"),
             );
 
         f.render_widget(controls_paragraph, area);
@@ -1556,7 +1787,7 @@ impl Dashboard {
             Line::from("Quick Actions:"),
             Line::from("  R          - Record Audio + Auto-Transcribe (Esc to stop)"),
             Line::from("  A          - Add External Audio File & Transcribe"),
-            Line::from("  T          - Transcribe Selected Recording"),
+            Line::from("  T          - Transcribe Selected Recording (also in transcript view)"),
             Line::from(""),
             Line::from("Navigation:"),
             Line::from("  ↑/↓        - Navigate recordings"),
@@ -1576,6 +1807,7 @@ impl Dashboard {
             Line::from("  PgUp/PgDn  - Page up/down (or 'b'/'f')"),
             Line::from("  Home/End   - Jump to top/bottom (or 'g'/'G')"),
             Line::from("  C          - Copy transcript to clipboard"),
+            Line::from("  T          - Re-transcribe recording"),
             Line::from("  ESC        - Close transcript"),
             Line::from(""),
             Line::from("Recording Control:"),
@@ -1598,13 +1830,13 @@ impl Dashboard {
                 Block::default()
                     .borders(Borders::ALL)
                     .style(Style::default().fg(Color::Yellow))
-                    .title("Help")
+                    .title("Help"),
             )
             .wrap(Wrap { trim: true });
 
         f.render_widget(help_paragraph, popup_area);
     }
-    
+
     fn render_settings(&self, f: &mut Frame, area: ratatui::layout::Rect) {
         let popup_area = Layout::default()
             .direction(Direction::Vertical)
@@ -1625,49 +1857,57 @@ impl Dashboard {
             .split(popup_area)[1];
 
         f.render_widget(Clear, popup_area);
-        
+
         let mut settings_text = vec![
-            Line::from(vec![
-                Span::styled("SETTINGS", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            ]),
+            Line::from(vec![Span::styled(
+                "SETTINGS",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )]),
             Line::from(""),
         ];
-        
+
         // Current transcription mode
         let mode_text = match &self.config.transcription {
             TranscriptionMode::Local { model_size } => {
                 format!("⚙️ Local (Whisper {})  ← Press Enter to change", model_size)
             }
-            TranscriptionMode::Api { .. } => {
-                "☁️ OpenAI API  ← Press Enter to change".to_string()
-            }
+            TranscriptionMode::Api { .. } => "☁️ OpenAI API  ← Press Enter to change".to_string(),
         };
-        
+
         let mode_style = if self.settings_selection == 0 {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::White)
         };
-        
+
         settings_text.push(Line::from(vec![
             Span::styled("Transcription Mode: ", Style::default().fg(Color::Green)),
             Span::styled(mode_text, mode_style),
         ]));
-        
+
         // Model size (only for local mode)
         if let TranscriptionMode::Local { model_size } = &self.config.transcription {
             let model_style = if self.settings_selection == 1 {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
             };
-            
+
             settings_text.push(Line::from(vec![
                 Span::styled("Model Size: ", Style::default().fg(Color::Green)),
-                Span::styled(format!("{} ← Press Enter to cycle", model_size), model_style),
+                Span::styled(
+                    format!("{} ← Press Enter to cycle", model_size),
+                    model_style,
+                ),
             ]));
         }
-        
+
         // Add mode-specific settings
         match &self.config.transcription {
             TranscriptionMode::Api { api_key } => {
@@ -1678,20 +1918,27 @@ impl Dashboard {
                     if api_key.is_empty() {
                         "[Not Set] ← Press Enter to edit".to_string()
                     } else {
-                        format!("{}****** ← Press Enter to edit", &api_key[..api_key.len().min(4)])
+                        format!(
+                            "{}****** ← Press Enter to edit",
+                            &api_key[..api_key.len().min(4)]
+                        )
                     }
                 };
-                
+
                 let api_key_style = if self.settings_selection == 1 {
                     if self.editing_api_key {
-                        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD)
                     }
                 } else {
                     Style::default().fg(Color::White)
                 };
-                
+
                 settings_text.push(Line::from(vec![
                     Span::styled("OpenAI API Key: ", Style::default().fg(Color::Green)),
                     Span::styled(api_key_display, api_key_style),
@@ -1701,29 +1948,41 @@ impl Dashboard {
                 // Local Mode: No API Key shown, Model Size is already shown above
             }
         }
-        
+
         // Audio settings preview
         settings_text.push(Line::from(""));
-        settings_text.push(Line::from(vec![
-            Span::styled("Audio Settings:", Style::default().fg(Color::Green)),
-        ]));
-        settings_text.push(Line::from(vec![
-            Span::styled(format!("  Sample Rate: {} Hz", self.config.audio_settings.sample_rate), Style::default().fg(Color::Gray)),
-        ]));
-        settings_text.push(Line::from(vec![
-            Span::styled(format!("  Bitrate: {} kbps", self.config.audio_settings.bitrate), Style::default().fg(Color::Gray)),
-        ]));
-        settings_text.push(Line::from(vec![
-            Span::styled(format!("  Channels: {}", self.config.audio_settings.channels), Style::default().fg(Color::Gray)),
-        ]));
-        settings_text.push(Line::from(vec![
-            Span::styled(format!("  Speech Optimized: {}", self.config.audio_settings.speech_optimized), Style::default().fg(Color::Gray)),
-        ]));
-        
+        settings_text.push(Line::from(vec![Span::styled(
+            "Audio Settings:",
+            Style::default().fg(Color::Green),
+        )]));
+        settings_text.push(Line::from(vec![Span::styled(
+            format!(
+                "  Sample Rate: {} Hz",
+                self.config.audio_settings.sample_rate
+            ),
+            Style::default().fg(Color::Gray),
+        )]));
+        settings_text.push(Line::from(vec![Span::styled(
+            format!("  Bitrate: {} kbps", self.config.audio_settings.bitrate),
+            Style::default().fg(Color::Gray),
+        )]));
+        settings_text.push(Line::from(vec![Span::styled(
+            format!("  Channels: {}", self.config.audio_settings.channels),
+            Style::default().fg(Color::Gray),
+        )]));
+        settings_text.push(Line::from(vec![Span::styled(
+            format!(
+                "  Speech Optimized: {}",
+                self.config.audio_settings.speech_optimized
+            ),
+            Style::default().fg(Color::Gray),
+        )]));
+
         settings_text.push(Line::from(""));
-        settings_text.push(Line::from(vec![
-            Span::styled("↑↓ Navigate  ⏎ Enter  ⎋ Esc", Style::default().fg(Color::Gray)),
-        ]));
+        settings_text.push(Line::from(vec![Span::styled(
+            "↑↓ Navigate  ⏎ Enter  ⎋ Esc",
+            Style::default().fg(Color::Gray),
+        )]));
 
         let settings_paragraph = Paragraph::new(settings_text)
             .style(Style::default().fg(Color::White))
@@ -1731,8 +1990,12 @@ impl Dashboard {
                 Block::default()
                     .borders(Borders::ALL)
                     .title("Settings")
-                    .title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
-                    .border_style(Style::default().fg(Color::Cyan))
+                    .title_style(
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .border_style(Style::default().fg(Color::Cyan)),
             )
             .wrap(Wrap { trim: true });
 
@@ -1766,7 +2029,7 @@ impl Dashboard {
                 Block::default()
                     .borders(Borders::ALL)
                     .style(Style::default().fg(Color::Red))
-                    .title("Message (press Esc)")
+                    .title("Message (press Esc)"),
             )
             .wrap(Wrap { trim: true });
 
@@ -1797,33 +2060,37 @@ impl Dashboard {
         // Calculate available height and width for content (subtract borders)
         let content_height = popup_area.height.saturating_sub(2) as usize;
         let content_width = popup_area.width.saturating_sub(4) as usize; // Account for borders and padding
-        
+
         // Handle text wrapping for very long lines
         let wrapped_lines = self.wrap_text_to_lines(&self.transcript_content, content_width);
         let total_lines = wrapped_lines.len();
-        
+
         // Create scrollable content
         let (visible_content, scroll_info) = if total_lines > content_height {
             let max_scroll = total_lines.saturating_sub(content_height);
             let actual_offset = std::cmp::min(self.transcript_scroll_offset, max_scroll);
             let end = std::cmp::min(actual_offset + content_height, total_lines);
-            
+
             let visible_lines = wrapped_lines[actual_offset..end].join("\n");
-            let scroll_info = format!("📝 Transcript [Line {}/{}] - ↑↓/b/f/g/G: scroll, C: copy, ESC: close", 
+            let scroll_info = format!("📝 Transcript [Line {}/{}] - ↑↓/b/f/g/G: scroll, C: copy, T: re-transcribe, ESC: close", 
                                     actual_offset + 1, 
                                     total_lines);
             (visible_lines, scroll_info)
         } else {
-            (self.transcript_content.clone(), "📝 Transcript - C: copy, ESC: close".to_string())
+            // Even if content fits vertically, still use wrapped lines to prevent horizontal overflow
+            (
+                wrapped_lines.join("\n"),
+                "📝 Transcript - C: copy, T: re-transcribe, ESC: close".to_string(),
+            )
         };
-        
+
         let para = Paragraph::new(visible_content)
             .style(Style::default().fg(Color::White))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .style(Style::default().fg(Color::Cyan))
-                    .title(scroll_info)
+                    .title(scroll_info),
             )
             .scroll((0, 0)); // Disable internal scrolling and wrapping since we handle it manually
 
@@ -1852,7 +2119,9 @@ impl Dashboard {
         f.render_widget(Clear, popup_area);
 
         let recording_name = if let Some(recording) = &self.delete_candidate {
-            recording.display_name.as_ref()
+            recording
+                .display_name
+                .as_ref()
                 .unwrap_or(&recording.directory_name)
                 .clone()
         } else {
@@ -1867,7 +2136,7 @@ impl Dashboard {
                 Block::default()
                     .borders(Borders::ALL)
                     .style(Style::default().fg(Color::Red))
-                    .title("⚠️  Confirm Deletion")
+                    .title("⚠️  Confirm Deletion"),
             )
             .alignment(Alignment::Center)
             .wrap(Wrap { trim: true });
@@ -1902,7 +2171,7 @@ impl Dashboard {
                 Block::default()
                     .borders(Borders::ALL)
                     .style(Style::default().fg(Color::Cyan))
-                    .title("Search Recordings")
+                    .title("Search Recordings"),
             );
 
         f.render_widget(search_input, popup_area);
@@ -1915,20 +2184,20 @@ impl Dashboard {
             self.show_message = true;
             return Ok(());
         }
-        
+
         // Show immediate progress animation
         self.progress_animation = Some("🎙️ Recording... (Press Esc to stop)".to_string());
         self.progress_frame = 0;
         self.show_message = true;
         self.recording_mode = Some(RecordingMode::RecordAndTranscribe);
-        
+
         // Generate filename and start recording task (no name prompt, consistent with A command)
         let recording_name = self.generate_filename(None);
         self.start_recording_task(recording_name).await?;
-        
+
         Ok(())
     }
-    
+
     async fn execute_add_external_file(&mut self) -> Result<()> {
         // Check if already recording or transcribing
         if self.recording_task.is_some() || self.transcription_task.is_some() {
@@ -1936,46 +2205,46 @@ impl Dashboard {
             self.show_message = true;
             return Ok(());
         }
-        
+
         // Show file dialog for importing audio file
         self.show_file_dialog = true;
         self.file_dialog_stage = FileDialogStage::FilePath;
         self.file_path_input.clear();
         self.file_name_input.clear();
-        
+
         Ok(())
     }
-    
+
     async fn start_file_import(&mut self, file_path: String, display_name: String) -> Result<()> {
-        use dirs::home_dir;
-        use chrono::Utc;
         use crate::database::Recording;
-        
+        use chrono::Utc;
+        use dirs::home_dir;
+
         // Show progress message
         self.progress_animation = Some(format!("📁 Importing: {}", display_name));
         self.progress_frame = 0;
         self.show_message = true;
-        
+
         let source_path = PathBuf::from(file_path.trim());
-        
+
         // Generate unique directory name based on timestamp
         let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
         let directory_name = format!("{}_{}", timestamp, display_name.replace(' ', "_"));
-        
+
         // Create destination directory
         let base_path = home_dir()
             .context("Could not find home directory")?
             .join("scriba_recordings");
         let dest_dir = base_path.join(&directory_name);
         fs::create_dir_all(&dest_dir)?;
-        
+
         // Copy audio file to destination with standard name
         let file_extension = source_path
             .extension()
             .and_then(|ext| ext.to_str())
             .unwrap_or("wav");
         let dest_file = dest_dir.join(format!("recording.{}", file_extension));
-        
+
         // Copy the file
         if let Err(e) = fs::copy(&source_path, &dest_file) {
             self.message = format!("❌ Failed to copy file: {}", e);
@@ -1983,7 +2252,7 @@ impl Dashboard {
             self.stop_progress_animation();
             return Ok(());
         }
-        
+
         // Insert into database
         let audio_format = file_extension.to_string();
         let recording = Recording {
@@ -1999,10 +2268,10 @@ impl Dashboard {
                     Err(_) => None, // Fallback to None if calculation fails
                 }
             },
-            file_size_bytes: None,  // TODO: We could get file size
+            file_size_bytes: None, // TODO: We could get file size
             audio_format,
             sample_rate: 44100, // Default value
-            channels: 2,       // Default value
+            channels: 2,        // Default value
             has_transcript: false,
             transcript_status: "pending".to_string(),
             language_code: "auto".to_string(),
@@ -2019,7 +2288,7 @@ impl Dashboard {
             audio_path: format!("recording.{}", file_extension),
             transcript_path: None,
         };
-        
+
         let _recording_id = match self.db.insert_recording(&recording) {
             Ok(id) => {
                 self.message = format!("✅ File imported: {}", display_name);
@@ -2032,10 +2301,19 @@ impl Dashboard {
                 return Ok(());
             }
         };
-        
+
         // Update progress message for transcription
-        self.progress_animation = Some(format!("📝 Transcribing: {}", display_name));
-        
+        let model_info = match &self.config.transcription {
+            crate::config::TranscriptionMode::Local { model_size } => {
+                format!("Local ({})", model_size)
+            }
+            crate::config::TranscriptionMode::Api { .. } => "OpenAI API".to_string(),
+        };
+        self.progress_animation = Some(format!(
+            "📝 Transcribing with {}: {}",
+            model_info, display_name
+        ));
+
         // Start transcription task - pass just the directory name, not the full path
         let directory_name_clone = directory_name.clone();
         let transcription_mode = self.config.transcription.clone();
@@ -2043,12 +2321,12 @@ impl Dashboard {
             let directory_path = PathBuf::from(directory_name_clone);
             transcribe_file_silent_with_mode(&directory_path, Some(transcription_mode)).await
         }));
-        
+
         Ok(())
     }
-    
+
     // Removed unused execute_transcribe_file; dashboard uses TranscribeSelected (T) instead
-    
+
     async fn execute_transcribe_selected(&mut self) -> Result<()> {
         // Check if transcription is already running
         if self.transcription_task.is_some() {
@@ -2056,7 +2334,7 @@ impl Dashboard {
             self.show_message = true;
             return Ok(());
         }
-        
+
         // Get the selected recording
         let selected_index = match self.table_state.selected() {
             Some(i) => i,
@@ -2066,7 +2344,7 @@ impl Dashboard {
                 return Ok(());
             }
         };
-        
+
         let selected_recording = match self.recordings.get(selected_index) {
             Some(recording) => recording.clone(),
             None => {
@@ -2075,14 +2353,16 @@ impl Dashboard {
                 return Ok(());
             }
         };
-        
+
         // Check if transcript already exists
         let has_transcript = if let Some(id) = selected_recording.id {
-            self.db.get_transcript_by_recording_id(id).is_ok_and(|t| t.is_some())
+            self.db
+                .get_transcript_by_recording_id(id)
+                .is_ok_and(|t| t.is_some())
         } else {
             false
         };
-        
+
         if has_transcript {
             // Check if this is the second press on the same recording
             if self.last_transcribe_warning == Some(selected_index) {
@@ -2091,7 +2371,8 @@ impl Dashboard {
             } else {
                 // First press - show warning and remember this recording
                 self.last_transcribe_warning = Some(selected_index);
-                self.message = "⚠️ Recording already has transcript. Press T again to overwrite.".to_string();
+                self.message =
+                    "⚠️ Recording already has transcript. Press T again to overwrite.".to_string();
                 self.show_message = true;
                 return Ok(());
             }
@@ -2099,46 +2380,58 @@ impl Dashboard {
             // Clear any previous warning state
             self.last_transcribe_warning = None;
         }
-        
+
         // No API key required in local transcription mode
-        let display_name = selected_recording.display_name
+        let display_name = selected_recording
+            .display_name
             .as_ref()
             .unwrap_or(&selected_recording.directory_name);
-        
+
         // Show immediate progress animation
-        self.progress_animation = Some(format!("🎵 Transcribing: {}", display_name));
+        let model_info = match &self.config.transcription {
+            crate::config::TranscriptionMode::Local { model_size } => {
+                format!("Local ({})", model_size)
+            }
+            crate::config::TranscriptionMode::Api { .. } => "OpenAI API".to_string(),
+        };
+        self.progress_animation = Some(format!(
+            "🎵 Transcribing with {}: {}",
+            model_info, display_name
+        ));
         self.progress_frame = 0;
         self.show_message = true;
-        
+
         // Build the audio file path - use the directory name as input
         let input_path = PathBuf::from(&selected_recording.directory_name);
-        
+
         // Start transcription in background task
         let input_path_clone = input_path.clone();
         let transcription_mode = self.config.transcription.clone();
         self.transcription_task = Some(tokio::spawn(async move {
             transcribe_file_silent_with_mode(&input_path_clone, Some(transcription_mode)).await
         }));
-        
+
         Ok(())
     }
-    
+
     fn generate_filename(&self, name: Option<String>) -> String {
         let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
         match name {
             Some(n) => {
-                let sanitized = n.replace(' ', "-").replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_");
+                let sanitized = n
+                    .replace(' ', "-")
+                    .replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_");
                 format!("{}_{}", timestamp, sanitized)
-            },
+            }
             None => format!("{}_recording", timestamp),
         }
     }
-    
+
     fn format_duration(&self, seconds: i64) -> String {
         let hours = seconds / 3600;
         let minutes = (seconds % 3600) / 60;
         let secs = seconds % 60;
-        
+
         if hours > 0 {
             format!("{}h {}m", hours, minutes)
         } else if minutes > 0 {
@@ -2147,22 +2440,30 @@ impl Dashboard {
             format!("{}s", secs)
         }
     }
-    
-    async fn create_stereo_temp_file(&self, mono_file_path: &std::path::Path) -> Result<std::path::PathBuf> {
+
+    async fn create_stereo_temp_file(
+        &self,
+        mono_file_path: &std::path::Path,
+    ) -> Result<std::path::PathBuf> {
         use std::fs;
-        
+
         // Create a temporary file path for the stereo version
         let temp_dir = std::env::temp_dir();
-        let temp_filename = format!("scriba_stereo_{}.wav", 
-            mono_file_path.file_stem().unwrap_or_default().to_string_lossy());
+        let temp_filename = format!(
+            "scriba_stereo_{}.wav",
+            mono_file_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+        );
         let temp_path = temp_dir.join(temp_filename);
-        
+
         // Use Rust's hound crate to convert mono to stereo
-        let mono_reader = hound::WavReader::open(mono_file_path)
-            .context("Failed to open mono audio file")?;
-        
+        let mono_reader =
+            hound::WavReader::open(mono_file_path).context("Failed to open mono audio file")?;
+
         let spec = mono_reader.spec();
-        
+
         // Create stereo spec (2 channels)
         let stereo_spec = hound::WavSpec {
             channels: 2,
@@ -2170,10 +2471,10 @@ impl Dashboard {
             bits_per_sample: spec.bits_per_sample,
             sample_format: spec.sample_format,
         };
-        
+
         let mut stereo_writer = hound::WavWriter::create(&temp_path, stereo_spec)
             .context("Failed to create stereo audio file")?;
-        
+
         // Convert samples based on format
         match spec.sample_format {
             hound::SampleFormat::Float => {
@@ -2182,10 +2483,12 @@ impl Dashboard {
                     match sample {
                         Ok(s) => {
                             // Write the same sample to both left and right channels
-                            stereo_writer.write_sample(s)?;  // Left
-                            stereo_writer.write_sample(s)?;  // Right
+                            stereo_writer.write_sample(s)?; // Left
+                            stereo_writer.write_sample(s)?; // Right
                         }
-                        Err(e) => return Err(anyhow::anyhow!("Error processing audio sample: {}", e)),
+                        Err(e) => {
+                            return Err(anyhow::anyhow!("Error processing audio sample: {}", e))
+                        }
                     }
                 }
             }
@@ -2195,11 +2498,14 @@ impl Dashboard {
                     for sample in mono_reader.into_samples::<i16>() {
                         match sample {
                             Ok(s) => {
-                                stereo_writer.write_sample(s)?;  // Left
-                                stereo_writer.write_sample(s)?;  // Right
+                                stereo_writer.write_sample(s)?; // Left
+                                stereo_writer.write_sample(s)?; // Right
                             }
                             Err(e) => {
-                                return Err(anyhow::anyhow!("Error processing audio sample: {}", e));
+                                return Err(anyhow::anyhow!(
+                                    "Error processing audio sample: {}",
+                                    e
+                                ));
                             }
                         }
                     }
@@ -2207,35 +2513,41 @@ impl Dashboard {
                     for sample in mono_reader.into_samples::<i32>() {
                         match sample {
                             Ok(s) => {
-                                stereo_writer.write_sample(s)?;  // Left
-                                stereo_writer.write_sample(s)?;  // Right
+                                stereo_writer.write_sample(s)?; // Left
+                                stereo_writer.write_sample(s)?; // Right
                             }
                             Err(e) => {
-                                return Err(anyhow::anyhow!("Error processing audio sample: {}", e));
+                                return Err(anyhow::anyhow!(
+                                    "Error processing audio sample: {}",
+                                    e
+                                ));
                             }
                         }
                     }
                 } else {
-                    return Err(anyhow::anyhow!("Unsupported bit depth: {}", spec.bits_per_sample));
+                    return Err(anyhow::anyhow!(
+                        "Unsupported bit depth: {}",
+                        spec.bits_per_sample
+                    ));
                 }
             }
         }
-        
+
         // Finalize the stereo file
-        stereo_writer.finalize()
+        stereo_writer
+            .finalize()
             .context("Failed to finalize stereo audio file")?;
-        
+
         // Schedule cleanup of temp file after a delay
         let temp_path_clone = temp_path.clone();
         tokio::spawn(async move {
             tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
             let _ = fs::remove_file(&temp_path_clone);
         });
-        
+
         Ok(temp_path)
     }
-    
-    
+
     fn emergency_stop_all_audio_players(&self) -> Result<()> {
         // Kill all common audio players as a fallback when PID is not available
         #[cfg(unix)]
@@ -2244,12 +2556,10 @@ impl Dashboard {
             // Try to kill common audio players
             let players = ["mpv", "ffplay", "afplay"];
             for player in &players {
-                let _ = Command::new("killall")
-                    .arg(player)
-                    .output();
+                let _ = Command::new("killall").arg(player).output();
             }
         }
-        
+
         #[cfg(windows)]
         {
             use std::process::Command;
@@ -2275,22 +2585,22 @@ impl Dashboard {
                 .arg("-TERM")
                 .arg(pid.to_string())
                 .output();
-                
+
             // Give a very brief moment for graceful shutdown
             std::thread::sleep(std::time::Duration::from_millis(10));
-            
+
             // Use SIGKILL immediately for faster termination (audio players can be stubborn)
             let kill_result = Command::new("kill")
                 .arg("-KILL")
                 .arg(pid.to_string())
                 .output();
-                
+
             // Also try pkill in case the process spawned children
             let _ = Command::new("pkill")
                 .arg("-P")
                 .arg(pid.to_string())
                 .output();
-                
+
             match kill_result {
                 Ok(_) => Ok(()),
                 Err(_e) => {
@@ -2304,7 +2614,7 @@ impl Dashboard {
                 }
             }
         }
-        
+
         #[cfg(windows)]
         {
             use std::process::Command;
@@ -2316,18 +2626,18 @@ impl Dashboard {
             Ok(())
         }
     }
-    
+
     // start_progress_animation not used; progress is updated directly via fields
-    
+
     fn stop_progress_animation(&mut self) {
         self.progress_animation = None;
     }
-    
+
     fn update_progress_message(&mut self) {
         if let Some(base_msg) = &self.progress_animation {
             let spinners = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
             let spinner = spinners[self.progress_frame % spinners.len()];
-            
+
             // If recording is active, show volume level instead of progress bar
             if self.recording_task.is_some() {
                 let volume_bar = self.create_volume_bar(self.current_volume_level);
@@ -2337,7 +2647,7 @@ impl Dashboard {
                 let bar_width = 20;
                 let progress_pos = (self.progress_frame / 2) % (bar_width * 2);
                 let mut bar = vec!["▱"; bar_width];
-                
+
                 if progress_pos < bar_width {
                     for i in 0..=progress_pos.min(bar_width - 1) {
                         bar[i] = "▰";
@@ -2348,47 +2658,47 @@ impl Dashboard {
                         bar[i] = "▰";
                     }
                 }
-                
+
                 let bar_str = bar.join("");
                 self.message = format!("{} {} [{}]", spinner, base_msg, bar_str);
             }
-            
+
             self.progress_frame += 1;
         }
     }
-    
+
     fn create_volume_bar(&self, level: f32) -> String {
         let bar_width = 20;
         // Scale the level (0.0 to 1.0) to bar width and apply some amplification for visibility
         let scaled_level = (level * 50.0).min(1.0); // Amplify for visibility
         let filled_chars = (scaled_level * bar_width as f32) as usize;
-        
+
         let mut bar = vec!["▱"; bar_width];
         for i in 0..filled_chars.min(bar_width) {
             bar[i] = "▰";
         }
-        
+
         format!("{}|{}%", bar.join(""), (scaled_level * 100.0) as u8)
     }
-    
+
     async fn start_recording_task(&mut self, recording_name: String) -> Result<()> {
         // Create channels for recording control
         let (stop_tx, stop_rx) = mpsc::channel(1);
         let (level_tx, level_rx) = mpsc::channel(100);
-        
+
         // Store the channels for control and feedback
         self.recording_stop_tx = Some(stop_tx);
         self.recording_level_rx = Some(level_rx);
-        
+
         // Use speech-optimized compression settings
         let compression_settings = CompressionSettings::speech_optimized();
         let output_path = PathBuf::from(&recording_name);
-        
+
         // Start the recording task
         self.recording_task = Some(tokio::spawn(async move {
             record_with_control(output_path, Some(compression_settings), stop_rx, level_tx).await
         }));
-        
+
         Ok(())
     }
 
@@ -2412,39 +2722,44 @@ impl Dashboard {
             .split(popup_area)[1];
 
         f.render_widget(Clear, popup_area);
-        
+
         let (title, prompt, current_input, hint) = match self.file_dialog_stage {
             FileDialogStage::FilePath => (
                 "Import Audio File - Step 1/2",
                 "Enter the full path to the audio file:",
                 &self.file_path_input,
-                "Example: /path/to/your/audio.mp3 or ~/Downloads/recording.wav"
+                "Example: /path/to/your/audio.mp3 or ~/Downloads/recording.wav",
             ),
             FileDialogStage::FileName => (
                 "Import Audio File - Step 2/2",
                 "Enter a display name for this recording:",
                 &self.file_name_input,
-                "This name will be shown in your recordings list"
+                "This name will be shown in your recordings list",
             ),
         };
-        
+
         let content = vec![
-            Line::from(vec![
-                Span::styled(prompt, Style::default().fg(Color::White)),
-            ]),
+            Line::from(vec![Span::styled(
+                prompt,
+                Style::default().fg(Color::White),
+            )]),
             Line::from(""),
             Line::from(vec![
                 Span::styled("Input: ", Style::default().fg(Color::Green)),
-                Span::styled(format!("{}_", current_input), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!("{}_", current_input),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
             ]),
             Line::from(""),
-            Line::from(vec![
-                Span::styled(hint, Style::default().fg(Color::Gray)),
-            ]),
+            Line::from(vec![Span::styled(hint, Style::default().fg(Color::Gray))]),
             Line::from(""),
-            Line::from(vec![
-                Span::styled("Press ENTER to continue, ESC to cancel", Style::default().fg(Color::Blue)),
-            ]),
+            Line::from(vec![Span::styled(
+                "Press ENTER to continue, ESC to cancel",
+                Style::default().fg(Color::Blue),
+            )]),
         ];
 
         let dialog_paragraph = Paragraph::new(content)
@@ -2453,8 +2768,12 @@ impl Dashboard {
                 Block::default()
                     .borders(Borders::ALL)
                     .title(title)
-                    .title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
-                    .border_style(Style::default().fg(Color::Cyan))
+                    .title_style(
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .border_style(Style::default().fg(Color::Cyan)),
             )
             .wrap(Wrap { trim: true });
 

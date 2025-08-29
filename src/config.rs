@@ -1,8 +1,8 @@
+use anyhow::{Context, Result};
+use dirs::home_dir;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use dirs::home_dir;
-use anyhow::{Context, Result};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TranscriptionMode {
@@ -93,37 +93,32 @@ impl ScribaConfig {
 
     pub fn load() -> Result<Self> {
         let config_path = Self::config_path();
-        
+
         if !config_path.exists() {
             let config = Self::default();
             config.save()?;
             return Ok(config);
         }
 
-        let content = fs::read_to_string(&config_path)
-            .context("Failed to read config file")?;
-        
-        let config: Self = serde_json::from_str(&content)
-            .context("Failed to parse config file")?;
-        
+        let content = fs::read_to_string(&config_path).context("Failed to read config file")?;
+
+        let config: Self = serde_json::from_str(&content).context("Failed to parse config file")?;
+
         Ok(config)
     }
 
     pub fn save(&self) -> Result<()> {
         let config_path = Self::config_path();
-        
+
         // Ensure parent directory exists
         if let Some(parent) = config_path.parent() {
-            fs::create_dir_all(parent)
-                .context("Failed to create config directory")?;
+            fs::create_dir_all(parent).context("Failed to create config directory")?;
         }
 
-        let content = serde_json::to_string_pretty(self)
-            .context("Failed to serialize config")?;
-        
-        fs::write(&config_path, content)
-            .context("Failed to write config file")?;
-        
+        let content = serde_json::to_string_pretty(self).context("Failed to serialize config")?;
+
+        fs::write(&config_path, content).context("Failed to write config file")?;
+
         Ok(())
     }
 
@@ -134,7 +129,7 @@ impl ScribaConfig {
                 self.last_api_key = Some(api_key.clone());
             }
         }
-        
+
         self.transcription = mode;
         self.save()
     }

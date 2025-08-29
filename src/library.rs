@@ -1,14 +1,14 @@
 use crate::database::{Database, Recording};
 use anyhow::{Context, Result};
-use std::io::{self, stdout, Write};
-use dirs::home_dir;
 use crossterm::{
-    style::{Color, Stylize}, 
-    terminal::{Clear, ClearType, enable_raw_mode, disable_raw_mode},
-    cursor::{MoveTo, Hide, Show},
+    cursor::{Hide, MoveTo, Show},
     event::{self, Event, KeyCode, KeyEvent},
     execute,
+    style::{Color, Stylize},
+    terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
 };
+use dirs::home_dir;
+use std::io::{self, stdout, Write};
 use std::thread;
 use std::time::Duration;
 
@@ -37,7 +37,7 @@ impl RecordingLibrary {
         enable_raw_mode()?;
         // Hide cursor for better visual experience
         execute!(stdout(), Hide)?;
-        
+
         // Initial load
         self.show_loading_animation()?;
         self.load_recordings()?;
@@ -48,10 +48,10 @@ impl RecordingLibrary {
             execute!(stdout(), Show)?;
             return Ok(());
         }
-        
+
         loop {
             self.display_library()?;
-            
+
             match self.get_user_choice()? {
                 LibraryChoice::Quit => break,
                 LibraryChoice::NextPage => {
@@ -81,8 +81,7 @@ impl RecordingLibrary {
                 }
                 LibraryChoice::MoveUp | LibraryChoice::MoveDown => {
                     // Navigation handled in get_user_choice, just refresh display
-                }
-                // Current selection handled via Enter mapping to Play(self.selected_index)
+                } // Current selection handled via Enter mapping to Play(self.selected_index)
             }
         }
 
@@ -92,39 +91,42 @@ impl RecordingLibrary {
         Ok(())
     }
 
-
     fn show_loading_animation(&self) -> Result<()> {
         execute!(stdout(), Clear(ClearType::All), MoveTo(0, 0))?;
-        
+
         let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let colors = [Color::Cyan, Color::Magenta, Color::Yellow, Color::Green];
-        
+
         for i in 0..12 {
             let frame = frames[i % frames.len()];
             let color = colors[i % colors.len()];
-            
+
             execute!(stdout(), MoveTo(25, 10))?;
-            print!("{} {} {}", 
-                   frame.with(color), 
-                   "LOADING RECORDINGS".with(Color::White).bold(),
-                   frame.with(color));
+            print!(
+                "{} {} {}",
+                frame.with(color),
+                "LOADING RECORDINGS".with(Color::White).bold(),
+                frame.with(color)
+            );
             stdout().flush()?;
             thread::sleep(Duration::from_millis(80));
         }
-        
+
         Ok(())
     }
 
     fn load_recordings(&mut self) -> Result<()> {
         let offset = (self.current_page * self.page_size) as i64;
-        self.recordings = self.db.list_recordings(Some(self.page_size as i64), Some(offset))?;
-        
+        self.recordings = self
+            .db
+            .list_recordings(Some(self.page_size as i64), Some(offset))?;
+
         // Reset selected index when loading new recordings
         self.selected_index = 0;
         if self.selected_index >= self.recordings.len() && !self.recordings.is_empty() {
             self.selected_index = self.recordings.len() - 1;
         }
-        
+
         Ok(())
     }
 
@@ -132,52 +134,98 @@ impl RecordingLibrary {
         execute!(stdout(), Clear(ClearType::All), MoveTo(0, 0))?;
 
         // Retro header with colorful gradient effect
-        println!("{}", "╔════════════════════════════════════════════════════════╗".with(Color::Cyan).bold());
-        println!("{}", "║                   🎵 RECORDING LIBRARY 🎵                ║".with(Color::Magenta).bold());
-        println!("{}", "╚════════════════════════════════════════════════════════╝".with(Color::Cyan).bold());
+        println!(
+            "{}",
+            "╔════════════════════════════════════════════════════════╗"
+                .with(Color::Cyan)
+                .bold()
+        );
+        println!(
+            "{}",
+            "║                   🎵 RECORDING LIBRARY 🎵                ║"
+                .with(Color::Magenta)
+                .bold()
+        );
+        println!(
+            "{}",
+            "╚════════════════════════════════════════════════════════╝"
+                .with(Color::Cyan)
+                .bold()
+        );
         println!();
 
         // Show current page info with retro styling
         let total_recordings = self.recordings.len();
         let start_index = self.current_page * self.page_size + 1;
-        let end_index = std::cmp::min(start_index + total_recordings - 1, start_index + self.page_size - 1);
-        
+        let end_index = std::cmp::min(
+            start_index + total_recordings - 1,
+            start_index + self.page_size - 1,
+        );
+
         if total_recordings > 0 {
-            let page_info = format!("【 PAGE {} 】 Showing {}-{} recordings", 
-                    self.current_page + 1, start_index, end_index);
+            let page_info = format!(
+                "【 PAGE {} 】 Showing {}-{} recordings",
+                self.current_page + 1,
+                start_index,
+                end_index
+            );
             println!("{}", page_info.with(Color::Yellow).bold());
             println!();
         }
 
         // Table header for proper alignment
-        println!("{}", format!("    {}  {:<25} │ {:<8} │ {}", 
-                 "ST", "NAME", "DURATION", "CREATED").with(Color::Yellow).bold());
-        println!("{}", "─────────────────────────────────────────────────────────".with(Color::DarkGrey));
+        println!(
+            "{}",
+            format!(
+                "    {}  {:<25} │ {:<8} │ {}",
+                "ST", "NAME", "DURATION", "CREATED"
+            )
+            .with(Color::Yellow)
+            .bold()
+        );
+        println!(
+            "{}",
+            "─────────────────────────────────────────────────────────".with(Color::DarkGrey)
+        );
 
         // Display recordings with fixed-width formatting for perfect alignment
         for (i, recording) in self.recordings.iter().enumerate() {
             let is_selected = i == self.selected_index;
             let number = i + 1;
-            let display_name = recording.display_name.as_ref()
+            let display_name = recording
+                .display_name
+                .as_ref()
                 .unwrap_or(&recording.directory_name);
-            
-            let duration = recording.duration_seconds
+
+            let duration = recording
+                .duration_seconds
                 .map(|d| self.format_duration(d))
                 .unwrap_or_else(|| "Unknown".to_string());
 
             // Use text-based status indicators for consistent alignment
-            let status_icon = if recording.has_transcript { "[T]" } else { "[A]" };
-            
+            let status_icon = if recording.has_transcript {
+                "[T]"
+            } else {
+                "[A]"
+            };
+
             let created_date = recording.created_at.format("%m/%d %H:%M").to_string();
-            
+
             // Fixed-width formatting ensures perfect column alignment
             if is_selected {
-                let selected_line = format!("▶{:2}. {} {:<25} │ {:<8} │ {}", 
-                    number, status_icon, display_name, duration, created_date);
-                println!("{}", selected_line.with(Color::Black).on(Color::Cyan).bold());
+                let selected_line = format!(
+                    "▶{:2}. {} {:<25} │ {:<8} │ {}",
+                    number, status_icon, display_name, duration, created_date
+                );
+                println!(
+                    "{}",
+                    selected_line.with(Color::Black).on(Color::Cyan).bold()
+                );
             } else {
-                let normal_line = format!(" {:2}. {} {:<25} │ {:<8} │ {}", 
-                    number, status_icon, display_name, duration, created_date);
+                let normal_line = format!(
+                    " {:2}. {} {:<25} │ {:<8} │ {}",
+                    number, status_icon, display_name, duration, created_date
+                );
                 println!("{}", normal_line.with(Color::White));
             }
         }
@@ -185,8 +233,11 @@ impl RecordingLibrary {
         println!();
 
         // Retro-styled command bar with pixelated look
-        println!("{}", "▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓".with(Color::DarkBlue));
-        
+        println!(
+            "{}",
+            "▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓".with(Color::DarkBlue)
+        );
+
         let controls = vec![
             ("↑/↓", "Navigate", Color::Green),
             ("ENTER", "Play", Color::Yellow),
@@ -196,46 +247,54 @@ impl RecordingLibrary {
             ("N/P", "Page", Color::Blue),
             ("Q", "Quit", Color::White),
         ];
-        
+
         print!("┃ ");
         for (i, (key, desc, color)) in controls.iter().enumerate() {
-            print!("{}{} {}", 
-                   key.with(*color).bold(),
-                   ":".with(Color::DarkGrey),
-                   desc.with(Color::White));
+            print!(
+                "{}{} {}",
+                key.with(*color).bold(),
+                ":".with(Color::DarkGrey),
+                desc.with(Color::White)
+            );
             if i < controls.len() - 1 {
                 print!(" {} ", "│".with(Color::DarkGrey));
             }
         }
         println!(" ┃");
-        
-        println!("{}", "▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓".with(Color::DarkBlue));
-        
+
+        println!(
+            "{}",
+            "▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓".with(Color::DarkBlue)
+        );
+
         print!("{} ", ">>".with(Color::Green).bold());
         stdout().flush()?;
-        
+
         Ok(())
     }
-
-
-
 
     fn show_empty_library(&self) {
         // Temporarily disable raw mode for user input
         disable_raw_mode().unwrap();
         execute!(stdout(), Show).unwrap();
-        
+
         println!("╔════════════════════════════════════════════════════════╗");
         println!("║                   🎵 RECORDING LIBRARY 🎵                ║");
         println!("╚════════════════════════════════════════════════════════╝");
         println!();
         println!("{}", "📭 EMPTY LIBRARY".with(Color::Yellow).bold());
         println!();
-        println!("{}", "You haven't made any recordings yet!".with(Color::White));
-        println!("{}", "Go back to the main menu to start your first recording session.".with(Color::Cyan));
+        println!(
+            "{}",
+            "You haven't made any recordings yet!".with(Color::White)
+        );
+        println!(
+            "{}",
+            "Go back to the main menu to start your first recording session.".with(Color::Cyan)
+        );
         println!();
         println!("Press Enter to continue...");
-        
+
         let mut input = String::new();
         io::stdin().read_line(&mut input).unwrap();
     }
@@ -295,7 +354,6 @@ impl RecordingLibrary {
         }
     }
 
-
     fn next_page(&mut self) {
         if self.recordings.len() == self.page_size {
             self.current_page += 1;
@@ -314,15 +372,22 @@ impl RecordingLibrary {
         // Temporarily disable raw mode for user input
         disable_raw_mode()?;
         execute!(stdout(), Show)?;
-        
-        println!("\n🎵 Playing: {}", 
-                 recording.display_name.as_ref().unwrap_or(&recording.directory_name));
-        
+
+        println!(
+            "\n🎵 Playing: {}",
+            recording
+                .display_name
+                .as_ref()
+                .unwrap_or(&recording.directory_name)
+        );
+
         let base_path = home_dir()
             .context("Could not find home directory")?
             .join("scriba_recordings");
-        let audio_path = base_path.join(&recording.directory_name).join("recording.wav");
-        
+        let audio_path = base_path
+            .join(&recording.directory_name)
+            .join("recording.wav");
+
         if !audio_path.exists() {
             println!("❌ Audio file not found: {}", audio_path.display());
             println!("Press Enter to continue...");
@@ -338,9 +403,11 @@ impl RecordingLibrary {
         }
         if recording.has_transcript {
             println!("📝 Transcript available");
-            
+
             // Show transcript if it exists
-            let transcript_path = base_path.join(&recording.directory_name).join("transcript.txt");
+            let transcript_path = base_path
+                .join(&recording.directory_name)
+                .join("transcript.txt");
             if transcript_path.exists() {
                 if let Ok(content) = std::fs::read_to_string(&transcript_path) {
                     println!();
@@ -361,11 +428,11 @@ impl RecordingLibrary {
         println!("Press Enter to continue...");
         let mut input = String::new();
         io::stdin().read_line(&mut input)?;
-        
+
         // Re-enable raw mode
         enable_raw_mode()?;
         execute!(stdout(), Hide)?;
-        
+
         Ok(())
     }
 
@@ -373,44 +440,50 @@ impl RecordingLibrary {
         // Temporarily disable raw mode for user input
         disable_raw_mode()?;
         execute!(stdout(), Show)?;
-        
+
         println!("\n⚠️  Are you sure you want to delete this recording?");
-        println!("   📁 {}", recording.display_name.as_ref().unwrap_or(&recording.directory_name));
+        println!(
+            "   📁 {}",
+            recording
+                .display_name
+                .as_ref()
+                .unwrap_or(&recording.directory_name)
+        );
         print!("   Type 'yes' to confirm: ");
         stdout().flush()?;
-        
+
         let mut input = String::new();
         io::stdin().read_line(&mut input)?;
-        
+
         if input.trim().to_lowercase() == "yes" {
             // Delete from database
             if let Some(id) = recording.id {
                 self.db.delete_recording(id)?;
-                
+
                 // Delete files
                 let base_path = home_dir()
                     .context("Could not find home directory")?
                     .join("scriba_recordings");
                 let recording_dir = base_path.join(&recording.directory_name);
-                
+
                 if recording_dir.exists() {
                     std::fs::remove_dir_all(&recording_dir)?;
                 }
-                
+
                 println!("✅ Recording deleted successfully!");
             }
         } else {
             println!("❌ Deletion cancelled.");
         }
-        
+
         println!("Press Enter to continue...");
         let mut input = String::new();
         io::stdin().read_line(&mut input)?;
-        
+
         // Re-enable raw mode
         enable_raw_mode()?;
         execute!(stdout(), Hide)?;
-        
+
         Ok(())
     }
 
@@ -418,9 +491,9 @@ impl RecordingLibrary {
         // Temporarily disable raw mode for user input
         disable_raw_mode()?;
         execute!(stdout(), Show)?;
-        
+
         let stats = self.db.get_stats()?;
-        
+
         println!();
         println!("╔════════════════════════════════════════════════════════╗");
         println!("║                RECORDING STATISTICS                    ║");
@@ -435,16 +508,16 @@ impl RecordingLibrary {
             let avg_duration = stats.total_duration_seconds / stats.total_recordings;
             println!("📊 Avg Duration: {}", self.format_duration(avg_duration));
         }
-        
+
         println!("\n💡 Your personal knowledge base is growing!");
         println!("Press Enter to continue...");
         let mut input = String::new();
         io::stdin().read_line(&mut input)?;
-        
+
         // Re-enable raw mode
         enable_raw_mode()?;
         execute!(stdout(), Hide)?;
-        
+
         Ok(())
     }
 
@@ -452,20 +525,20 @@ impl RecordingLibrary {
         // Temporarily disable raw mode for user input
         disable_raw_mode()?;
         execute!(stdout(), Show)?;
-        
+
         print!("\n🔍 Search recordings (enter keywords): ");
         stdout().flush()?;
-        
+
         let mut input = String::new();
         io::stdin().read_line(&mut input)?;
         let query = input.trim();
-        
+
         if query.is_empty() {
             return Ok(());
         }
 
         println!("🔍 Searching for '{}'...", query);
-        
+
         match self.db.search_transcripts(query, Some(10)) {
             Ok(results) => {
                 if results.is_empty() {
@@ -473,11 +546,16 @@ impl RecordingLibrary {
                 } else {
                     println!("✅ Found {} matching recording(s):", results.len());
                     println!();
-                    
+
                     for (i, (recording, _transcript)) in results.iter().enumerate() {
-                        println!("{}. 🎙️  {}", 
-                                 i + 1, 
-                                 recording.display_name.as_ref().unwrap_or(&recording.directory_name));
+                        println!(
+                            "{}. 🎙️  {}",
+                            i + 1,
+                            recording
+                                .display_name
+                                .as_ref()
+                                .unwrap_or(&recording.directory_name)
+                        );
                         println!("   📅 {}", recording.created_at.format("%Y-%m-%d %H:%M"));
                         println!();
                     }
@@ -488,15 +566,15 @@ impl RecordingLibrary {
                 println!("💡 Make sure you have transcribed recordings to search through.");
             }
         }
-        
+
         println!("Press Enter to continue...");
         let mut input = String::new();
         io::stdin().read_line(&mut input)?;
-        
+
         // Re-enable raw mode
         enable_raw_mode()?;
         execute!(stdout(), Hide)?;
-        
+
         Ok(())
     }
 
@@ -504,7 +582,7 @@ impl RecordingLibrary {
         let hours = seconds / 3600;
         let minutes = (seconds % 3600) / 60;
         let secs = seconds % 60;
-        
+
         if hours > 0 {
             format!("{}h {}m {}s", hours, minutes, secs)
         } else if minutes > 0 {
