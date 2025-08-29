@@ -386,10 +386,10 @@ impl Dashboard {
             KeyCode::Down => {
                 self.next_recording();
             }
-            KeyCode::PageUp => {
+            KeyCode::PageUp | KeyCode::Char('[') => {
                 self.previous_page().await?;
             }
-            KeyCode::PageDown => {
+            KeyCode::PageDown | KeyCode::Char(']') => {
                 self.next_page().await?;
             }
             KeyCode::Enter => {
@@ -513,10 +513,17 @@ impl Dashboard {
     }
 
     async fn next_page(&mut self) -> Result<()> {
-        if self.recordings.len() == self.page_size {
-            self.current_page += 1;
+        // Try to load next page - if it has recordings, advance
+        let old_page = self.current_page;
+        self.current_page += 1;
+        self.load_recordings()?;
+        
+        // If no recordings found on next page, go back to previous page
+        if self.recordings.is_empty() {
+            self.current_page = old_page;
             self.load_recordings()?;
         }
+        
         Ok(())
     }
 
@@ -1330,7 +1337,7 @@ impl Dashboard {
                 Block::default()
                     .borders(Borders::ALL)
                     .style(Style::default().fg(Color::Cyan))
-                    .title("Recordings")
+                    .title(format!("Recordings (Page {})", self.current_page + 1))
             )
             .highlight_style(
                 Style::default()
@@ -1387,7 +1394,7 @@ impl Dashboard {
         let controls = if self.search_mode {
             "ESC: Cancel | ENTER: Search | Type to search..."
         } else {
-"↑↓: Navigate | ENTER: Transcript | P: Play | D/Del: Delete | /: Search | R/A/T: Quick Actions | S: Settings | H: Help | Q: Quit"
+"↑↓: Navigate | [/]: Pages | ENTER: Transcript | P: Play | D/Del: Delete | /: Search | R/A/T: Quick Actions | S: Settings | H: Help | Q: Quit"
         };
 
         let controls_paragraph = Paragraph::new(controls)
@@ -1434,7 +1441,7 @@ impl Dashboard {
             Line::from(""),
             Line::from("Navigation:"),
             Line::from("  ↑/↓        - Navigate recordings"),
-            Line::from("  PgUp/PgDn  - Change pages"),
+            Line::from("  PgUp/PgDn  - Change pages (or '['/']')"),
             Line::from("  Enter      - View transcript"),
             Line::from("  P          - Play recording"),
             Line::from(""),
