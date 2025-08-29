@@ -1305,8 +1305,11 @@ impl Dashboard {
             let status = if recording.has_transcript { "[T]" } else { "[A]" };
             let created = recording.created_at.format("%m/%d %H:%M").to_string();
 
+            // Calculate global index across all pages
+            let global_index = (self.current_page * self.page_size) + i + 1;
+
             let cells = vec![
-                Cell::from((i + 1).to_string()),
+                Cell::from(global_index.to_string()),
                 Cell::from(status).style(
                     if recording.has_transcript {
                         Style::default().fg(Color::Green)
@@ -1337,7 +1340,11 @@ impl Dashboard {
                 Block::default()
                     .borders(Borders::ALL)
                     .style(Style::default().fg(Color::Cyan))
-                    .title(format!("Recordings (Page {})", self.current_page + 1))
+                    .title({
+                        let start_index = (self.current_page * self.page_size) + 1;
+                        let end_index = start_index + self.recordings.len() - 1;
+                        format!("Recordings (Page {} - #{}-#{})", self.current_page + 1, start_index, end_index)
+                    })
             )
             .highlight_style(
                 Style::default()
