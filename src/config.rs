@@ -54,6 +54,8 @@ impl std::str::FromStr for LocalModelSize {
 pub struct ScribaConfig {
     pub transcription: TranscriptionMode,
     pub audio_settings: AudioSettings,
+    /// Stores the last used API key to preserve it when switching modes
+    pub last_api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +78,7 @@ impl Default for ScribaConfig {
                 channels: 1,
                 speech_optimized: true,
             },
+            last_api_key: None,
         }
     }
 }
@@ -125,6 +128,13 @@ impl ScribaConfig {
     }
 
     pub fn set_transcription_mode(&mut self, mode: TranscriptionMode) -> Result<()> {
+        // Save current API key if we're switching away from API mode
+        if let TranscriptionMode::Api { api_key } = &self.transcription {
+            if !api_key.is_empty() {
+                self.last_api_key = Some(api_key.clone());
+            }
+        }
+        
         self.transcription = mode;
         self.save()
     }

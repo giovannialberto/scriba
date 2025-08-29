@@ -1,6 +1,6 @@
 use crate::database::{Database, Recording, RecordingStats};
 use crate::record::record_with_control;
-use crate::transcribe::transcribe_file_silent;
+use crate::transcribe::transcribe_file;
 use crate::audio::CompressionSettings;
 use crate::config::{ScribaConfig, TranscriptionMode, LocalModelSize};
 use tokio::sync::mpsc;
@@ -188,8 +188,10 @@ impl Dashboard {
                                 // Start transcription
                                 let input_path = PathBuf::from(&recording_name);
                                 let input_path_clone = input_path.clone();
+                                let output_path_clone = input_path.clone();
+                                let transcription_mode = self.config.transcription.clone();
                                 self.transcription_task = Some(tokio::spawn(async move {
-                                    transcribe_file_silent(&input_path_clone, Some(LocalModelSize::Turbo)).await
+                                    transcribe_file(&input_path_clone, &output_path_clone, Some(transcription_mode)).await
                                 }));
                             } else {
                                 // Recording only mode - complete
@@ -945,7 +947,11 @@ impl Dashboard {
                             // Toggle transcription mode
                             let new_mode = match &self.config.transcription {
                                 TranscriptionMode::Local { .. } => {
-                                    TranscriptionMode::Api { api_key: String::new() }
+                                    // Use preserved API key if available, otherwise empty
+                                    let api_key = self.config.last_api_key.as_ref()
+                                        .map(|key| key.clone())
+                                        .unwrap_or_else(String::new);
+                                    TranscriptionMode::Api { api_key }
                                 }
                                 TranscriptionMode::Api { .. } => {
                                     TranscriptionMode::Local { model_size: LocalModelSize::Medium }
@@ -1887,8 +1893,10 @@ impl Dashboard {
         
         // Start transcription in background task
         let input_path_clone = input_path.clone();
+        let output_path_clone = input_path.clone();
+        let transcription_mode = self.config.transcription.clone();
         self.transcription_task = Some(tokio::spawn(async move {
-            transcribe_file_silent(&input_path_clone, Some(LocalModelSize::Turbo)).await
+            transcribe_file(&input_path_clone, &output_path_clone, Some(transcription_mode)).await
         }));
         
         Ok(())
