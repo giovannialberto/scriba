@@ -236,8 +236,15 @@ fn resolve_audio_path(input_path: &PathBuf) -> Result<PathBuf> {
             Err(anyhow::anyhow!("Audio file not found: {}", full_path.display()))
         }
     } else {
-        let recording_dir = BASE_PATH.join(input_path);
-        for audio_file in ["recording.mp3", "recording.wav"] {
+        // Handle directory name - could be relative to BASE_PATH or already under BASE_PATH
+        let recording_dir = if input_path.is_absolute() {
+            input_path.clone()
+        } else {
+            BASE_PATH.join(input_path)
+        };
+        
+        // Check for all supported audio formats
+        for audio_file in ["recording.wav", "recording.mp3", "recording.m4a", "recording.flac", "recording.ogg", "recording.aac"] {
             let path = recording_dir.join(audio_file);
             if path.exists() {
                 validate_audio_file(&path)?;
@@ -245,7 +252,7 @@ fn resolve_audio_path(input_path: &PathBuf) -> Result<PathBuf> {
             }
         }
         Err(anyhow::anyhow!(
-            "No audio file found (recording.wav or recording.mp3) in {}", 
+            "No audio file found (recording.wav, recording.mp3, recording.m4a, recording.flac, recording.ogg, or recording.aac) in {}", 
             recording_dir.display()
         ))
     }

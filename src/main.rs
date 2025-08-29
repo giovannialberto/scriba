@@ -225,9 +225,10 @@ async fn import_audio_file(
         &config,
     )?;
     
-    // Start transcription
+    // Start transcription - pass just the directory name, not the full path
     println!("📝 Starting transcription...");
-    transcribe_file(&dest_dir, &dest_dir, Some(transcription_mode)).await
+    let directory_path = PathBuf::from(&directory_name);
+    transcribe_file(&directory_path, &directory_path, Some(transcription_mode)).await
         .with_context(|| "Transcription failed")?;
     
     println!("🎉 Import and transcription complete!");

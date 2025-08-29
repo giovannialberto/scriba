@@ -2013,7 +2013,7 @@ impl Dashboard {
             transcript_path: None,
         };
         
-        let recording_id = match self.db.insert_recording(&recording) {
+        let _recording_id = match self.db.insert_recording(&recording) {
             Ok(id) => {
                 self.message = format!("✅ File imported: {}", display_name);
                 id
@@ -2029,11 +2029,12 @@ impl Dashboard {
         // Update progress message for transcription
         self.progress_animation = Some(format!("📝 Transcribing: {}", display_name));
         
-        // Start transcription task
-        let input_path_clone = dest_dir.clone();
+        // Start transcription task - pass just the directory name, not the full path
+        let directory_name_clone = directory_name.clone();
         let transcription_mode = self.config.transcription.clone();
         self.transcription_task = Some(tokio::spawn(async move {
-            transcribe_file_silent_with_mode(&input_path_clone, Some(transcription_mode)).await
+            let directory_path = PathBuf::from(directory_name_clone);
+            transcribe_file_silent_with_mode(&directory_path, Some(transcription_mode)).await
         }));
         
         Ok(())
