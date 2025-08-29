@@ -1,6 +1,6 @@
 use crate::database::{Database, Recording, RecordingStats};
 use crate::record::record_with_control;
-use crate::transcribe::transcribe_file;
+use crate::transcribe::transcribe_file_silent_with_mode;
 use crate::audio::CompressionSettings;
 use crate::config::{ScribaConfig, TranscriptionMode, LocalModelSize};
 use tokio::sync::mpsc;
@@ -188,10 +188,9 @@ impl Dashboard {
                                 // Start transcription
                                 let input_path = PathBuf::from(&recording_name);
                                 let input_path_clone = input_path.clone();
-                                let output_path_clone = input_path.clone();
                                 let transcription_mode = self.config.transcription.clone();
                                 self.transcription_task = Some(tokio::spawn(async move {
-                                    transcribe_file(&input_path_clone, &output_path_clone, Some(transcription_mode)).await
+                                    transcribe_file_silent_with_mode(&input_path_clone, Some(transcription_mode)).await
                                 }));
                             } else {
                                 // Recording only mode - complete
@@ -1893,10 +1892,9 @@ impl Dashboard {
         
         // Start transcription in background task
         let input_path_clone = input_path.clone();
-        let output_path_clone = input_path.clone();
         let transcription_mode = self.config.transcription.clone();
         self.transcription_task = Some(tokio::spawn(async move {
-            transcribe_file(&input_path_clone, &output_path_clone, Some(transcription_mode)).await
+            transcribe_file_silent_with_mode(&input_path_clone, Some(transcription_mode)).await
         }));
         
         Ok(())

@@ -252,7 +252,30 @@ fn resolve_audio_path(input_path: &PathBuf) -> Result<PathBuf> {
 }
 
 // Silent transcription function for TUI usage (no stdout prints)
-pub async fn transcribe_file_silent(input_path: &PathBuf, model: Option<LocalModelSize>) -> Result<(), anyhow::Error> {
+pub async fn transcribe_file_silent_with_mode(
+    input_path: &PathBuf, 
+    mode_override: Option<TranscriptionMode>
+) -> Result<(), anyhow::Error> {
+    // Suppress any whisper/ggml logs globally to avoid interfering with TUI
+    ensure_whisper_logs_suppressed();
+    
+    let audio_file_path = resolve_audio_path(input_path)?;
+    
+    // Determine which transcription mode to use
+    let config = ScribaConfig::load()?;
+    let transcription_mode = mode_override.unwrap_or_else(|| config.transcription.clone());
+    
+    match transcription_mode {
+        TranscriptionMode::Local { model_size } => {
+            transcribe_file_silent_local(input_path, Some(model_size)).await
+        }
+        TranscriptionMode::Api { api_key } => {
+            transcribe_with_openai_api_silent(&audio_file_path, &api_key).await
+        }
+    }
+}
+
+pub async fn transcribe_file_silent_local(input_path: &PathBuf, model: Option<LocalModelSize>) -> Result<(), anyhow::Error> {
     // Suppress any whisper/ggml logs globally to avoid interfering with TUI
     ensure_whisper_logs_suppressed();
     
@@ -510,6 +533,44 @@ async fn transcribe_with_openai_api(audio_path: &PathBuf, api_key: &str) -> Resu
         .and_then(|t| t.as_str())
         .map(|s| s.to_string())
         .ok_or_else(|| anyhow::anyhow!("No 'text' field found in OpenAI response"))
+}
+
+async fn transcribe_with_openai_api_silent(audio_path: &PathBuf, api_key: &str) -> Result<()> {
+    let transcript_text = transcribe_with_openai_api(audio_path, api_key).await?;
+    
+    // Save transcript to file (silent - no prints)
+    let transcript_path = audio_path.with_extension("txt");
+    std::fs::write(&transcript_path, &transcript_text)
+        .with_context(|| format!("Failed to write transcript to {}", transcript_path.display()))?;
+    
+    // Store in database if possible
+    if let Ok(mut db) = Database::new() {
+        if let Some(directory_name) = audio_path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) {
+            if let Ok(Some(recording)) = db.get_recording_by_directory(directory_name) {
+                if let Some(recording_id) = recording.id {
+                    let transcript_row = Transcript {
+                        id: None,
+                        recording_id,
+                        content: transcript_text.clone(),
+                        created_at: Utc::now(),
+                        updated_at: Utc::now(),
+                        word_count: None,
+                        character_count: None,
+                        language_detected: None,
+                        confidence_scores: None,
+                        segments: None,
+                        entities: None,
+                        topics: None,
+                    };
+                    if db.insert_transcript(&transcript_row).is_ok() {
+                        let _ = db.update_recording_transcript_status(recording_id, "completed", true);
+                    }
+                }
+            }
+        }
+    }
+    
+    Ok(())
 }
 
 
