@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use structopt::StructOpt;
 use anyhow::Context;
-use scriba::record::record;
+use scriba::record::{record, calculate_audio_duration};
 use scriba::transcribe::transcribe_file;
 use scriba::dashboard::Dashboard;
 use scriba::audio::{AudioFormat, CompressionSettings};
@@ -45,21 +45,9 @@ enum Command {
         api_key: Option<String>,
     },
     Transcribe {
-        #[structopt(parse(from_os_str), help = "Path to the input recording file or directory name")]
+        #[structopt(parse(from_os_str), help = "Path to existing recording directory name OR external audio file to import")]
         input: PathBuf,
-        #[structopt(short = "n", long = "name", help = "Optional name for the transcript (auto-generated if not provided)")]
-        name: Option<String>,
-        #[structopt(long = "local", help = "Force local transcription (overrides config)")]
-        force_local: bool,
-        #[structopt(long = "model", help = "Local Whisper model size (tiny|base|small|medium|large|turbo)")]
-        model: Option<LocalModelSize>,
-        #[structopt(long = "api-key", help = "OpenAI API key for API-based transcription (overrides config)")]
-        api_key: Option<String>,
-    },
-    Import {
-        #[structopt(parse(from_os_str), help = "Path to the audio file to import")]
-        input: PathBuf,
-        #[structopt(short = "n", long = "name", help = "Display name for the imported recording")]
+        #[structopt(short = "n", long = "name", help = "Display name for imported files (auto-generated if not provided)")]
         name: Option<String>,
         #[structopt(long = "local", help = "Force local transcription (overrides config)")]
         force_local: bool,
@@ -189,7 +177,13 @@ async fn import_audio_file(
         display_name: Some(display_name.clone()),
         created_at: Utc::now(),
         updated_at: Utc::now(),
-        duration_seconds: None, // TODO: We could calculate this if needed
+        duration_seconds: {
+            // Calculate duration from the copied file
+            match calculate_audio_duration(&dest_file, 44100, 2) {
+                Ok(duration) => Some(duration),
+                Err(_) => None, // Fallback to None if calculation fails
+            }
+        },
         file_size_bytes: None,  // TODO: We could get file size
         audio_format,
         sample_rate: 44100, // Default value
@@ -425,7 +419,7 @@ async fn main() -> Result<()> {
             // Launch dashboard directly
             println!("\n╭─ SCRIBA DASHBOARD ─────────────────────────────────────╮");
             println!("│ Launching dashboard interface...                       │");
-            println!("╰───────────────────────────────────────────────────────╯\n");
+            println!("╰────────────────────────────────────────────────────────╯\n");
             
             match Dashboard::new() {
                 Ok(mut dashboard) => {
@@ -497,31 +491,37 @@ async fn main() -> Result<()> {
                     record_result
                 }
                 Command::Transcribe { input, name, force_local, model, api_key } => {
-                    // Generate automatic transcript filename if needed
-                    let output = if let Some(n) = name {
-                        let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
-                        let sanitized = n.replace(' ', "-").replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_");
-                        PathBuf::from(format!("{}_{}_transcript", timestamp, sanitized))
+                    // Detect if input is an external audio file (import + transcribe) or existing recording directory
+                    if input.is_file() && input.extension().is_some() {
+                        // External audio file - import and transcribe
+                        println!("📁 Detected external audio file, importing and transcribing...");
+                        import_audio_file(input, name, force_local, model, api_key).await
                     } else {
-                        let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
-                        PathBuf::from(format!("{}_transcript", timestamp))
-                    };
-                    
-                    // Load config and resolve transcription mode
-                    let config = ScribaConfig::load()?;
-                    let transcription_mode = resolve_transcription_mode(
-                        force_local,
-                        model,
-                        api_key,
-                        &config,
-                    )?;
-                    
-                    // Transcribe the specified file
-                    let transcription = transcribe_file(&input, &output, Some(transcription_mode)).await;
-                    transcription
-                }
-                Command::Import { input, name, force_local, model, api_key } => {
-                    import_audio_file(input, name, force_local, model, api_key).await
+                        // Existing recording directory - transcribe only
+                        println!("📝 Transcribing existing recording...");
+                        
+                        // Generate automatic transcript filename if needed
+                        let output = if let Some(n) = name {
+                            let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
+                            let sanitized = n.replace(' ', "-").replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_");
+                            PathBuf::from(format!("{}_{}_transcript", timestamp, sanitized))
+                        } else {
+                            let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
+                            PathBuf::from(format!("{}_transcript", timestamp))
+                        };
+                        
+                        // Load config and resolve transcription mode
+                        let config = ScribaConfig::load()?;
+                        let transcription_mode = resolve_transcription_mode(
+                            force_local,
+                            model,
+                            api_key,
+                            &config,
+                        )?;
+                        
+                        // Transcribe the specified file
+                        transcribe_file(&input, &output, Some(transcription_mode)).await
+                    }
                 }
                 Command::Config { cmd } => {
                     match cmd {

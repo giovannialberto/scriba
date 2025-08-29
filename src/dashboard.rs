@@ -1,6 +1,7 @@
 use crate::database::{Database, Recording, RecordingStats};
 use crate::record::record_with_control;
 use crate::transcribe::transcribe_file_silent_with_mode;
+use crate::record::calculate_audio_duration;
 use crate::audio::CompressionSettings;
 use crate::config::{ScribaConfig, TranscriptionMode, LocalModelSize};
 use tokio::sync::mpsc;
@@ -1991,7 +1992,13 @@ impl Dashboard {
             display_name: Some(display_name.clone()),
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            duration_seconds: None, // TODO: We could calculate this if needed
+            duration_seconds: {
+                // Calculate duration from the copied file
+                match calculate_audio_duration(&dest_file, 44100, 2) {
+                    Ok(duration) => Some(duration),
+                    Err(_) => None, // Fallback to None if calculation fails
+                }
+            },
             file_size_bytes: None,  // TODO: We could get file size
             audio_format,
             sample_rate: 44100, // Default value

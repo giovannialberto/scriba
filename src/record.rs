@@ -300,7 +300,7 @@ fn write_input_data_with_monitoring_i8(input: &[i8], encoder: &AudioEncoderHandl
     }
 }
 
-fn calculate_audio_duration(file_path: &std::path::Path, _sample_rate: i64, _channels: i64) -> Result<i64, anyhow::Error> {
+pub fn calculate_audio_duration(file_path: &std::path::Path, _sample_rate: i64, _channels: i64) -> Result<i64, anyhow::Error> {
     let extension = file_path.extension()
         .and_then(|ext| ext.to_str())
         .unwrap_or("");
