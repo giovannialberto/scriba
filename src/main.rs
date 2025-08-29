@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use structopt::StructOpt;
+use anyhow::Context;
 use scriba::record::record;
 use scriba::transcribe::transcribe_file;
 use scriba::dashboard::Dashboard;
@@ -47,6 +48,18 @@ enum Command {
         #[structopt(parse(from_os_str), help = "Path to the input recording file or directory name")]
         input: PathBuf,
         #[structopt(short = "n", long = "name", help = "Optional name for the transcript (auto-generated if not provided)")]
+        name: Option<String>,
+        #[structopt(long = "local", help = "Force local transcription (overrides config)")]
+        force_local: bool,
+        #[structopt(long = "model", help = "Local Whisper model size (tiny|base|small|medium|large|turbo)")]
+        model: Option<LocalModelSize>,
+        #[structopt(long = "api-key", help = "OpenAI API key for API-based transcription (overrides config)")]
+        api_key: Option<String>,
+    },
+    Import {
+        #[structopt(parse(from_os_str), help = "Path to the audio file to import")]
+        input: PathBuf,
+        #[structopt(short = "n", long = "name", help = "Display name for the imported recording")]
         name: Option<String>,
         #[structopt(long = "local", help = "Force local transcription (overrides config)")]
         force_local: bool,
@@ -116,6 +129,111 @@ fn resolve_transcription_mode(
     
     // Use config default
     Ok(config.transcription.clone())
+}
+
+async fn import_audio_file(
+    input: PathBuf, 
+    name: Option<String>, 
+    force_local: bool, 
+    model: Option<LocalModelSize>, 
+    api_key: Option<String>
+) -> Result<()> {
+    use std::fs;
+    use chrono::{Local, Utc};
+    use scriba::database::{Database, Recording};
+    
+    // Check if input file exists
+    if !input.exists() {
+        return Err(anyhow::anyhow!("File not found: {}", input.display()));
+    }
+    
+    // Generate display name
+    let display_name = name.unwrap_or_else(|| {
+        input.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("imported_audio")
+            .to_string()
+    });
+    
+    println!("📁 Importing audio file: {}", input.display());
+    println!("📝 Display name: {}", display_name);
+    
+    // Generate unique directory name based on timestamp
+    let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
+    let directory_name = format!("{}_{}", timestamp, display_name.replace(' ', "_"));
+    
+    // Create destination directory
+    let base_path = dirs::home_dir()
+        .context("Could not find home directory")?
+        .join("scriba_recordings");
+    let dest_dir = base_path.join(&directory_name);
+    fs::create_dir_all(&dest_dir)?;
+    
+    // Copy audio file to destination with standard name
+    let file_extension = input
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("wav");
+    let dest_file = dest_dir.join(format!("recording.{}", file_extension));
+    
+    println!("📂 Copying file to: {}", dest_file.display());
+    fs::copy(&input, &dest_file)
+        .with_context(|| format!("Failed to copy {} to {}", input.display(), dest_file.display()))?;
+    
+    // Insert into database
+    let mut db = Database::new()?;
+    let audio_format = file_extension.to_string();
+    let recording = Recording {
+        id: None,
+        directory_name: directory_name.clone(),
+        display_name: Some(display_name.clone()),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        duration_seconds: None, // TODO: We could calculate this if needed
+        file_size_bytes: None,  // TODO: We could get file size
+        audio_format,
+        sample_rate: 44100, // Default value
+        channels: 2,       // Default value
+        has_transcript: false,
+        transcript_status: "pending".to_string(),
+        language_code: "auto".to_string(),
+        model_used: "whisper".to_string(),
+        tags: None,
+        summary: None,
+        key_points: None,
+        action_items: None,
+        speakers: None,
+        sentiment_score: None,
+        search_index: None,
+        categories: None,
+        confidence_score: None,
+        audio_path: format!("recording.{}", file_extension),
+        transcript_path: None,
+    };
+    
+    let recording_id = db.insert_recording(&recording)
+        .with_context(|| "Failed to insert recording into database")?;
+    
+    println!("✅ File imported to database with ID: {}", recording_id);
+    
+    // Load config and resolve transcription mode
+    let config = ScribaConfig::load()?;
+    let transcription_mode = resolve_transcription_mode(
+        force_local,
+        model,
+        api_key,
+        &config,
+    )?;
+    
+    // Start transcription
+    println!("📝 Starting transcription...");
+    transcribe_file(&dest_dir, &dest_dir, Some(transcription_mode)).await
+        .with_context(|| "Transcription failed")?;
+    
+    println!("🎉 Import and transcription complete!");
+    println!("📁 Files saved in: ~/scriba_recordings/{}/", directory_name);
+    
+    Ok(())
 }
 
 fn print_banner() {
@@ -400,6 +518,9 @@ async fn main() -> Result<()> {
                     // Transcribe the specified file
                     let transcription = transcribe_file(&input, &output, Some(transcription_mode)).await;
                     transcription
+                }
+                Command::Import { input, name, force_local, model, api_key } => {
+                    import_audio_file(input, name, force_local, model, api_key).await
                 }
                 Command::Config { cmd } => {
                     match cmd {
