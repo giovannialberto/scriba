@@ -1,73 +1,121 @@
+//! Database repository with DRY row mapping.
+
 use anyhow::{anyhow, Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use dirs::home_dir;
-use rusqlite::{params, Connection};
-use serde::{Deserialize, Serialize};
+use rusqlite::{params, Connection, Row};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Recording {
-    pub id: Option<i64>,
-    pub directory_name: String,
-    pub display_name: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-    pub duration_seconds: Option<i64>,
-    pub file_size_bytes: Option<i64>,
-    pub audio_format: String,
-    pub sample_rate: i64,
-    pub channels: i64,
-    pub has_transcript: bool,
-    pub transcript_status: String,
-    pub language_code: String,
-    pub model_used: String,
-    pub tags: Option<String>, // JSON
-    pub summary: Option<String>,
-    pub key_points: Option<String>,   // JSON
-    pub action_items: Option<String>, // JSON
-    pub speakers: Option<String>,     // JSON
-    pub sentiment_score: Option<f64>,
-    pub search_index: Option<String>,
-    pub categories: Option<String>, // JSON
-    pub confidence_score: Option<f64>,
-    pub audio_path: String,
-    pub transcript_path: Option<String>,
+use super::models::{Recording, RecordingStats, Transcript};
+
+/// Maps a SQLite row to a Recording struct.
+/// This eliminates the duplicate mapping code that was in 4+ places.
+fn row_to_recording(row: &Row) -> rusqlite::Result<Recording> {
+    Ok(Recording {
+        id: Some(row.get(0)?),
+        directory_name: row.get(1)?,
+        display_name: row.get(2)?,
+        created_at: row.get(3)?,
+        updated_at: row.get(4)?,
+        duration_seconds: row.get(5)?,
+        file_size_bytes: row.get(6)?,
+        audio_format: row.get(7)?,
+        sample_rate: row.get(8)?,
+        channels: row.get(9)?,
+        has_transcript: row.get(10)?,
+        transcript_status: row.get(11)?,
+        language_code: row.get(12)?,
+        model_used: row.get(13)?,
+        tags: row.get(14)?,
+        summary: row.get(15)?,
+        key_points: row.get(16)?,
+        action_items: row.get(17)?,
+        speakers: row.get(18)?,
+        sentiment_score: row.get(19)?,
+        search_index: row.get(20)?,
+        categories: row.get(21)?,
+        confidence_score: row.get(22)?,
+        audio_path: row.get(23)?,
+        transcript_path: row.get(24)?,
+    })
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Transcript {
-    pub id: Option<i64>,
-    pub recording_id: i64,
-    pub content: String,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-    pub word_count: Option<i64>,
-    pub character_count: Option<i64>,
-    pub language_detected: Option<String>,
-    pub confidence_scores: Option<String>, // JSON
-    pub segments: Option<String>,          // JSON
-    pub entities: Option<String>,          // JSON
-    pub topics: Option<String>,            // JSON
+/// Maps a SQLite row to a Transcript struct.
+fn row_to_transcript(row: &Row) -> rusqlite::Result<Transcript> {
+    Ok(Transcript {
+        id: Some(row.get(0)?),
+        recording_id: row.get(1)?,
+        content: row.get(2)?,
+        created_at: row.get(3)?,
+        updated_at: row.get(4)?,
+        word_count: row.get(5)?,
+        character_count: row.get(6)?,
+        language_detected: row.get(7)?,
+        confidence_scores: row.get(8)?,
+        segments: row.get(9)?,
+        entities: row.get(10)?,
+        topics: row.get(11)?,
+    })
 }
 
-#[derive(Debug, Clone)]
-pub struct Tag {
-    pub id: Option<i64>,
-    pub name: String,
-    pub color: String,
-    pub created_at: DateTime<Utc>,
-    pub usage_count: i64,
+/// Maps a combined row (recordings + transcripts join) to both structs.
+fn row_to_recording_and_transcript(row: &Row) -> rusqlite::Result<(Recording, Transcript)> {
+    let recording = Recording {
+        id: Some(row.get(0)?),
+        directory_name: row.get(1)?,
+        display_name: row.get(2)?,
+        created_at: row.get(3)?,
+        updated_at: row.get(4)?,
+        duration_seconds: row.get(5)?,
+        file_size_bytes: row.get(6)?,
+        audio_format: row.get(7)?,
+        sample_rate: row.get(8)?,
+        channels: row.get(9)?,
+        has_transcript: row.get(10)?,
+        transcript_status: row.get(11)?,
+        language_code: row.get(12)?,
+        model_used: row.get(13)?,
+        tags: row.get(14)?,
+        summary: row.get(15)?,
+        key_points: row.get(16)?,
+        action_items: row.get(17)?,
+        speakers: row.get(18)?,
+        sentiment_score: row.get(19)?,
+        search_index: row.get(20)?,
+        categories: row.get(21)?,
+        confidence_score: row.get(22)?,
+        audio_path: row.get(23)?,
+        transcript_path: row.get(24)?,
+    };
+
+    let transcript = Transcript {
+        id: Some(row.get(25)?),
+        recording_id: row.get(26)?,
+        content: row.get(27)?,
+        created_at: row.get(28)?,
+        updated_at: row.get(29)?,
+        word_count: row.get(30)?,
+        character_count: row.get(31)?,
+        language_detected: row.get(32)?,
+        confidence_scores: row.get(33)?,
+        segments: row.get(34)?,
+        entities: row.get(35)?,
+        topics: row.get(36)?,
+    };
+
+    Ok((recording, transcript))
 }
 
+/// Database connection wrapper with all repository operations.
 pub struct Database {
     conn: Connection,
 }
 
 impl Database {
+    /// Create a new database connection.
     pub fn new() -> Result<Self> {
         let db_path = Self::get_database_path()?;
 
-        // Ensure the directory exists
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -96,20 +144,16 @@ impl Database {
     }
 
     fn initialize(&mut self) -> Result<()> {
-        // Enable foreign key constraints (essential)
         self.conn
             .execute("PRAGMA foreign_keys = ON", [])
             .context("Failed to enable foreign key constraints")?;
 
-        // Try to enable WAL mode for better concurrency, but don't fail if not supported
         if self.conn.execute("PRAGMA journal_mode = WAL", []).is_err() {
             // Fallback to default if not supported
         }
 
-        // Busy timeout to reduce SQLITE_BUSY errors
         let _ = self.conn.execute("PRAGMA busy_timeout = 5000", []);
 
-        // Apply the full schema only once to avoid dropping/recreating virtual tables on each open
         {
             let tx = self
                 .conn
@@ -121,10 +165,9 @@ impl Database {
                 .unwrap_or(0);
 
             if user_version == 0 {
-                let schema = include_str!("../schema.sql");
+                let schema = include_str!("../../schema.sql");
                 tx.execute_batch(schema)
                     .context("Failed to initialize database schema")?;
-                // Mark as initialized
                 tx.execute("PRAGMA user_version = 1", [])
                     .context("Failed to set user_version")?;
                 tx.commit()
@@ -134,7 +177,6 @@ impl Database {
             }
         }
 
-        // Verify that FK is active on this connection
         let fk_on: i64 = self
             .conn
             .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
@@ -145,7 +187,6 @@ impl Database {
             ));
         }
 
-        // Attempt a quick integrity check; allow skipping in MCP mode to keep startup snappy
         let skip_integrity = std::env::var("SCRIBA_SKIP_INTEGRITY").is_ok()
             || std::env::var("SCRIBA_MCP_MODE").is_ok();
         if !skip_integrity {
@@ -158,9 +199,8 @@ impl Database {
                         Ok(r == "ok")
                     })
                 })
-                .unwrap_or(true); // don't block initialization if pragma not available
+                .unwrap_or(true);
             if !ok {
-                // Try to rebuild FTS as this is a common source of corruption-like errors
                 if self.rebuild_transcripts_fts().is_ok() {
                     let _ = self.conn.execute("PRAGMA optimize", []);
                 }
@@ -169,7 +209,10 @@ impl Database {
         Ok(())
     }
 
-    // Recording operations
+    // =========================================================================
+    // Recording Operations
+    // =========================================================================
+
     pub fn insert_recording(&mut self, recording: &Recording) -> Result<i64> {
         let sql = r#"
             INSERT INTO recordings (
@@ -182,7 +225,7 @@ impl Database {
             )
         "#;
 
-        let _result = self.conn.execute(
+        self.conn.execute(
             sql,
             params![
                 recording.directory_name,
@@ -205,39 +248,12 @@ impl Database {
         Ok(self.conn.last_insert_rowid())
     }
 
-    pub fn get_recording_by_directory(&self, directory_name: &str) -> Result<Option<Recording>> {
-        let sql = "SELECT * FROM recordings WHERE directory_name = ?1";
+    pub fn get_recording(&self, id: i64) -> Result<Option<Recording>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM recordings WHERE id = ?1")?;
 
-        let mut stmt = self.conn.prepare(sql)?;
-        let mut rows = stmt.query_map([directory_name], |row| {
-            Ok(Recording {
-                id: Some(row.get(0)?),
-                directory_name: row.get(1)?,
-                display_name: row.get(2)?,
-                created_at: row.get(3)?,
-                updated_at: row.get(4)?,
-                duration_seconds: row.get(5)?,
-                file_size_bytes: row.get(6)?,
-                audio_format: row.get(7)?,
-                sample_rate: row.get(8)?,
-                channels: row.get(9)?,
-                has_transcript: row.get(10)?,
-                transcript_status: row.get(11)?,
-                language_code: row.get(12)?,
-                model_used: row.get(13)?,
-                tags: row.get(14)?,
-                summary: row.get(15)?,
-                key_points: row.get(16)?,
-                action_items: row.get(17)?,
-                speakers: row.get(18)?,
-                sentiment_score: row.get(19)?,
-                search_index: row.get(20)?,
-                categories: row.get(21)?,
-                confidence_score: row.get(22)?,
-                audio_path: row.get(23)?,
-                transcript_path: row.get(24)?,
-            })
-        })?;
+        let mut rows = stmt.query_map([id], row_to_recording)?;
 
         match rows.next() {
             Some(row) => Ok(Some(row?)),
@@ -245,45 +261,17 @@ impl Database {
         }
     }
 
-    pub fn get_recording(&self, id: i64) -> Result<Option<Recording>> {
+    pub fn get_recording_by_directory(&self, directory_name: &str) -> Result<Option<Recording>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT * FROM recordings WHERE id = ?1")?;
+            .prepare("SELECT * FROM recordings WHERE directory_name = ?1")?;
 
-        let recording_iter = stmt.query_map([id], |row| {
-            Ok(Recording {
-                id: Some(row.get(0)?),
-                directory_name: row.get(1)?,
-                display_name: row.get(2)?,
-                created_at: row.get(3)?,
-                updated_at: row.get(4)?,
-                duration_seconds: row.get(5)?,
-                file_size_bytes: row.get(6)?,
-                audio_format: row.get(7)?,
-                sample_rate: row.get(8)?,
-                channels: row.get(9)?,
-                has_transcript: row.get(10)?,
-                transcript_status: row.get(11)?,
-                language_code: row.get(12)?,
-                model_used: row.get(13)?,
-                tags: row.get(14)?,
-                summary: row.get(15)?,
-                key_points: row.get(16)?,
-                action_items: row.get(17)?,
-                speakers: row.get(18)?,
-                sentiment_score: row.get(19)?,
-                search_index: row.get(20)?,
-                categories: row.get(21)?,
-                confidence_score: row.get(22)?,
-                audio_path: row.get(23)?,
-                transcript_path: row.get(24)?,
-            })
-        })?;
+        let mut rows = stmt.query_map([directory_name], row_to_recording)?;
 
-        for recording in recording_iter {
-            return Ok(Some(recording?));
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
         }
-        Ok(None)
     }
 
     pub fn list_recordings(
@@ -304,35 +292,7 @@ impl Database {
         };
 
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |row| {
-            Ok(Recording {
-                id: Some(row.get(0)?),
-                directory_name: row.get(1)?,
-                display_name: row.get(2)?,
-                created_at: row.get(3)?,
-                updated_at: row.get(4)?,
-                duration_seconds: row.get(5)?,
-                file_size_bytes: row.get(6)?,
-                audio_format: row.get(7)?,
-                sample_rate: row.get(8)?,
-                channels: row.get(9)?,
-                has_transcript: row.get(10)?,
-                transcript_status: row.get(11)?,
-                language_code: row.get(12)?,
-                model_used: row.get(13)?,
-                tags: row.get(14)?,
-                summary: row.get(15)?,
-                key_points: row.get(16)?,
-                action_items: row.get(17)?,
-                speakers: row.get(18)?,
-                sentiment_score: row.get(19)?,
-                search_index: row.get(20)?,
-                categories: row.get(21)?,
-                confidence_score: row.get(22)?,
-                audio_path: row.get(23)?,
-                transcript_path: row.get(24)?,
-            })
-        })?;
+        let rows = stmt.query_map([], row_to_recording)?;
 
         let mut recordings = Vec::new();
         for row in rows {
@@ -379,17 +339,12 @@ impl Database {
         }
 
         match self.try_parent_delete_with_cascade(id) {
-            Ok(()) => return Ok(()),
+            Ok(()) => Ok(()),
             Err(e) => {
-                if let Err(_rebuild_err) = self.rebuild_transcripts_fts() {
+                if self.rebuild_transcripts_fts().is_err() {
                     return Err(e);
                 }
-                match self.try_parent_delete_with_cascade(id) {
-                    Ok(()) => return Ok(()),
-                    Err(e2) => {
-                        return Err(e2);
-                    }
-                }
+                self.try_parent_delete_with_cascade(id)
             }
         }
     }
@@ -402,8 +357,7 @@ impl Database {
 
         tx.execute("PRAGMA foreign_keys = ON", [])?;
 
-        let _rows_affected = tx
-            .execute("DELETE FROM recordings WHERE id = ?1", params![id])
+        tx.execute("DELETE FROM recordings WHERE id = ?1", params![id])
             .context("Failed to delete recording")?;
 
         {
@@ -469,20 +423,22 @@ impl Database {
         )
         .context("Failed to recreate transcripts_fts and triggers")?;
 
-        let _inserted = tx
-            .execute(
-                "INSERT INTO transcripts_fts(rowid, content, recording_id)
-                 SELECT id, content, recording_id FROM transcripts",
-                [],
-            )
-            .context("Failed to repopulate transcripts_fts from transcripts")?;
+        tx.execute(
+            "INSERT INTO transcripts_fts(rowid, content, recording_id)
+             SELECT id, content, recording_id FROM transcripts",
+            [],
+        )
+        .context("Failed to repopulate transcripts_fts from transcripts")?;
 
         tx.commit()
             .context("Failed to commit rebuild transaction")?;
         Ok(())
     }
 
-    // Transcript operations
+    // =========================================================================
+    // Transcript Operations
+    // =========================================================================
+
     pub fn insert_transcript(&mut self, transcript: &Transcript) -> Result<i64> {
         let sql = r#"
             INSERT INTO transcripts (
@@ -512,7 +468,7 @@ impl Database {
 
     pub fn update_transcript(&mut self, recording_id: i64, new_content: &str) -> Result<()> {
         let sql = r#"
-            UPDATE transcripts 
+            UPDATE transcripts
             SET content = ?1, updated_at = ?2, word_count = ?3, character_count = ?4
             WHERE recording_id = ?5
         "#;
@@ -535,20 +491,17 @@ impl Database {
     }
 
     pub fn upsert_transcript(&mut self, recording_id: i64, content: &str) -> Result<()> {
-        // Check if transcript already exists
         if self.get_transcript_by_recording_id(recording_id)?.is_some() {
-            // Update existing transcript
             self.update_transcript(recording_id, content)
         } else {
-            // Create new transcript
             let transcript = Transcript {
                 id: None,
                 recording_id,
                 content: content.to_string(),
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
-                word_count: None,      // Will be calculated by the insert method
-                character_count: None, // Will be calculated by the insert method
+                word_count: None,
+                character_count: None,
                 language_detected: None,
                 confidence_scores: None,
                 segments: None,
@@ -564,22 +517,7 @@ impl Database {
         let sql = "SELECT * FROM transcripts WHERE recording_id = ?1";
 
         let mut stmt = self.conn.prepare(sql)?;
-        let mut rows = stmt.query_map([recording_id], |row| {
-            Ok(Transcript {
-                id: Some(row.get(0)?),
-                recording_id: row.get(1)?,
-                content: row.get(2)?,
-                created_at: row.get(3)?,
-                updated_at: row.get(4)?,
-                word_count: row.get(5)?,
-                character_count: row.get(6)?,
-                language_detected: row.get(7)?,
-                confidence_scores: row.get(8)?,
-                segments: row.get(9)?,
-                entities: row.get(10)?,
-                topics: row.get(11)?,
-            })
-        })?;
+        let mut rows = stmt.query_map([recording_id], row_to_transcript)?;
 
         match rows.next() {
             Some(row) => Ok(Some(row?)),
@@ -587,7 +525,10 @@ impl Database {
         }
     }
 
-    // Search operations (for future AI features)
+    // =========================================================================
+    // Search Operations
+    // =========================================================================
+
     pub fn search_transcripts(
         &self,
         query: &str,
@@ -616,52 +557,7 @@ impl Database {
         };
 
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map([query], |row| {
-            let recording = Recording {
-                id: Some(row.get(0)?),
-                directory_name: row.get(1)?,
-                display_name: row.get(2)?,
-                created_at: row.get(3)?,
-                updated_at: row.get(4)?,
-                duration_seconds: row.get(5)?,
-                file_size_bytes: row.get(6)?,
-                audio_format: row.get(7)?,
-                sample_rate: row.get(8)?,
-                channels: row.get(9)?,
-                has_transcript: row.get(10)?,
-                transcript_status: row.get(11)?,
-                language_code: row.get(12)?,
-                model_used: row.get(13)?,
-                tags: row.get(14)?,
-                summary: row.get(15)?,
-                key_points: row.get(16)?,
-                action_items: row.get(17)?,
-                speakers: row.get(18)?,
-                sentiment_score: row.get(19)?,
-                search_index: row.get(20)?,
-                categories: row.get(21)?,
-                confidence_score: row.get(22)?,
-                audio_path: row.get(23)?,
-                transcript_path: row.get(24)?,
-            };
-
-            let transcript = Transcript {
-                id: Some(row.get(25)?),
-                recording_id: row.get(26)?,
-                content: row.get(27)?,
-                created_at: row.get(28)?,
-                updated_at: row.get(29)?,
-                word_count: row.get(30)?,
-                character_count: row.get(31)?,
-                language_detected: row.get(32)?,
-                confidence_scores: row.get(33)?,
-                segments: row.get(34)?,
-                entities: row.get(35)?,
-                topics: row.get(36)?,
-            };
-
-            Ok((recording, transcript))
-        })?;
+        let rows = stmt.query_map([query], row_to_recording_and_transcript)?;
 
         let mut results = Vec::new();
         for row in rows {
@@ -670,10 +566,13 @@ impl Database {
         Ok(results)
     }
 
-    // Statistics for future dashboard
+    // =========================================================================
+    // Statistics
+    // =========================================================================
+
     pub fn get_stats(&self) -> Result<RecordingStats> {
         let sql = r#"
-            SELECT 
+            SELECT
                 COUNT(*) as total_recordings,
                 SUM(duration_seconds) as total_duration,
                 SUM(file_size_bytes) as total_size,
@@ -697,7 +596,10 @@ impl Database {
         Ok(row)
     }
 
-    // Database maintenance and diagnostics
+    // =========================================================================
+    // Maintenance
+    // =========================================================================
+
     pub fn check_integrity(&self) -> Result<bool> {
         let mut stmt = self.conn.prepare("PRAGMA integrity_check")?;
         let result = stmt.query_row([], |row| {
@@ -712,7 +614,6 @@ impl Database {
         Ok(())
     }
 
-    // Reset the database completely - useful for corruption recovery
     pub fn reset_database() -> Result<()> {
         let db_path = Self::get_database_path()?;
 
@@ -732,46 +633,5 @@ impl Database {
         }
 
         Ok(())
-    }
-}
-
-#[derive(Debug)]
-pub struct RecordingStats {
-    pub total_recordings: i64,
-    pub total_duration_seconds: i64,
-    pub total_size_bytes: i64,
-    pub transcribed_count: i64,
-    pub total_words: i64,
-}
-
-impl RecordingStats {
-    pub fn format_duration(&self) -> String {
-        let hours = self.total_duration_seconds / 3600;
-        let minutes = (self.total_duration_seconds % 3600) / 60;
-        let seconds = self.total_duration_seconds % 60;
-
-        if hours > 0 {
-            format!("{}h {}m {}s", hours, minutes, seconds)
-        } else if minutes > 0 {
-            format!("{}m {}s", minutes, seconds)
-        } else {
-            format!("{}s", seconds)
-        }
-    }
-
-    pub fn format_size(&self) -> String {
-        const KB: i64 = 1024;
-        const MB: i64 = KB * 1024;
-        const GB: i64 = MB * 1024;
-
-        if self.total_size_bytes >= GB {
-            format!("{:.1} GB", self.total_size_bytes as f64 / GB as f64)
-        } else if self.total_size_bytes >= MB {
-            format!("{:.1} MB", self.total_size_bytes as f64 / MB as f64)
-        } else if self.total_size_bytes >= KB {
-            format!("{:.1} KB", self.total_size_bytes as f64 / KB as f64)
-        } else {
-            format!("{} bytes", self.total_size_bytes)
-        }
     }
 }

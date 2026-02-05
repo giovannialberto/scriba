@@ -1,9 +1,10 @@
 use anyhow::Result;
-use scriba::audio::{AudioFormat, CompressionSettings};
-use scriba::config::{LocalModelSize, ScribaConfig, TranscriptionMode};
-use scriba::core::WorkflowManager;
-use scriba::dashboard::Dashboard;
+use scriba::core::{
+    resolve_transcription_mode, AudioFormat, CompressionSettings, LocalModelSize, ScribaConfig,
+    TranscriptionMode, WorkflowManager,
+};
 use scriba::mcp::run_mcp_server;
+use scriba::tui::Dashboard;
 use std::path::PathBuf;
 use structopt::StructOpt;
 
@@ -13,11 +14,11 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 fn print_ascii_art() {
     println!(
         r#"
- ███████  ██████ ██████  ██ ██████   █████  
-██      ██      ██   ██ ██ ██   ██ ██   ██ 
-███████ ██      ██████  ██ ██████  ███████ 
-     ██ ██      ██   ██ ██ ██   ██ ██   ██ 
-███████  ██████ ██   ██ ██ ██████  ██   ██ 
+ ███████  ██████ ██████  ██ ██████   █████
+██      ██      ██   ██ ██ ██   ██ ██   ██
+███████ ██      ██████  ██ ██████  ███████
+     ██ ██      ██   ██ ██ ██   ██ ██   ██
+███████  ██████ ██   ██ ██ ██████  ██   ██
                                     v{VERSION}
 "#
     );
@@ -134,31 +135,6 @@ enum ConfigCommand {
 struct Cli {
     #[structopt(subcommand)]
     command: Option<Command>,
-}
-
-/// Resolve transcription mode from CLI flags and config
-/// Priority: force_local > api_key > model > config default
-fn resolve_transcription_mode(
-    force_local: bool,
-    model: Option<LocalModelSize>,
-    api_key: Option<String>,
-    config: &ScribaConfig,
-) -> Result<TranscriptionMode> {
-    if force_local {
-        let model_size = model.unwrap_or(LocalModelSize::Medium);
-        return Ok(TranscriptionMode::Local { model_size });
-    }
-
-    if let Some(key) = api_key {
-        return Ok(TranscriptionMode::Api { api_key: key });
-    }
-
-    if let Some(model_size) = model {
-        return Ok(TranscriptionMode::Local { model_size });
-    }
-
-    // Use config default
-    Ok(config.transcription.clone())
 }
 
 #[tokio::main]

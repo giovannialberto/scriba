@@ -1,6 +1,7 @@
-use crate::audio::CompressionSettings;
-use crate::config::{LocalModelSize, ScribaConfig, TranscriptionMode};
-use crate::core::WorkflowManager;
+use crate::core::{
+    CompressionSettings, LocalModelSize, RecordOptions, ScribaConfig, TranscriptionMode,
+    WorkflowManager, record_audio,
+};
 use crate::database::{Database, Recording, RecordingStats};
 use crate::utils::generate_recording_name;
 use anyhow::Result;
@@ -20,10 +21,10 @@ use ratatui::{
 use std::io;
 use tokio::sync::mpsc;
 
-const ASCII_ART: &str = r#" ███████  ██████ ██████  ██ ██████   █████  
-██      ██      ██   ██ ██ ██   ██ ██   ██ 
-███████ ██      ██████  ██ ██████  ███████ 
-     ██ ██      ██   ██ ██ ██   ██ ██   ██ 
+const ASCII_ART: &str = r#" ███████  ██████ ██████  ██ ██████   █████
+██      ██      ██   ██ ██ ██   ██ ██   ██
+███████ ██      ██████  ██ ██████  ███████
+     ██ ██      ██   ██ ██ ██   ██ ██   ██
 ███████  ██████ ██   ██ ██ ██████  ██   ██"#;
 use anyhow::Context;
 use dirs::home_dir;
@@ -202,10 +203,10 @@ impl Dashboard {
                                 // Start transcription phase (local, no API key)
                                 // Update progress message for transcription phase
                                 let model_info = match &self.config.transcription {
-                                    crate::config::TranscriptionMode::Local { model_size } => {
+                                    TranscriptionMode::Local { model_size } => {
                                         format!("Local ({})", model_size)
                                     }
-                                    crate::config::TranscriptionMode::Api { .. } => {
+                                    TranscriptionMode::Api { .. } => {
                                         "OpenAI API".to_string()
                                     }
                                 };
@@ -1017,10 +1018,10 @@ impl Dashboard {
                     self.show_message = true;
 
                     let model_info = match &self.config.transcription {
-                        crate::config::TranscriptionMode::Local { model_size } => {
+                        TranscriptionMode::Local { model_size } => {
                             format!("Local ({})", model_size)
                         }
-                        crate::config::TranscriptionMode::Api { .. } => "OpenAI API".to_string(),
+                        TranscriptionMode::Api { .. } => "OpenAI API".to_string(),
                     };
                     self.progress_animation = Some(format!(
                         "🔄 Re-transcribing with {}: {}",
@@ -2322,10 +2323,10 @@ impl Dashboard {
 
         // Show immediate progress animation
         let model_info = match &self.config.transcription {
-            crate::config::TranscriptionMode::Local { model_size } => {
+            TranscriptionMode::Local { model_size } => {
                 format!("Local ({})", model_size)
             }
-            crate::config::TranscriptionMode::Api { .. } => "OpenAI API".to_string(),
+            TranscriptionMode::Api { .. } => "OpenAI API".to_string(),
         };
         let action = if has_transcript {
             "Re-transcribing"
@@ -2626,7 +2627,7 @@ impl Dashboard {
         );
 
         // Use unified recording function with TUI control channels
-        use crate::record::{record_audio, RecordOptions};
+        // record_audio and RecordOptions are already imported from crate::core
         let output_path = PathBuf::from(&recording_name);
 
         self.recording_task = Some(tokio::spawn(async move {
