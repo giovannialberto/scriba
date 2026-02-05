@@ -1,3 +1,37 @@
+Scriba 0.13.0 — Modular Architecture Refactoring
+
+Highlights
+
+- **Modular Codebase**: Complete reorganization into `core/`, `database/`, `tui/`, and `mcp/` modules with clear separation of concerns.
+- **DRY Database Layer**: Eliminated duplicate row-mapping code with shared helper functions in `database/repository.rs`.
+- **Unified File Operations**: Single `FileManager` in `core/files.rs` provides consistent file handling across all features.
+- **Clean Module Boundaries**: Core business logic has no UI dependencies; TUI depends on Core, not vice versa.
+- **Backward Compatible**: Public API exports maintained in `lib.rs` for existing integrations.
+
+Changelog
+
+- refactor(core): extract audio, config, recording, transcription, files, types, and workflow modules
+- refactor(database): split into models.rs and repository.rs with DRY row mappers
+- refactor(tui): move dashboard to dedicated tui/ module
+- refactor(mcp): move MCP server to mcp/ module
+- docs: update AGENTS.md with new module structure
+
+New Module Structure
+```
+src/
+├── core/           # Business logic (no UI deps)
+│   ├── audio.rs, config.rs, files.rs, recording.rs
+│   ├── transcription.rs, types.rs, workflow.rs
+├── database/       # Data persistence
+│   ├── models.rs, repository.rs
+├── tui/            # Terminal UI
+│   └── app.rs
+├── mcp/            # MCP server
+└── lib.rs, main.rs, errors.rs, utils.rs
+```
+
+---
+
 Scriba 0.12.1 — Real-Time MCP Data Access
 
 Highlights
