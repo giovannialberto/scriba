@@ -17,7 +17,7 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
@@ -36,7 +36,7 @@ use tokio::process::Command as TokioCommand;
 
 use super::chat::{
     ChatContext, ChatFocus, ChatMessage, ChatRole, ChatState, ChatStreamEvent,
-    chat_agent_pipeline,
+    chat_agent_pipeline, ACCENT,
 };
 
 pub struct Dashboard {
@@ -54,7 +54,6 @@ pub struct Dashboard {
     message: String,
     show_transcript: bool,
     transcript_content: String,
-    transcript_scroll_offset: usize,
     show_delete_confirm: bool,
     delete_candidate: Option<Recording>,
     current_playback_pid: Option<u32>,
@@ -65,7 +64,6 @@ pub struct Dashboard {
     active_transcription: Option<ActiveTranscription>, // Currently running transcription
     transcription_queue: VecDeque<PendingTranscription>, // FIFO queue of pending transcriptions
     notification_message: Option<(String, usize)>, // (message, frames_remaining) — auto-dismiss
-    header_anim_frame: usize, // Main header owl animation counter
     recording_task: Option<tokio::task::JoinHandle<Result<RecordingResult, anyhow::Error>>>,
     recording_mode: Option<RecordingMode>, // Track if we should transcribe after recording
     recording_stop_tx: Option<mpsc::Sender<()>>, // Channel to stop recording
@@ -132,11 +130,17 @@ pub struct Dashboard {
     global_chat_messages: Vec<ChatMessage>,
     // Track the currently-viewed recording for chat context
     current_transcript_recording: Option<Recording>,
+
+    // Home screen greeting
+    greeting_text: String,
+    greeting_subtitle: String,
+    owner_name: String,
 }
 
 #[derive(Debug, PartialEq)]
 enum DashboardView {
     Main,
+    Browse,
     Help,
     Settings,
     Entities,
@@ -413,7 +417,6 @@ impl Dashboard {
             message: String::new(),
             show_transcript: false,
             transcript_content: String::new(),
-            transcript_scroll_offset: 0,
             show_delete_confirm: false,
             delete_candidate: None,
             current_playback_pid: None,
@@ -424,7 +427,6 @@ impl Dashboard {
             active_transcription: None,
             transcription_queue: VecDeque::new(),
             notification_message: None,
-            header_anim_frame: 0,
             recording_task: None,
             recording_mode: None,
             recording_stop_tx: None,
@@ -490,6 +492,11 @@ impl Dashboard {
             chat: ChatState::new(),
             global_chat_messages: Vec::new(),
             current_transcript_recording: None,
+
+            // Greeting
+            greeting_text: String::new(),
+            greeting_subtitle: String::new(),
+            owner_name: String::new(),
         })
     }
 
@@ -895,9 +902,6 @@ impl Dashboard {
             if anim_tick {
                 self.chat.spinner_frame = self.chat.spinner_frame.wrapping_add(1);
 
-                if self.current_view == DashboardView::Main {
-                    self.header_anim_frame = self.header_anim_frame.wrapping_add(1);
-                }
 
                 if self.current_view == DashboardView::Entities {
                     self.owl_world_anim_frame = self.owl_world_anim_frame.wrapping_add(1);
@@ -921,7 +925,13 @@ impl Dashboard {
                 match event::read()? {
                     Event::Key(key) => {
                         if key.kind == KeyEventKind::Press {
-                            match self.handle_key_event(key.code).await {
+                            // Ctrl+C quits from anywhere
+                            if key.code == KeyCode::Char('c')
+                                && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                            {
+                                break 'main;
+                            }
+                            match self.handle_key_event(key.code, key.modifiers).await {
                                 Ok(DashboardAction::Continue) => {}
                                 Ok(DashboardAction::Quit) => break 'main,
                                 Ok(action) => {
@@ -944,7 +954,7 @@ impl Dashboard {
         Ok(())
     }
 
-    async fn handle_key_event(&mut self, key_code: KeyCode) -> Result<DashboardAction> {
+    async fn handle_key_event(&mut self, key_code: KeyCode, modifiers: crossterm::event::KeyModifiers) -> Result<DashboardAction> {
         // If audio is playing and ESC is pressed, stop it immediately
         if matches!(key_code, KeyCode::Esc) {
             // Check if we're in audio playback mode (either with PID or with playback message)
@@ -1039,6 +1049,43 @@ impl Dashboard {
         }
 
         if self.show_transcript {
+            // Ctrl+Y: copy full transcript (works regardless of focus)
+            if key_code == KeyCode::Char('y')
+                && modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+            {
+                match self.copy_transcript_to_clipboard() {
+                    Ok(()) => {
+                        self.notification_message = Some(("Transcript copied to clipboard".to_string(), 40));
+                    }
+                    Err(e) => {
+                        self.notification_message = Some((format!("Copy failed: {}", e), 40));
+                    }
+                }
+                return Ok(DashboardAction::Continue);
+            }
+
+            // Ctrl+T: re-transcribe (works regardless of focus)
+            if key_code == KeyCode::Char('t')
+                && modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+            {
+                if let Some(recording) = self.get_current_recording() {
+                    if self.has_active_transcription() {
+                        self.message = "Transcription already in progress".to_string();
+                        self.show_message = true;
+                    } else {
+                        self.show_transcript = false;
+                        self.transcript_content.clear();
+                        let transcription_mode = self.config.transcription.clone();
+                        let directory_name = recording.directory_name.clone();
+                        self.enqueue_transcription(PendingTranscription::Retranscribe {
+                            recording_name: directory_name,
+                            transcription_mode,
+                        });
+                    }
+                }
+                return Ok(DashboardAction::Continue);
+            }
+
             // Chat keys in transcript view take priority when chat is focused
             if self.handle_transcript_chat_key(key_code) {
                 return Ok(DashboardAction::Continue);
@@ -1050,41 +1097,63 @@ impl Dashboard {
             return self.handle_delete_confirmation(key_code).await;
         }
 
-        // Chat key handling (Tab focus toggle, chat input when focused)
+        // Browse view keys
+        if self.current_view == DashboardView::Browse {
+            return self.handle_browse_keys(key_code).await;
+        }
+
+        // Chat key handling (Tab → Browse, chat input when focused)
+        // Global Ctrl+ shortcuts (work from any Main view state)
+        let ctrl = modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
+        if ctrl {
+            match key_code {
+                KeyCode::Char('s') => {
+                    self.current_view = DashboardView::Settings;
+                    self.settings_selection = 0;
+                    return Ok(DashboardAction::Continue);
+                }
+                KeyCode::Char('w') => {
+                    self.load_entities()?;
+                    self.current_view = DashboardView::Entities;
+                    self.entity_table_state.select(Some(0));
+                    self.owl_world_anim_frame = 0;
+                    self.owl_world_mood = OwlWorldMood::Idle;
+                    self.set_owl_quip_for_browse();
+                    return Ok(DashboardAction::Continue);
+                }
+                KeyCode::Char('r') => {
+                    return Ok(DashboardAction::RecordAndTranscribe);
+                }
+                _ => {}
+            }
+        }
+
+        // F1 / ? for help (? only when input is empty to avoid conflicts)
+        if matches!(key_code, KeyCode::F(1))
+            || (key_code == KeyCode::Char('?') && self.chat.input_buffer.is_empty())
+        {
+            self.show_help = true;
+            self.current_view = DashboardView::Help;
+            return Ok(DashboardAction::Continue);
+        }
+
         if self.handle_chat_key(key_code) {
             return Ok(DashboardAction::Continue);
         }
 
+        Ok(DashboardAction::Continue)
+    }
+
+    async fn handle_browse_keys(&mut self, key_code: KeyCode) -> Result<DashboardAction> {
         match key_code {
-            KeyCode::Char('q') | KeyCode::Esc => return Ok(DashboardAction::Quit),
-            KeyCode::Char('h') | KeyCode::Char('H') | KeyCode::F(1) => {
-                self.show_help = true;
-                self.current_view = DashboardView::Help;
-            }
-            KeyCode::Char('s') | KeyCode::Char('S') => {
-                self.current_view = DashboardView::Settings;
-                self.settings_selection = 0;
-            }
-            KeyCode::Char('w') | KeyCode::Char('W') => {
-                self.load_entities()?;
-                self.current_view = DashboardView::Entities;
-                self.entity_table_state.select(Some(0));
-                self.owl_world_anim_frame = 0;
-                self.owl_world_mood = OwlWorldMood::Idle;
-                self.set_owl_quip_for_browse();
-            }
-            KeyCode::Char('r') | KeyCode::Char('R') => {
-                return Ok(DashboardAction::RecordAndTranscribe);
-            }
-            KeyCode::Char('a') | KeyCode::Char('A') => {
-                return Ok(DashboardAction::AddExternalFile);
-            }
-            KeyCode::Char('t') | KeyCode::Char('T') => {
-                return Ok(DashboardAction::TranscribeSelected);
-            }
-            KeyCode::Char('/') => {
-                self.search_mode = true;
-                self.search_query.clear();
+            KeyCode::Tab | KeyCode::Esc => {
+                self.current_view = DashboardView::Main;
+                self.chat.focus = ChatFocus::ChatInput;
+                self.chat.borderless = true;
+                if self.chat.messages.is_empty() {
+                    self.chat.show_home_screen = true;
+                    self.chat.show_suggestions = true;
+                }
             }
             KeyCode::Up => {
                 self.previous_recording();
@@ -1105,11 +1174,11 @@ impl Dashboard {
                     self.show_message = true;
                 }
             },
-            KeyCode::Char('d') => {
-                self.show_delete_confirmation();
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                return Ok(DashboardAction::RecordAndTranscribe);
             }
-            KeyCode::Delete => {
-                self.show_delete_confirmation();
+            KeyCode::Char('t') | KeyCode::Char('T') => {
+                return Ok(DashboardAction::TranscribeSelected);
             }
             KeyCode::Char('p') | KeyCode::Char('P') => match self.play_selected_recording().await {
                 Ok(()) => {}
@@ -1118,9 +1187,15 @@ impl Dashboard {
                     self.show_message = true;
                 }
             },
+            KeyCode::Char('d') | KeyCode::Delete => {
+                self.show_delete_confirmation();
+            }
+            KeyCode::Char('/') => {
+                self.search_mode = true;
+                self.search_query.clear();
+            }
             _ => {}
         }
-
         Ok(DashboardAction::Continue)
     }
 
@@ -1224,6 +1299,11 @@ impl Dashboard {
             self.table_state.select(Some(0));
         } else {
             self.table_state.select(None);
+        }
+
+        // Refresh greeting with updated recording data
+        if !self.owner_name.is_empty() {
+            self.generate_greeting();
         }
 
         Ok(())
@@ -2044,147 +2124,14 @@ impl Dashboard {
 
     async fn handle_transcript_keys(&mut self, key_code: KeyCode) -> Result<DashboardAction> {
         match key_code {
-            KeyCode::Up => {
-                // Scroll up (decrease offset)
-                if self.transcript_scroll_offset > 0 {
-                    self.transcript_scroll_offset = self.transcript_scroll_offset.saturating_sub(1);
-                }
-                Ok(DashboardAction::Continue)
-            }
-            KeyCode::Down => {
-                // Scroll down (increase offset)
-                let content_width = 120; // Conservative estimate for terminal width
-                let content_height = 25; // Conservative estimate for terminal height
-                let wrapped_lines =
-                    self.wrap_text_to_lines(&self.transcript_content, content_width);
-                let max_scroll = wrapped_lines.len().saturating_sub(content_height);
-                if self.transcript_scroll_offset < max_scroll {
-                    self.transcript_scroll_offset += 1;
-                }
-                Ok(DashboardAction::Continue)
-            }
-            KeyCode::Char('c') | KeyCode::Char('C') => {
-                // Copy transcript to clipboard
-                match self.copy_transcript_to_clipboard() {
-                    Ok(()) => {
-                        self.message = "Transcript copied to clipboard.".to_string();
-                        self.show_message = true;
-                    }
-                    Err(e) => {
-                        self.message = format!("Failed to copy to clipboard: {}", e);
-                        self.show_message = true;
-                    }
-                }
-                Ok(DashboardAction::Continue)
-            }
-            KeyCode::PageUp => {
-                // Page up (scroll up by larger amount)
-                self.transcript_scroll_offset = self.transcript_scroll_offset.saturating_sub(10);
-                Ok(DashboardAction::Continue)
-            }
-            KeyCode::PageDown => {
-                // Page down (scroll down by larger amount)
-                let content_width = 120; // Conservative estimate for terminal width
-                let content_height = 25; // Conservative estimate for terminal height
-                let wrapped_lines =
-                    self.wrap_text_to_lines(&self.transcript_content, content_width);
-                let max_offset = wrapped_lines.len().saturating_sub(content_height);
-                self.transcript_scroll_offset =
-                    std::cmp::min(self.transcript_scroll_offset + 10, max_offset);
-                Ok(DashboardAction::Continue)
-            }
-            KeyCode::Home => {
-                // Jump to top of transcript
-                self.transcript_scroll_offset = 0;
-                Ok(DashboardAction::Continue)
-            }
-            KeyCode::End => {
-                // Jump to bottom of transcript
-                let content_width = 120; // Conservative estimate for terminal width
-                let content_height = 25; // Conservative estimate for terminal height
-                let wrapped_lines =
-                    self.wrap_text_to_lines(&self.transcript_content, content_width);
-                if wrapped_lines.len() > content_height {
-                    self.transcript_scroll_offset =
-                        wrapped_lines.len().saturating_sub(content_height);
-                } else {
-                    self.transcript_scroll_offset = 0;
-                }
-                Ok(DashboardAction::Continue)
-            }
-            KeyCode::Char('g') => {
-                // Jump to top of transcript (vim-style, alternative to Home)
-                self.transcript_scroll_offset = 0;
-                Ok(DashboardAction::Continue)
-            }
-            KeyCode::Char('G') => {
-                // Jump to bottom of transcript (vim-style, alternative to End)
-                let content_width = 120; // Conservative estimate for terminal width
-                let content_height = 25; // Conservative estimate for terminal height
-                let wrapped_lines =
-                    self.wrap_text_to_lines(&self.transcript_content, content_width);
-                if wrapped_lines.len() > content_height {
-                    self.transcript_scroll_offset =
-                        wrapped_lines.len().saturating_sub(content_height);
-                } else {
-                    self.transcript_scroll_offset = 0;
-                }
-                Ok(DashboardAction::Continue)
-            }
-            KeyCode::Char('b') => {
-                // Page up (vim-style, alternative to PageUp)
-                self.transcript_scroll_offset = self.transcript_scroll_offset.saturating_sub(10);
-                Ok(DashboardAction::Continue)
-            }
-            KeyCode::Char('f') => {
-                // Page down (vim-style, alternative to PageDown)
-                let content_width = 120; // Conservative estimate for terminal width
-                let content_height = 25; // Conservative estimate for terminal height
-                let wrapped_lines =
-                    self.wrap_text_to_lines(&self.transcript_content, content_width);
-                let max_offset = wrapped_lines.len().saturating_sub(content_height);
-                self.transcript_scroll_offset =
-                    std::cmp::min(self.transcript_scroll_offset + 10, max_offset);
-                Ok(DashboardAction::Continue)
-            }
-            KeyCode::Char('t') | KeyCode::Char('T') => {
-                // Re-transcribe the current recording
-                if let Some(recording) = self.get_current_recording() {
-                    if self.has_active_transcription() {
-                        self.message = "Transcription already in progress".to_string();
-                        self.show_message = true;
-                        return Ok(DashboardAction::Continue);
-                    }
-
-                    // Close transcript view
-                    self.show_transcript = false;
-                    self.transcript_content.clear();
-                    self.transcript_scroll_offset = 0;
-
-                    // Enqueue re-transcription
-                    let transcription_mode = self.config.transcription.clone();
-                    let directory_name = recording.directory_name.clone();
-
-                    self.enqueue_transcription(PendingTranscription::Retranscribe {
-                        recording_name: directory_name,
-                        transcription_mode,
-                    });
-                }
-                Ok(DashboardAction::Continue)
-            }
             KeyCode::Esc => {
-                // Only Esc key closes the transcript (consistent behavior)
                 self.show_transcript = false;
                 self.transcript_content.clear();
-                self.transcript_scroll_offset = 0;
                 self.clear_enrichment_data();
                 self.restore_global_chat();
                 Ok(DashboardAction::Continue)
             }
-            _ => {
-                // Other keys are ignored (consistent behavior)
-                Ok(DashboardAction::Continue)
-            }
+            _ => Ok(DashboardAction::Continue),
         }
     }
 
@@ -2828,91 +2775,6 @@ impl Dashboard {
         Err(anyhow::anyhow!("No transcript file found (expected transcript.txt)"))
     }
 
-    fn wrap_text_to_lines(&self, text: &str, max_width: usize) -> Vec<String> {
-        let mut result = Vec::new();
-
-        for line in text.lines() {
-            if line.len() <= max_width {
-                result.push(line.to_string());
-            } else {
-                // Split long lines into multiple wrapped lines
-                let words: Vec<&str> = line.split_whitespace().collect();
-                let mut current_line = String::new();
-
-                for word in words {
-                    if word.len() > max_width {
-                        // Handle extremely long words by character breaking
-                        if !current_line.is_empty() {
-                            result.push(current_line);
-                            current_line = String::new();
-                        }
-
-                        let chars: Vec<char> = word.chars().collect();
-                        for chunk in chars.chunks(max_width) {
-                            result.push(chunk.iter().collect());
-                        }
-                    } else {
-                        let test_line = if current_line.is_empty() {
-                            word.to_string()
-                        } else {
-                            format!("{} {}", current_line, word)
-                        };
-
-                        if test_line.len() <= max_width {
-                            current_line = test_line;
-                        } else {
-                            result.push(current_line);
-                            current_line = word.to_string();
-                        }
-                    }
-                }
-
-                if !current_line.is_empty() {
-                    result.push(current_line);
-                }
-            }
-        }
-
-        // Handle edge case where text has no newlines at all
-        if result.is_empty() && !text.is_empty() {
-            let words: Vec<&str> = text.split_whitespace().collect();
-            let mut current_line = String::new();
-
-            for word in words {
-                if word.len() > max_width {
-                    if !current_line.is_empty() {
-                        result.push(current_line);
-                        current_line = String::new();
-                    }
-
-                    let chars: Vec<char> = word.chars().collect();
-                    for chunk in chars.chunks(max_width) {
-                        result.push(chunk.iter().collect());
-                    }
-                } else {
-                    let test_line = if current_line.is_empty() {
-                        word.to_string()
-                    } else {
-                        format!("{} {}", current_line, word)
-                    };
-
-                    if test_line.len() <= max_width {
-                        current_line = test_line;
-                    } else {
-                        result.push(current_line);
-                        current_line = word.to_string();
-                    }
-                }
-            }
-
-            if !current_line.is_empty() {
-                result.push(current_line);
-            }
-        }
-
-        result
-    }
-
     fn copy_transcript_to_clipboard(&self) -> Result<()> {
         use arboard::Clipboard;
 
@@ -2928,6 +2790,7 @@ impl Dashboard {
     fn ui(&mut self, f: &mut Frame) {
         match self.current_view {
             DashboardView::Main => self.render_main_dashboard(f),
+            DashboardView::Browse => self.render_browse_view(f),
             DashboardView::Help => self.render_help(f, f.size()),
             DashboardView::Settings => self.render_settings(f, f.size()),
             DashboardView::Entities => self.render_entities_view(f, f.size()),
@@ -2958,417 +2821,376 @@ impl Dashboard {
             return;
         }
 
-        // Dynamic chat panel height (unified: suggestions/messages + input in one block)
-        let has_chat_content = !self.chat.messages.is_empty()
-            || !self.chat.pending_blocks.is_empty()
-            || self.chat.is_generating;
-
-        let chat_panel_height: u16 = if has_chat_content {
-            let available = size.height.saturating_sub(5 + 1); // header + footer
-            (available * 65 / 100).max(10)
+        // Center-constrain only the home screen; full width once chatting
+        let content_area = if self.chat.show_home_screen && self.chat.messages.is_empty() {
+            let max_width: u16 = 90;
+            let h_pad = size.width.saturating_sub(max_width) / 2;
+            Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Length(h_pad),
+                    Constraint::Min(1),
+                    Constraint::Length(h_pad),
+                ])
+                .split(size)[1]
         } else {
-            // Suggestions + input + borders: enough for suggestions + input line
-            (self.chat.suggestions.len() as u16 + 4).max(5).min(8)
+            size
         };
 
         let main_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(5),                // Header (owl + text)
-                Constraint::Min(6),                   // Recordings Table (shrinks when chat grows)
-                Constraint::Length(chat_panel_height), // Unified chat panel
-                Constraint::Length(1),                // Footer (compressed)
+                Constraint::Min(6),   // Chat
+                Constraint::Length(2), // Footer
             ])
-            .split(size);
+            .split(content_area);
 
-        // Header
-        self.render_header(f, main_chunks[0]);
+        self.chat.render(f, main_chunks[0]);
+        self.render_home_footer(f, main_chunks[1]);
 
-        // Table (with stats in title)
-        self.render_recordings_table(f, main_chunks[1]);
-
-        // Unified chat panel
-        self.chat.render(f, main_chunks[2]);
-
-        // Compressed footer
-        self.render_compressed_footer(f, main_chunks[3]);
-
-        // Search input overlay
         if self.search_mode {
             self.render_search_input(f, size);
         }
     }
 
-    fn render_header(&self, f: &mut Frame, area: ratatui::layout::Rect) {
-        use ratatui::text::{Line, Span};
+    fn render_browse_view(&mut self, f: &mut Frame) {
+        let size = f.size();
 
-        let cycle = self.header_anim_frame % 300;
-        let yellow_bold = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
-        let gray = Style::default().fg(Color::DarkGray);
+        if self.show_file_dialog {
+            self.render_file_dialog_popup(f, size);
+            return;
+        }
 
-        let inner_width = (area.width as usize).saturating_sub(2);
-        let logo_end: usize = 28;
-        let trail_len = inner_width.saturating_sub(logo_end + 2);
-        let skip_anim = trail_len < 10;
+        if self.show_message {
+            self.render_message_popup(f, size);
+            return;
+        }
 
-        let logo_lines = [
-            "         ╔═╗╔═╗╦═╗╦╔╗ ╔═╗",
-            "         ╚═╗║  ╠╦╝║╠╩╗╠═╣",
-            "         ╚═╝╚═╝╩╚═╩╚═╝╩ ╩",
-        ];
+        if self.show_transcript {
+            self.render_transcript_popup(f, size);
+            return;
+        }
 
-        let lines = if skip_anim || cycle < 120 || cycle >= 290 {
-            // Idle A (0-119), Idle B (290-299), or narrow terminal fallback
-            let is_blink = (cycle % 40) < 3;
-            let face = if is_blink { "(-,-)" } else { "(o,o)" };
-            vec![
-                Line::from(Span::styled(
-                    format!("  {}  ╔═╗╔═╗╦═╗╦╔╗ ╔═╗", face),
-                    yellow_bold,
-                )),
-                Line::from(Span::styled(
-                    "  {`\"'}  ╚═╗║  ╠╦╝║╠╩╗╠═╣",
-                    yellow_bold,
-                )),
-                Line::from(vec![
-                    Span::styled(
-                        "  -\"-\"-  ╚═╝╚═╝╩╚═╩╚═╝╩ ╩",
-                        yellow_bold,
-                    ),
-                    Span::styled(
-                        " — hoo remembers everything",
-                        gray,
-                    ),
-                ]),
-            ]
-        } else if cycle < 130 {
-            // Owl notices ground (120-129): eyes look right, no trail yet
-            let notice = cycle - 120; // 0..9
-            let face = if notice < 5 { "(o,>)" } else { "(O,>)" };
-            vec![
-                Line::from(Span::styled(
-                    format!("  {}  ╔═╗╔═╗╦═╗╦╔╗ ╔═╗", face),
-                    yellow_bold,
-                )),
-                Line::from(Span::styled(
-                    "  {`\"'}  ╚═╗║  ╠╦╝║╠╩╗╠═╣",
-                    yellow_bold,
-                )),
-                Line::from(vec![
-                    Span::styled(
-                        "  -\"-\"-  ╚═╝╚═╝╩╚═╩╚═╝╩ ╩",
-                        yellow_bold,
-                    ),
-                    Span::styled(
-                        " — hoo remembers everything",
-                        gray,
-                    ),
-                ]),
-            ]
-        } else if cycle < 180 {
-            // Wing cut (130-179): owl flies right on line 1, wing scores sand trail
-            let cut = cycle - 130; // 0..49
-            let progress = cut as f64 / 49.0;
-            let eased = if progress < 0.5 {
-                2.0 * progress * progress
-            } else {
-                1.0 - (-2.0 * progress + 2.0).powi(2) / 2.0
-            };
-            let max_cut = trail_len.saturating_sub(1);
-            let cut_pos = (eased * max_cut as f64) as usize;
-            // Owl face on line 1, centered above the wing tip
-            let owl_face = "(o,o)";
-            let owl_col = cut_pos.saturating_sub(2).min(trail_len.saturating_sub(5));
-            let owl_gap = " ".repeat(owl_col);
-            // Trail on line 2: scored dots behind wing + wing tip + blank ahead
-            let wing = if cut % 2 == 0 { "\\" } else { "/" };
-            let scored: String = "·".repeat(cut_pos);
-            vec![
-                Line::from(Span::styled(logo_lines[0], yellow_bold)),
-                Line::from(vec![
-                    Span::styled(logo_lines[1], yellow_bold),
-                    Span::styled(format!(" {}{}", owl_gap, owl_face), yellow_bold),
-                ]),
-                Line::from(vec![
-                    Span::styled(logo_lines[2], yellow_bold),
-                    Span::styled(format!(" {}", scored), gray),
-                    Span::styled(wing, yellow_bold),
-                ]),
-            ]
-        } else if cycle < 195 {
-            // Return (180-194): owl flies back to start, full trail visible
-            let ret = cycle - 180; // 0..14
-            let progress = ret as f64 / 14.0;
-            let eased = 1.0 - (1.0 - progress).powi(2); // ease-out
-            let max_pos = trail_len.saturating_sub(5);
-            let gap_size = ((1.0 - eased) * max_pos as f64) as usize;
-            let gap = " ".repeat(gap_size);
-            let owl_face = if ret % 2 == 0 { "~(o,o)~" } else { " (o,o) " };
-            let trail: String = "·".repeat(trail_len);
-            vec![
-                Line::from(Span::styled(logo_lines[0], yellow_bold)),
-                Line::from(vec![
-                    Span::styled(logo_lines[1], yellow_bold),
-                    Span::styled(format!(" {}{}", gap, owl_face), yellow_bold),
-                ]),
-                Line::from(vec![
-                    Span::styled(logo_lines[2], yellow_bold),
-                    Span::styled(format!(" {}", trail), gray),
-                ]),
-            ]
-        } else if cycle < 250 {
-            // Owl eats trail (195-249): owl on line 1 above trail, vacuums dots upward
-            let eat = cycle - 195; // 0..54
-            let progress = eat as f64 / 54.0;
-            let eased = if progress < 0.5 {
-                2.0 * progress * progress
-            } else {
-                1.0 - (-2.0 * progress + 2.0).powi(2) / 2.0
-            };
-            // Eating front: how far into the trail the owl has eaten
-            let max_eat = trail_len.saturating_sub(1);
-            let eat_pos = (eased * max_eat as f64) as usize;
-            // Owl face on line 1, centered above the eating front
-            let owl_face = if eat % 2 == 0 { "(o,o)" } else { "(O,O)" };
-            let owl_col = eat_pos.saturating_sub(2).min(trail_len.saturating_sub(5));
-            let owl_gap = " ".repeat(owl_col);
-            // Trail on line 2: eaten (blank) + suction char + remaining dots
-            let suction = if eat % 2 == 0 { "'" } else { "^" };
-            let eaten_blank = " ".repeat(eat_pos);
-            let remaining = trail_len.saturating_sub(eat_pos + 1);
-            let dots: String = "·".repeat(remaining);
-            vec![
-                Line::from(Span::styled(logo_lines[0], yellow_bold)),
-                Line::from(vec![
-                    Span::styled(logo_lines[1], yellow_bold),
-                    Span::styled(format!(" {}{}", owl_gap, owl_face), yellow_bold),
-                ]),
-                Line::from(vec![
-                    Span::styled(logo_lines[2], yellow_bold),
-                    Span::styled(format!(" {}{}", eaten_blank, suction), yellow_bold),
-                    Span::styled(dots, gray),
-                ]),
-            ]
-        } else if cycle < 265 {
-            // Crazy celebration (250-264): owl ecstatic, shouts HOOOOOO!!
-            let celeb = cycle - 250; // 0..14
-            // Fast-cycling crazy sprites (every 2 frames)
-            let owl_str = match (celeb / 2) % 4 {
-                0 => "\\(@,@)/",
-                1 => "/(O,O)\\",
-                2 => "\\(x,X)/",
-                _ => "|(O,o)|",
-            };
-            let owl_col = trail_len.saturating_sub(7);
-            let owl_gap = " ".repeat(owl_col);
-            // Growing "HOOOOOO!!" shout on line 2, expanding right-to-left
-            let shout_target = ((celeb + 1) as f64 / 15.0 * trail_len as f64) as usize;
-            let shout_len = shout_target.max(4).min(trail_len);
-            let num_os = shout_len.saturating_sub(3).max(1);
-            let shout = format!("H{}!!", "O".repeat(num_os));
-            let shout_gap = " ".repeat(trail_len.saturating_sub(shout.len()));
-            vec![
-                Line::from(Span::styled(logo_lines[0], yellow_bold)),
-                Line::from(vec![
-                    Span::styled(logo_lines[1], yellow_bold),
-                    Span::styled(format!(" {}{}", owl_gap, owl_str), yellow_bold),
-                ]),
-                Line::from(vec![
-                    Span::styled(logo_lines[2], yellow_bold),
-                    Span::styled(format!(" {}{}", shout_gap, shout), yellow_bold),
-                ]),
-            ]
-        } else {
-            // Fly back (265-289): owl flaps back to rest position
-            let fly = cycle - 265; // 0..24
-            let progress = fly as f64 / 24.0;
-            let eased = 1.0 - (1.0 - progress).powi(2); // ease-out
-            let max_pos = trail_len.saturating_sub(7);
-            let gap_size = ((1.0 - eased) * max_pos as f64) as usize;
-            let gap = " ".repeat(gap_size);
-            let owl_str = if fly % 2 == 0 { "~(o,o)~" } else { " (o,o) " };
-            vec![
-                Line::from(vec![
-                    Span::styled(logo_lines[0], yellow_bold),
-                    Span::styled(
-                        format!(" {}{}", gap, owl_str),
-                        yellow_bold,
-                    ),
-                ]),
-                Line::from(Span::styled(logo_lines[1], yellow_bold)),
-                Line::from(vec![
-                    Span::styled(logo_lines[2], yellow_bold),
-                    Span::styled(
-                        " — hoo remembers everything",
-                        gray,
-                    ),
-                ]),
-            ]
-        };
+        if self.show_delete_confirm {
+            self.render_delete_confirmation_popup(f, size);
+            return;
+        }
 
-        let header = Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .style(Style::default().fg(Color::Cyan))
-                    .border_type(ratatui::widgets::BorderType::Double),
-            );
-        f.render_widget(header, area);
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(6),   // Recording list
+                Constraint::Length(2), // Footer (separator + line)
+            ])
+            .split(size);
+
+        self.render_recording_list(f, chunks[0]);
+        self.render_browse_footer(f, chunks[1]);
+
+        if self.search_mode {
+            self.render_search_input(f, size);
+        }
     }
 
-    fn render_recordings_table(&mut self, f: &mut Frame, area: ratatui::layout::Rect) {
-        let header_cells = ["#", "Status", "Name", "Duration", "Model", "Created"]
-            .iter()
-            .map(|h| {
-                Cell::from(*h).style(
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                )
-            });
+    fn render_home_footer(&self, f: &mut Frame, area: ratatui::layout::Rect) {
+        // Notification override
+        if let Some((ref msg, _)) = self.notification_message {
+            let is_error = msg.contains("failed") || msg.contains("Failed");
+            let style = if is_error {
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+            };
+            let para = Paragraph::new(msg.as_str())
+                .style(style)
+                .alignment(Alignment::Center);
+            f.render_widget(para, area);
+            return;
+        }
 
-        let header = Row::new(header_cells)
-            .style(Style::default())
-            .height(1)
-            .bottom_margin(1);
+        // Separator line
+        let sep = "\u{2500}".repeat(area.width as usize);
+        f.render_widget(
+            Paragraph::new(sep).style(Style::default().fg(Color::Indexed(237))),
+            Rect { x: area.x, y: area.y, width: area.width, height: 1 },
+        );
 
-        let rows: Vec<Row> = self
-            .recordings
-            .iter()
-            .enumerate()
-            .map(|(i, recording)| {
-                let display_name = recording
-                    .display_name
-                    .as_ref()
-                    .unwrap_or(&recording.directory_name);
+        // Footer content area (below separator)
+        let footer_area = if area.height > 1 {
+            Rect { x: area.x, y: area.y + 1, width: area.width, height: area.height - 1 }
+        } else {
+            // Single-line: reuse same area, separator doubles as footer line
+            area
+        };
 
-                let duration = recording
-                    .duration_seconds
-                    .map(|d| self.format_duration(d))
-                    .unwrap_or_else(|| "Unknown".to_string());
+        // Left side: ▸ scriba · v0.21.2
+        let version = env!("CARGO_PKG_VERSION");
+        let left_spans = vec![
+            Span::styled(" \u{25B8} ", Style::default().fg(ACCENT)),
+            Span::styled(format!("scriba \u{00B7} v{}", version), Style::default().fg(Color::DarkGray)),
+        ];
 
-                let is_active = self.active_transcription.as_ref()
-                    .is_some_and(|a| a.recording_name == recording.directory_name);
-                let is_queued = !is_active
-                    && self.transcription_queue.iter().any(|p| p.recording_name() == recording.directory_name);
-                let status = if is_active {
-                    match self.progress_frame % 4 {
-                        0 => "[|]",
-                        1 => "[/]",
-                        2 => "[-]",
-                        _ => "[\\]",
-                    }
-                } else if is_queued {
-                    "[Q]"
-                } else if recording.has_transcript {
-                    "[T]"
-                } else {
-                    "[A]"
+        // Right side: shortcuts (context-dependent)
+        let in_chat = !self.chat.show_home_screen && !self.chat.messages.is_empty();
+        let mut right_spans: Vec<Span> = Vec::new();
+        if in_chat {
+            right_spans.extend([
+                Span::styled("[", Style::default().fg(Color::DarkGray)),
+                Span::styled("Esc", Style::default().fg(Color::White)),
+                Span::styled("] Home  ", Style::default().fg(Color::DarkGray)),
+            ]);
+        }
+        right_spans.extend([
+            Span::styled("[", Style::default().fg(Color::DarkGray)),
+            Span::styled("Tab", Style::default().fg(Color::White)),
+            Span::styled("] Browse  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(Color::DarkGray)),
+            Span::styled("Ctrl+R", Style::default().fg(Color::White)),
+            Span::styled("] Record  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(Color::DarkGray)),
+            Span::styled("?", Style::default().fg(Color::White)),
+            Span::styled("] Help ", Style::default().fg(Color::DarkGray)),
+        ]);
+
+        // Compute widths to fill gap with spaces
+        let left_width: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
+        let right_width: usize = right_spans.iter().map(|s| s.content.chars().count()).sum();
+        let gap = (footer_area.width as usize).saturating_sub(left_width + right_width);
+
+        let mut spans = left_spans;
+        spans.push(Span::raw(" ".repeat(gap)));
+        spans.extend(right_spans);
+
+        let line = Line::from(spans);
+        f.render_widget(Paragraph::new(line), footer_area);
+    }
+
+    fn render_browse_footer(&self, f: &mut Frame, area: ratatui::layout::Rect) {
+        // Notification override
+        if let Some((ref msg, _)) = self.notification_message {
+            let is_error = msg.contains("failed") || msg.contains("Failed");
+            let style = if is_error {
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+            };
+            let para = Paragraph::new(msg.as_str())
+                .style(style)
+                .alignment(Alignment::Center);
+            f.render_widget(para, area);
+            return;
+        }
+
+        // Separator line
+        let sep = "\u{2500}".repeat(area.width as usize);
+        f.render_widget(
+            Paragraph::new(sep).style(Style::default().fg(Color::Indexed(237))),
+            Rect { x: area.x, y: area.y, width: area.width, height: 1 },
+        );
+
+        // Footer content area (below separator)
+        let footer_area = if area.height > 1 {
+            Rect { x: area.x, y: area.y + 1, width: area.width, height: area.height - 1 }
+        } else {
+            area
+        };
+
+        // Left side: ▸ scriba · v0.21.2 · N recordings · Xh Ym
+        let version = env!("CARGO_PKG_VERSION");
+        let rec_count = self.stats.as_ref().map(|s| s.total_recordings).unwrap_or(0);
+        let total_secs = self.stats.as_ref().map(|s| s.total_duration_seconds).unwrap_or(0);
+        let total_h = total_secs / 3600;
+        let total_m = (total_secs % 3600) / 60;
+        let duration_str = if total_h > 0 {
+            format!("{}h {}m", total_h, total_m)
+        } else {
+            format!("{}m", total_m)
+        };
+
+        let mut left_spans = vec![
+            Span::styled(" \u{25B8} ", Style::default().fg(ACCENT)),
+            Span::styled(
+                format!("scriba \u{00B7} v{} \u{00B7} {} recordings \u{00B7} {}", version, rec_count, duration_str),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ];
+
+        // Transcribing indicator
+        if self.active_transcription.is_some() {
+            left_spans.push(Span::styled(
+                " \u{00B7} Transcribing...",
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+
+        // Right side: shortcuts
+        let right_spans = vec![
+            Span::styled("[", Style::default().fg(Color::DarkGray)),
+            Span::styled("Tab", Style::default().fg(Color::White)),
+            Span::styled("] Home  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(Color::DarkGray)),
+            Span::styled("Ctrl+R", Style::default().fg(Color::White)),
+            Span::styled("] Record  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(Color::DarkGray)),
+            Span::styled("/", Style::default().fg(Color::White)),
+            Span::styled("] Search ", Style::default().fg(Color::DarkGray)),
+        ];
+
+        // Compute widths to fill gap
+        let left_width: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
+        let right_width: usize = right_spans.iter().map(|s| s.content.chars().count()).sum();
+        let gap = (footer_area.width as usize).saturating_sub(left_width + right_width);
+
+        let mut spans = left_spans;
+        spans.push(Span::raw(" ".repeat(gap)));
+        spans.extend(right_spans);
+
+        let line = Line::from(spans);
+        f.render_widget(Paragraph::new(line), footer_area);
+    }
+
+
+    fn render_recording_list(&mut self, f: &mut Frame, area: ratatui::layout::Rect) {
+        if self.recordings.is_empty() {
+            let msg = if self.search_query.is_empty() {
+                "No recordings yet. Press Ctrl+R to start recording."
+            } else {
+                "No recordings match your search."
+            };
+            let para = Paragraph::new(msg)
+                .style(Style::default().fg(Color::DarkGray))
+                .alignment(Alignment::Center);
+            f.render_widget(para, area);
+            return;
+        }
+
+        let selected_idx = self.table_state.selected().unwrap_or(0);
+        let today = chrono::Local::now().date_naive();
+        let yesterday = today - chrono::Duration::days(1);
+
+        // Build lines and track which line maps to which recording index
+        let mut lines: Vec<Line> = Vec::new();
+        let mut line_to_recording: Vec<Option<usize>> = Vec::new();
+        let mut current_group: Option<String> = None;
+
+        let name_col_width = (area.width as usize).saturating_sub(16); // leave room for prefix + duration + time
+
+        for (i, recording) in self.recordings.iter().enumerate() {
+            let rec_date = recording.created_at.with_timezone(&chrono::Local).date_naive();
+            let group_label = if rec_date == today {
+                "Today".to_string()
+            } else if rec_date == yesterday {
+                "Yesterday".to_string()
+            } else {
+                rec_date.format("%b %-d").to_string()
+            };
+
+            if current_group.as_ref() != Some(&group_label) {
+                // Blank line before group (except first)
+                if current_group.is_some() {
+                    lines.push(Line::from(""));
+                    line_to_recording.push(None);
+                }
+                // Date header
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", group_label),
+                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+                )));
+                line_to_recording.push(None);
+                current_group = Some(group_label);
+            }
+
+            let is_selected = i == selected_idx;
+            let is_active = self.active_transcription.as_ref()
+                .is_some_and(|a| a.recording_name == recording.directory_name);
+            let is_queued = !is_active
+                && self.transcription_queue.iter().any(|p| p.recording_name() == recording.directory_name);
+
+            // Selection marker
+            let marker = if is_selected { "\u{25B8} " } else { "  " };
+            let marker_style = Style::default().fg(Color::White);
+
+            // Status dot
+            let (dot, dot_style) = if is_active {
+                let spinner = match self.progress_frame % 4 {
+                    0 => "\u{25D0}",
+                    1 => "\u{25D3}",
+                    2 => "\u{25D1}",
+                    _ => "\u{25D2}",
                 };
-                let created = recording.created_at.format("%m/%d %H:%M").to_string();
+                (spinner, Style::default().fg(Color::Yellow))
+            } else if is_queued {
+                ("\u{25CB}", Style::default().fg(Color::Yellow))
+            } else if recording.has_transcript {
+                ("\u{25CF}", Style::default().fg(ACCENT))
+            } else {
+                ("\u{25CB}", Style::default().fg(Color::DarkGray))
+            };
 
-                // Calculate global index across all pages
-                let global_index = (self.current_page * self.page_size) + i + 1;
+            // Name
+            let display_name = recording.display_name.as_ref()
+                .unwrap_or(&recording.directory_name);
+            let name_style = if is_selected {
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Indexed(249))
+            };
 
-                // Format model used for display
-                let model_display = if recording.has_transcript {
-                    // Parse the model_used field to show a user-friendly format
-                    match recording.model_used.as_str() {
-                        // API models
-                        "whisper-1" => "API",
-                        s if s.starts_with("gpt") || s.contains("openai") => "API",
-                        // Local models - extract size from format like "whisper-tiny", "whisper-turbo"
-                        s if s.starts_with("whisper-") => {
-                            let size = s.strip_prefix("whisper-").unwrap_or("");
-                            match size {
-                                "tiny" => "Tiny",
-                                "base" => "Base",
-                                "small" => "Small",
-                                "medium" => "Medium",
-                                "large" => "Large",
-                                "large-v2" => "Large-v2",
-                                "large-v3" => "Large-v3",
-                                "turbo" => "Turbo",
-                                _ => "Local",
-                            }
-                        }
-                        // Legacy formats
-                        "whisper" | "whisper.cpp" | "whisper-rs" => "Local",
-                        // Unknown/empty
-                        s if s.is_empty() => "-",
-                        _ => &recording.model_used,
+            // Duration (short format)
+            let duration = recording.duration_seconds
+                .map(|d| {
+                    let mins = d / 60;
+                    if mins >= 60 {
+                        format!("{}h{}m", mins / 60, mins % 60)
+                    } else {
+                        format!("{}m", mins)
                     }
-                } else {
-                    "-"
-                };
+                })
+                .unwrap_or_default();
 
-                let cells = vec![
-                    Cell::from(global_index.to_string()),
-                    Cell::from(status).style(if is_active || is_queued {
-                        Style::default().fg(Color::Yellow)
-                    } else if recording.has_transcript {
-                        Style::default().fg(Color::Green)
-                    } else {
-                        Style::default().fg(Color::Blue)
-                    }),
-                    Cell::from(display_name.clone()),
-                    Cell::from(duration),
-                    Cell::from(model_display).style(if model_display == "API" {
-                        Style::default().fg(Color::Cyan)
-                    } else if model_display == "-" {
-                        Style::default().fg(Color::Gray)
-                    } else {
-                        Style::default().fg(Color::Yellow)
-                    }),
-                    Cell::from(created),
-                ];
+            // Time
+            let time = recording.created_at
+                .with_timezone(&chrono::Local)
+                .format("%H:%M")
+                .to_string();
 
-                Row::new(cells).height(1).bottom_margin(0)
-            })
-            .collect();
+            // Truncate name to fit
+            let right_part = format!("{:>6}  {}", duration, time);
+            let max_name = name_col_width.saturating_sub(right_part.len() + 6); // 6 = "  ▸ ● "
+            let truncated_name: String = if display_name.chars().count() > max_name {
+                display_name.chars().take(max_name.saturating_sub(1)).collect::<String>() + "\u{2026}"
+            } else {
+                display_name.clone()
+            };
+            let name_padding = max_name.saturating_sub(truncated_name.chars().count());
 
-        let table = Table::new(
-            rows,
-            [
-                Constraint::Length(4),  // #
-                Constraint::Length(8),  // Status
-                Constraint::Min(15),    // Name (flexible)
-                Constraint::Length(10), // Duration
-                Constraint::Length(8),  // Model
-                Constraint::Length(12), // Created
-            ],
-        )
-        .header(header)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .style(Style::default().fg(Color::Cyan))
-                .title({
-                    let start_index = (self.current_page * self.page_size) + 1;
-                    let end_index = start_index + self.recordings.len() - 1;
-                    let stats_suffix = if let Some(stats) = &self.stats {
-                        format!(" — {} total, {}", stats.total_recordings, stats.format_duration())
-                    } else {
-                        String::new()
-                    };
-                    format!(
-                        "Recordings (Page {} - #{}-#{}){}",
-                        self.current_page + 1,
-                        start_index,
-                        end_index,
-                        stats_suffix
-                    )
-                }),
-        )
-        .highlight_style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("▶ ");
+            let spans = vec![
+                Span::styled(format!("  {}", marker), marker_style),
+                Span::styled(format!("{} ", dot), dot_style),
+                Span::styled(truncated_name, name_style),
+                Span::raw(" ".repeat(name_padding)),
+                Span::styled(right_part, Style::default().fg(Color::DarkGray)),
+            ];
 
-        f.render_stateful_widget(table, area, &mut self.table_state);
+            lines.push(Line::from(spans));
+            line_to_recording.push(Some(i));
+        }
+
+        // Find the line index for the selected recording to keep it in view
+        let selected_line = line_to_recording.iter()
+            .position(|r| *r == Some(selected_idx))
+            .unwrap_or(0);
+
+        // Calculate scroll offset
+        let visible_height = area.height as usize;
+        let scroll = if selected_line >= visible_height {
+            selected_line - visible_height + 2 // keep 1 line below selected visible
+        } else {
+            0
+        };
+
+        let para = Paragraph::new(lines).scroll((scroll as u16, 0));
+        f.render_widget(para, area);
     }
 
     fn render_help(&self, f: &mut Frame, area: ratatui::layout::Rect) {
@@ -3449,201 +3271,131 @@ impl Dashboard {
     }
 
     fn render_settings(&self, f: &mut Frame, area: ratatui::layout::Rect) {
-        let popup_area = Layout::default()
+        // Full-screen borderless layout: header + body + footer
+        let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Percentage(15),
-                Constraint::Percentage(70),
-                Constraint::Percentage(15),
+                Constraint::Length(2),  // Header
+                Constraint::Min(10),   // Body
+                Constraint::Length(2),  // Footer
             ])
-            .split(area)[1];
+            .split(area);
 
-        let popup_area = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(15),
-                Constraint::Percentage(70),
-                Constraint::Percentage(15),
-            ])
-            .split(popup_area)[1];
+        // ── Header ──────────────────────────────────────────────────
+        let header_line = Line::from(vec![
+            Span::raw("  "),
+            Span::styled("Settings", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        ]);
+        f.render_widget(Paragraph::new(header_line), Rect { x: chunks[0].x, y: chunks[0].y, width: chunks[0].width, height: 1 });
+        let sep = "\u{2500}".repeat(chunks[0].width as usize);
+        f.render_widget(
+            Paragraph::new(sep).style(Style::default().fg(Color::Indexed(237))),
+            Rect { x: chunks[0].x, y: chunks[0].y + 1, width: chunks[0].width, height: 1 },
+        );
 
-        f.render_widget(Clear, popup_area);
+        // ── Body ────────────────────────────────────────────────────
+        let label_style = Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD);
+        let val_normal = Style::default().fg(Color::White);
+        let val_selected = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+        let val_editing = Style::default().fg(Color::Green).add_modifier(Modifier::BOLD);
+        let hint_style = Style::default().fg(Color::DarkGray);
+        let val_disabled = Style::default().fg(Color::DarkGray);
+        let section_style = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+        let pad = 20; // label column width
 
-        let mut settings_text = vec![
-            Line::from(vec![Span::styled(
-                "SETTINGS",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )]),
-            Line::from(""),
-        ];
+        let sel = self.settings_selection;
+        let mut lines: Vec<Line> = Vec::new();
 
-        // Current transcription mode
-        let mode_text = match &self.config.transcription {
-            TranscriptionMode::Local { model_size } => {
-                format!("Local (Whisper {})  <- Press Enter to change", model_size)
-            }
-            TranscriptionMode::Api { .. } => "OpenAI API  <- Press Enter to change".to_string(),
+        // Helper closure-like macro for building a setting line
+        macro_rules! setting_line {
+            ($label:expr, $value:expr, $idx:expr, $hint:expr, $style_override:expr) => {{
+                let padded_label = format!("  {:<width$}", $label, width = pad);
+                let is_sel = sel == $idx;
+                let v_style = if let Some(s) = $style_override { s } else if is_sel { val_selected } else { val_normal };
+                let mut spans = vec![
+                    Span::styled(padded_label, label_style),
+                    Span::styled($value.to_string(), v_style),
+                ];
+                if is_sel && !$hint.is_empty() {
+                    spans.push(Span::styled(format!("  {}", $hint), hint_style));
+                }
+                lines.push(Line::from(spans));
+            }};
+        }
+
+        // ── TRANSCRIPTION ───────────────────────────────────────────
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::raw("  "), Span::styled("TRANSCRIPTION", section_style)]));
+
+        let mode_value = match &self.config.transcription {
+            TranscriptionMode::Local { model_size } => format!("Local (Whisper {})", model_size),
+            TranscriptionMode::Api { .. } => "OpenAI API".to_string(),
         };
-
-        let mode_style = if self.settings_selection == 0 {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White)
-        };
-
-        settings_text.push(Line::from(vec![
-            Span::styled("Transcription Mode: ", Style::default().fg(Color::Green)),
-            Span::styled(mode_text, mode_style),
-        ]));
+        setting_line!("Mode", mode_value, 0, "\u{2190} Enter to change", None::<Style>);
 
         // Model size (only for local mode)
         if let TranscriptionMode::Local { model_size } = &self.config.transcription {
-            let model_style = if self.settings_selection == 1 {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
+            setting_line!("Model Size", model_size, 1, "\u{2190} Enter to cycle", None::<Style>);
+        }
+
+        // API key (only for API mode)
+        if let TranscriptionMode::Api { api_key } = &self.config.transcription {
+            let api_key_display = if self.editing_api_key {
+                format!("{}_", self.api_key_input)
+            } else if api_key.is_empty() {
+                "[Not Set]".to_string()
             } else {
-                Style::default().fg(Color::White)
+                format!("{}******", &api_key[..api_key.len().min(4)])
             };
-
-            settings_text.push(Line::from(vec![
-                Span::styled("Model Size: ", Style::default().fg(Color::Green)),
-                Span::styled(
-                    format!("{} <- Press Enter to cycle", model_size),
-                    model_style,
-                ),
-            ]));
+            let style_override = if sel == 1 && self.editing_api_key { Some(val_editing) } else { None };
+            setting_line!("OpenAI API Key", api_key_display, 1, "\u{2190} Enter to edit", style_override);
         }
 
-        // Add mode-specific settings
-        match &self.config.transcription {
-            TranscriptionMode::Api { api_key } => {
-                // API Mode: Show API Key configuration at index 1
-                let api_key_display = if self.editing_api_key {
-                    format!("{}_", self.api_key_input) // Show cursor
-                } else {
-                    if api_key.is_empty() {
-                        "[Not Set] <- Press Enter to edit".to_string()
-                    } else {
-                        format!(
-                            "{}****** <- Press Enter to edit",
-                            &api_key[..api_key.len().min(4)]
-                        )
-                    }
-                };
+        // ── ENRICHMENT ──────────────────────────────────────────────
+        lines.push(Line::from(""));
+        let enrichment_label = if self.config.enrichment.is_local() { "ENRICHMENT (Privacy)" } else { "ENRICHMENT" };
+        lines.push(Line::from(vec![Span::raw("  "), Span::styled(enrichment_label, section_style)]));
 
-                let api_key_style = if self.settings_selection == 1 {
-                    if self.editing_api_key {
-                        Style::default()
-                            .fg(Color::Green)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD)
-                    }
-                } else {
-                    Style::default().fg(Color::White)
-                };
+        setting_line!("Provider", self.config.enrichment.provider_display_name(), 2, "\u{2190} Enter to cycle", None::<Style>);
 
-                settings_text.push(Line::from(vec![
-                    Span::styled("OpenAI API Key: ", Style::default().fg(Color::Green)),
-                    Span::styled(api_key_display, api_key_style),
-                ]));
-            }
-            TranscriptionMode::Local { .. } => {
-                // Local Mode: No API Key shown, Model Size is already shown above
-            }
-        }
-
-        // Enrichment settings section
-        settings_text.push(Line::from(""));
-        let enrichment_header = if self.config.enrichment.is_local() {
-            "ENRICHMENT (Privacy Mode)"
-        } else {
-            "ENRICHMENT"
-        };
-        settings_text.push(Line::from(vec![Span::styled(
-            enrichment_header,
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )]));
-
-        // Provider (index 2) — cycle through providers
-        let provider_display = format!(
-            "{} <- Press Enter to cycle",
-            self.config.enrichment.provider_display_name()
-        );
-        let provider_style = if self.settings_selection == 2 {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        settings_text.push(Line::from(vec![
-            Span::styled("Provider: ", Style::default().fg(Color::Green)),
-            Span::styled(provider_display, provider_style),
-        ]));
-
-        // Model (index 3) — picker or closed
+        // Model (index 3)
         if self.model_picker_state == ModelPickerState::Closed {
-            let model_display = format!(
-                "{} <- Press Enter to choose",
-                self.config.enrichment.model_name()
-            );
-            let model_style = if self.settings_selection == 3 {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            settings_text.push(Line::from(vec![
-                Span::styled("Model: ", Style::default().fg(Color::Green)),
-                Span::styled(model_display, model_style),
-            ]));
+            setting_line!("Model", self.config.enrichment.model_name(), 3, "\u{2190} Enter to choose", None::<Style>);
         } else {
-            // Picker is open or editing custom
-            settings_text.push(Line::from(vec![
-                Span::styled("Model: ", Style::default().fg(Color::Green)),
-                Span::styled("(select below)", Style::default().fg(Color::DarkGray)),
+            // Picker is open
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {:<width$}", "Model", width = pad), label_style),
+                Span::styled("(select below)", hint_style),
             ]));
 
             let current_model = self.config.enrichment.model_name().to_string();
-
             for (i, item) in self.model_picker_items.iter().enumerate() {
                 let is_cursor = i == self.model_picker_selection;
                 let is_current = item.model_id.as_deref() == Some(current_model.as_str());
                 let is_custom_sentinel = item.model_id.is_none() && item.display_name == "Custom...";
 
-                let arrow = if is_cursor { "  > " } else { "    " };
+                let arrow = if is_cursor { "    \u{25B8} " } else { "      " };
 
                 let style = if is_cursor {
                     if self.model_picker_state == ModelPickerState::EditingCustom && is_custom_sentinel {
-                        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                        val_editing
                     } else {
-                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                        val_selected
                     }
                 } else if is_current {
-                    Style::default().fg(Color::Cyan)
+                    Style::default().fg(ACCENT)
                 } else {
-                    Style::default().fg(Color::White)
+                    val_normal
                 };
 
                 if is_custom_sentinel && self.model_picker_state == ModelPickerState::EditingCustom {
-                    settings_text.push(Line::from(vec![
+                    lines.push(Line::from(vec![
                         Span::styled(arrow, style),
                         Span::styled(format!("Custom: {}_", self.model_picker_custom_input), style),
                     ]));
                 } else {
                     let suffix = if is_current && !is_cursor { " (current)" } else { "" };
-                    settings_text.push(Line::from(vec![
+                    lines.push(Line::from(vec![
                         Span::styled(arrow, style),
                         Span::styled(format!("{}{}", item.display_name, suffix), style),
                     ]));
@@ -3656,382 +3408,159 @@ impl Dashboard {
             let endpoint_display = if self.editing_enrichment_endpoint {
                 format!("{}_", self.enrichment_endpoint_input)
             } else {
-                format!(
-                    "{} <- Press Enter to edit",
-                    self.config.enrichment.ollama_endpoint()
-                )
+                self.config.enrichment.ollama_endpoint().to_string()
             };
-            let endpoint_style = if self.settings_selection == 4 {
-                if self.editing_enrichment_endpoint {
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD)
-                }
-            } else {
-                Style::default().fg(Color::White)
-            };
-            settings_text.push(Line::from(vec![
-                Span::styled("Ollama Server: ", Style::default().fg(Color::Green)),
-                Span::styled(endpoint_display, endpoint_style),
-            ]));
+            let style_override = if sel == 4 && self.editing_enrichment_endpoint { Some(val_editing) } else { None };
+            setting_line!("Ollama Server", endpoint_display, 4, "\u{2190} Enter to edit", style_override);
         } else {
-            // Provider-specific label and env var hint
-            let (key_label, env_hint) = match self.config.enrichment.cloud_provider() {
-                Some(p) => (
-                    format!("{} API Key: ", p.display_name()),
-                    format!(" (or set {})", p.env_var_name()),
-                ),
-                None => ("API Key: ".to_string(), String::new()),
+            let key_label = match self.config.enrichment.cloud_provider() {
+                Some(p) => format!("{} API Key", p.display_name()),
+                None => "API Key".to_string(),
+            };
+            let env_hint = match self.config.enrichment.cloud_provider() {
+                Some(p) => format!(" (or set {})", p.env_var_name()),
+                None => String::new(),
             };
             let key_display = if self.editing_enrichment_api_key {
                 format!("{}_", self.enrichment_api_key_input)
             } else {
                 match self.config.enrichment.api_key() {
-                    Some(key) if key.len() >= 4 => {
-                        format!("{}****** <- Press Enter to edit", &key[..4])
-                    }
-                    Some(_) => "****** <- Press Enter to edit".to_string(),
-                    None => format!("[Not Set]{} <- Press Enter to edit", env_hint),
+                    Some(key) if key.len() >= 4 => format!("{}******", &key[..4]),
+                    Some(_) => "******".to_string(),
+                    None => format!("[Not Set]{}", env_hint),
                 }
             };
-            let key_style = if self.settings_selection == 4 {
-                if self.editing_enrichment_api_key {
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD)
-                }
-            } else {
-                Style::default().fg(Color::White)
-            };
-            settings_text.push(Line::from(vec![
-                Span::styled(key_label, Style::default().fg(Color::Green)),
-                Span::styled(key_display, key_style),
-            ]));
+            let style_override = if sel == 4 && self.editing_enrichment_api_key { Some(val_editing) } else { None };
+            setting_line!(key_label, key_display, 4, "\u{2190} Enter to edit", style_override);
         }
 
-        // Recording section — silence auto-stop
-        settings_text.push(Line::from(""));
-        settings_text.push(Line::from(vec![Span::styled(
-            "RECORDING",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )]));
+        // ── RECORDING ───────────────────────────────────────────────
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::raw("  "), Span::styled("RECORDING", section_style)]));
 
-        // Silence Auto-Stop toggle (index 4)
         let silence_enabled = self.config.silence_auto_stop.enabled;
-        let silence_toggle_text = if silence_enabled {
-            "Enabled <- Press Enter to toggle"
-        } else {
-            "Disabled <- Press Enter to toggle"
-        };
-        let silence_toggle_style = if self.settings_selection == 5 {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        settings_text.push(Line::from(vec![
-            Span::styled("Silence Auto-Stop: ", Style::default().fg(Color::Green)),
-            Span::styled(silence_toggle_text, silence_toggle_style),
-        ]));
+        let silence_value = if silence_enabled { "Enabled" } else { "Disabled" };
+        setting_line!("Auto-Stop", silence_value, 5, "\u{2190} Enter to toggle", None::<Style>);
 
-        // Silence Timeout (index 5) — only interactive when enabled
         let timeout_secs = self.config.silence_auto_stop.timeout_seconds;
         let timeout_display = match timeout_secs {
             s if s < 60 => format!("{}s", s),
             s if s % 60 == 0 => format!("{}m", s / 60),
             s => format!("{}m {}s", s / 60, s % 60),
         };
-        let timeout_text = if silence_enabled {
-            format!("{} <- Press Enter to cycle", timeout_display)
-        } else {
-            format!("{} (enable auto-stop first)", timeout_display)
-        };
-        let timeout_style = if self.settings_selection == 6 {
-            if silence_enabled {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            }
-        } else {
-            if silence_enabled {
-                Style::default().fg(Color::White)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            }
-        };
-        settings_text.push(Line::from(vec![
-            Span::styled("Silence Timeout: ", Style::default().fg(Color::Green)),
-            Span::styled(timeout_text, timeout_style),
-        ]));
+        let timeout_style_override = if !silence_enabled { Some(val_disabled) } else { None };
+        let timeout_hint = if silence_enabled { "\u{2190} Enter to cycle" } else { "(enable auto-stop first)" };
+        setting_line!("Timeout", timeout_display, 6, timeout_hint, timeout_style_override);
 
-        // Diarization section
-        settings_text.push(Line::from(""));
-        settings_text.push(Line::from(vec![Span::styled(
-            "DIARIZATION",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )]));
+        // ── DIARIZATION ─────────────────────────────────────────────
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::raw("  "), Span::styled("DIARIZATION", section_style)]));
 
-        // Speaker Diarization toggle (index 6)
         let diarization_enabled = self.config.diarization.enabled;
-        let diarization_toggle_text = if diarization_enabled {
-            "Enabled <- Press Enter to toggle"
-        } else {
-            "Disabled <- Press Enter to toggle"
-        };
-        let diarization_toggle_style = if self.settings_selection == 7 {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        settings_text.push(Line::from(vec![
-            Span::styled("Speaker Diarization: ", Style::default().fg(Color::Green)),
-            Span::styled(diarization_toggle_text, diarization_toggle_style),
-        ]));
+        let diar_value = if diarization_enabled { "Enabled" } else { "Disabled" };
+        setting_line!("Speaker Diarization", diar_value, 7, "\u{2190} Enter to toggle", None::<Style>);
 
-        // Max Speakers (index 7) — only interactive when enabled
         let max_speakers = self.config.diarization.max_speakers;
-        let max_speakers_text = if diarization_enabled {
-            format!("{} <- Press Enter to cycle", max_speakers)
-        } else {
-            format!("{} (enable diarization first)", max_speakers)
-        };
-        let max_speakers_style = if self.settings_selection == 8 {
-            if diarization_enabled {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            }
-        } else if diarization_enabled {
-            Style::default().fg(Color::White)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        settings_text.push(Line::from(vec![
-            Span::styled("Max Speakers: ", Style::default().fg(Color::Green)),
-            Span::styled(max_speakers_text, max_speakers_style),
-        ]));
+        let speakers_style_override = if !diarization_enabled { Some(val_disabled) } else { None };
+        let speakers_hint = if diarization_enabled { "\u{2190} Enter to cycle" } else { "(enable diarization first)" };
+        setting_line!("Max Speakers", max_speakers, 8, speakers_hint, speakers_style_override);
 
-        // Voice mode section
-        settings_text.push(Line::from(""));
-        settings_text.push(Line::from(vec![Span::styled(
-            "VOICE MODE (Scriba Forever)",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )]));
+        // ── VOICE MODE ──────────────────────────────────────────────
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::raw("  "), Span::styled("VOICE MODE", section_style)]));
 
-        // Voice Mode toggle (index 9)
         let voice_enabled = self.voice_mode_active;
-        let voice_toggle_text = if voice_enabled {
-            "Active <- Press Enter to toggle"
-        } else {
-            "Off <- Press Enter to toggle"
-        };
-        let voice_toggle_style = if self.settings_selection == 9 {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        settings_text.push(Line::from(vec![
-            Span::styled("Voice Activation: ", Style::default().fg(Color::Green)),
-            Span::styled(voice_toggle_text, voice_toggle_style),
-        ]));
+        let voice_value = if voice_enabled { "Active" } else { "Off" };
+        setting_line!("Voice Activation", voice_value, 9, "\u{2190} Enter to toggle", None::<Style>);
 
-        // Voice Sensitivity (index 10)
         let sensitivity_label = match self.config.voice.vad_threshold {
             t if t <= 0.005 => "Very High (0.005)",
             t if t <= 0.01 => "High (0.01)",
             t if t <= 0.02 => "Medium (0.02)",
             _ => "Low (0.05)",
         };
-        let sensitivity_text = if voice_enabled {
-            format!("{} <- Press Enter to cycle", sensitivity_label)
-        } else {
-            format!("{} (enable voice mode first)", sensitivity_label)
-        };
-        let sensitivity_style = if self.settings_selection == 10 {
-            if voice_enabled {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            }
-        } else if voice_enabled {
-            Style::default().fg(Color::White)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        settings_text.push(Line::from(vec![
-            Span::styled("Voice Sensitivity: ", Style::default().fg(Color::Green)),
-            Span::styled(sensitivity_text, sensitivity_style),
-        ]));
+        let sens_style_override = if !voice_enabled { Some(val_disabled) } else { None };
+        let sens_hint = if voice_enabled { "\u{2190} Enter to cycle" } else { "(enable voice mode first)" };
+        setting_line!("Sensitivity", sensitivity_label, 10, sens_hint, sens_style_override);
 
-        settings_text.push(Line::from(""));
-        settings_text.push(Line::from(vec![Span::styled(
-            "↑↓ Navigate  ⏎ Enter  ⎋ Esc",
-            Style::default().fg(Color::Gray),
-        )]));
+        let body = Paragraph::new(lines).style(Style::default().fg(Color::White));
+        f.render_widget(body, chunks[1]);
 
-        let settings_paragraph = Paragraph::new(settings_text)
-            .style(Style::default().fg(Color::White))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Settings")
-                    .title_style(
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    )
-                    .border_style(Style::default().fg(Color::Cyan)),
-            )
-            .wrap(Wrap { trim: true });
+        // ── Footer ──────────────────────────────────────────────────
+        let sep2 = "\u{2500}".repeat(chunks[2].width as usize);
+        f.render_widget(
+            Paragraph::new(sep2).style(Style::default().fg(Color::Indexed(237))),
+            Rect { x: chunks[2].x, y: chunks[2].y, width: chunks[2].width, height: 1 },
+        );
 
-        f.render_widget(settings_paragraph, popup_area);
+        let footer_area = Rect { x: chunks[2].x, y: chunks[2].y + 1, width: chunks[2].width, height: 1 };
+        let version = env!("CARGO_PKG_VERSION");
+        let left_spans = vec![
+            Span::styled(" \u{25B8} ", Style::default().fg(ACCENT)),
+            Span::styled(format!("scriba \u{00B7} v{}", version), Style::default().fg(Color::DarkGray)),
+        ];
+        let right_spans = vec![
+            Span::styled("[", Style::default().fg(Color::DarkGray)),
+            Span::styled("\u{2191}\u{2193}", Style::default().fg(Color::White)),
+            Span::styled("] Navigate  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(Color::DarkGray)),
+            Span::styled("Enter", Style::default().fg(Color::White)),
+            Span::styled("] Change  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc", Style::default().fg(Color::White)),
+            Span::styled("] Back ", Style::default().fg(Color::DarkGray)),
+        ];
+        let left_w: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
+        let right_w: usize = right_spans.iter().map(|s| s.content.chars().count()).sum();
+        let gap = (footer_area.width as usize).saturating_sub(left_w + right_w);
+        let mut spans = left_spans;
+        spans.push(Span::raw(" ".repeat(gap)));
+        spans.extend(right_spans);
+        f.render_widget(Paragraph::new(Line::from(spans)), footer_area);
     }
 
     fn render_entities_view(&mut self, f: &mut Frame, area: ratatui::layout::Rect) {
         use ratatui::text::{Line, Span};
 
-        // Main layout: Header + Content + Footer
+        // Full-screen borderless layout: header + table + footer
         let main_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(5),  // Header (owl + summary + quip)
-                Constraint::Min(8),     // Entity table
-                Constraint::Length(3),  // Footer
+                Constraint::Length(2),  // Header
+                Constraint::Min(8),    // Entity table
+                Constraint::Length(2), // Footer
             ])
             .split(area);
 
-        // Animated owl header — fixed-width face + separate thought bubble
-        let (owl_face, owl_body, owl_feet, thought) = match self.owl_world_mood {
-            OwlWorldMood::Idle => {
-                let face = if self.owl_world_anim_frame % 30 < 3 { "(-,-)" } else { "(o,o)" };
-                (face, "{`\"'}", "-\"-\"-", "")
-            }
-            OwlWorldMood::Thinking => {
-                let frame = (self.owl_world_anim_frame / 3) % 8;
-                let face = if frame == 4 { "(-,-)" } else { "(o,o)" };
-                let bubble = match frame {
-                    0 => "  ?",
-                    1 => "  ~",
-                    2 => "  !",
-                    3 => " ~~",
-                    4 => "  ?",
-                    5 => "~~~",
-                    6 => "  !",
-                    _ => "...",
-                };
-                let beak = if frame % 2 == 1 { "{`~'}" } else { "{`\"'}" };
-                (face, beak, "-\"-\"-", bubble)
-            }
-            OwlWorldMood::Celebrating => {
-                let frame = (self.owl_world_anim_frame / 2) % 4;
-                let face = match frame {
-                    0 | 2 => "(^,^)",
-                    _ => "(^,^)",
-                };
-                (face, "{`\"'}", "-\"-\"-", "")
-            }
-        };
-
-        // Build owner summary from entities
-        let owner_entity = self.entities.iter().find(|e| {
-            e.context.as_deref().unwrap_or("").contains("Owner of this Scriba instance")
-        });
-        let owner_summary = if let Some(owner) = owner_entity {
-            let ctx = owner.context.as_deref().unwrap_or("");
-            let role_part = ctx.splitn(2, '.').nth(1).unwrap_or("").trim();
-            if role_part.is_empty() {
-                owner.canonical_name.clone()
-            } else {
-                format!("{} | {}", owner.canonical_name, role_part)
-            }
-        } else {
-            "No owner set".to_string()
-        };
-
-        let people_count = self.entities.iter().filter(|e| {
-            e.entity_type == "person" && !e.context.as_deref().unwrap_or("").contains("Owner of this Scriba instance")
-        }).count();
+        // ── Header ──────────────────────────────────────────────────
+        let people_count = self.entities.iter().filter(|e| e.entity_type == "person").count();
         let org_count = self.entities.iter().filter(|e| e.entity_type == "organization").count();
         let project_count = self.entities.iter().filter(|e| e.entity_type == "project").count();
 
-        let mut counts = Vec::new();
-        if people_count > 0 { counts.push(format!("{} people", people_count)); }
-        if org_count > 0 { counts.push(format!("{} orgs", org_count)); }
-        if project_count > 0 { counts.push(format!("{} projects", project_count)); }
-        let counts_str = if counts.is_empty() { String::new() } else { format!(" | {}", counts.join(", ")) };
+        let mut count_parts: Vec<String> = Vec::new();
+        if people_count > 0 { count_parts.push(format!("{} people", people_count)); }
+        if org_count > 0 { count_parts.push(format!("{} orgs", org_count)); }
+        if project_count > 0 { count_parts.push(format!("{} projects", project_count)); }
+        let counts_suffix = if count_parts.is_empty() {
+            String::new()
+        } else {
+            format!(" \u{00B7} {}", count_parts.join(" \u{00B7} "))
+        };
 
-        let header_lines = vec![
-            Line::from(vec![
-                Span::styled(
-                    format!("  {}  ", owl_face),
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    "SCRIBA'S WORLD",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!("  {}", thought),
-                    Style::default().fg(Color::White),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled(
-                    format!("  {}  ", owl_body),
-                    Style::default().fg(Color::Yellow),
-                ),
-                Span::styled(
-                    format!("{}{}", owner_summary, counts_str),
-                    Style::default().fg(Color::White),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled(
-                    format!("  {}  ", owl_feet),
-                    Style::default().fg(Color::Yellow),
-                ),
-                Span::styled(
-                    format!("\"{}\"", self.owl_quip),
-                    Style::default().fg(Color::Green),
-                ),
-            ]),
-        ];
+        let header_line = Line::from(vec![
+            Span::raw("  "),
+            Span::styled("Scriba's World", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(counts_suffix, Style::default().fg(Color::DarkGray)),
+        ]);
+        f.render_widget(Paragraph::new(header_line), Rect { x: main_chunks[0].x, y: main_chunks[0].y, width: main_chunks[0].width, height: 1 });
 
-        let header = Paragraph::new(header_lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .style(Style::default().fg(Color::Cyan))
-                    .border_type(ratatui::widgets::BorderType::Double),
-            );
-        f.render_widget(header, main_chunks[0]);
+        let sep = "\u{2500}".repeat(main_chunks[0].width as usize);
+        f.render_widget(
+            Paragraph::new(sep).style(Style::default().fg(Color::Indexed(237))),
+            Rect { x: main_chunks[0].x, y: main_chunks[0].y + 1, width: main_chunks[0].width, height: 1 },
+        );
 
-        // Entity table
+        // ── Entity table ────────────────────────────────────────────
         let header_cells = ["ID", "Type", "Name", "Aliases", "Context", "Mentions"]
             .iter()
             .map(|h| {
@@ -4120,48 +3649,102 @@ impl Dashboard {
             ],
         )
         .header(header_row)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .style(Style::default().fg(Color::Cyan))
-                .title(format!("Entities ({} total)", self.entities.len())),
-        )
+        .block(Block::default())
         .highlight_style(
             Style::default()
                 .fg(Color::Black)
-                .bg(Color::Cyan)
+                .bg(ACCENT)
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol("▶ ");
+        .highlight_symbol("\u{25B6} ");
 
         f.render_stateful_widget(table, main_chunks[1], &mut self.entity_table_state);
 
-        // Footer (changes based on entity mode)
-        let footer_text = match self.entity_mode {
-            EntityMode::Browse => "↑↓: Navigate | Enter: Details | A: Add | E: Edit | D: Delete | M: Merge | R: Refresh | Esc: Back".to_string(),
-            EntityMode::Adding => "Tab/↑↓: Switch Field | Type chars | Space: Cycle Type | Enter: Save | Esc: Cancel".to_string(),
-            EntityMode::Editing => "Tab/↑↓: Switch Field | Type chars | Space: Cycle Type | Esc: Save & Close".to_string(),
-            EntityMode::DeleteConfirm => "Y: Confirm Delete | N/Esc: Cancel".to_string(),
-            EntityMode::MergeSelectTarget => {
-                let src_name = self.merge_source_entity.as_ref()
-                    .map(|e| e.canonical_name.as_str())
-                    .unwrap_or("?");
-                format!("↑↓: Select target | Enter: Confirm | Esc: Cancel  (merging '{}')", src_name)
-            }
-            EntityMode::MergeConfirm => "Y: Confirm Merge | N/Esc: Cancel".to_string(),
-        };
-        let footer = Paragraph::new(footer_text)
-            .style(Style::default().fg(Color::White))
-            .alignment(Alignment::Center)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .style(Style::default().fg(Color::Blue))
-                    .title("Controls"),
-            );
-        f.render_widget(footer, main_chunks[2]);
+        // ── Footer ──────────────────────────────────────────────────
+        let sep2 = "\u{2500}".repeat(main_chunks[2].width as usize);
+        f.render_widget(
+            Paragraph::new(sep2).style(Style::default().fg(Color::Indexed(237))),
+            Rect { x: main_chunks[2].x, y: main_chunks[2].y, width: main_chunks[2].width, height: 1 },
+        );
 
-        // Popups
+        let footer_area = Rect { x: main_chunks[2].x, y: main_chunks[2].y + 1, width: main_chunks[2].width, height: 1 };
+        let version = env!("CARGO_PKG_VERSION");
+        let entity_count = self.entities.len();
+        let left_spans = vec![
+            Span::styled(" \u{25B8} ", Style::default().fg(ACCENT)),
+            Span::styled(
+                format!("scriba \u{00B7} v{} \u{00B7} {} entities", version, entity_count),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ];
+
+        let right_spans: Vec<Span> = match self.entity_mode {
+            EntityMode::Browse => vec![
+                Span::styled("[", Style::default().fg(Color::DarkGray)),
+                Span::styled("A", Style::default().fg(Color::White)),
+                Span::styled("] Add  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[", Style::default().fg(Color::DarkGray)),
+                Span::styled("E", Style::default().fg(Color::White)),
+                Span::styled("] Edit  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[", Style::default().fg(Color::DarkGray)),
+                Span::styled("D", Style::default().fg(Color::White)),
+                Span::styled("] Del  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[", Style::default().fg(Color::DarkGray)),
+                Span::styled("M", Style::default().fg(Color::White)),
+                Span::styled("] Merge  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[", Style::default().fg(Color::DarkGray)),
+                Span::styled("R", Style::default().fg(Color::White)),
+                Span::styled("] Refresh  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[", Style::default().fg(Color::DarkGray)),
+                Span::styled("Esc", Style::default().fg(Color::White)),
+                Span::styled("] Back ", Style::default().fg(Color::DarkGray)),
+            ],
+            EntityMode::MergeSelectTarget => vec![
+                Span::styled("[", Style::default().fg(Color::DarkGray)),
+                Span::styled("Enter", Style::default().fg(Color::White)),
+                Span::styled("] Confirm  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[", Style::default().fg(Color::DarkGray)),
+                Span::styled("Esc", Style::default().fg(Color::White)),
+                Span::styled("] Cancel ", Style::default().fg(Color::DarkGray)),
+            ],
+            EntityMode::DeleteConfirm => vec![
+                Span::styled("[", Style::default().fg(Color::DarkGray)),
+                Span::styled("Y", Style::default().fg(Color::White)),
+                Span::styled("] Confirm  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[", Style::default().fg(Color::DarkGray)),
+                Span::styled("N", Style::default().fg(Color::White)),
+                Span::styled("] Cancel ", Style::default().fg(Color::DarkGray)),
+            ],
+            EntityMode::MergeConfirm => vec![
+                Span::styled("[", Style::default().fg(Color::DarkGray)),
+                Span::styled("Y", Style::default().fg(Color::White)),
+                Span::styled("] Confirm  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[", Style::default().fg(Color::DarkGray)),
+                Span::styled("N", Style::default().fg(Color::White)),
+                Span::styled("] Cancel ", Style::default().fg(Color::DarkGray)),
+            ],
+            EntityMode::Adding | EntityMode::Editing => vec![
+                Span::styled("[", Style::default().fg(Color::DarkGray)),
+                Span::styled("Tab", Style::default().fg(Color::White)),
+                Span::styled("] Next field  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[", Style::default().fg(Color::DarkGray)),
+                Span::styled("Space", Style::default().fg(Color::White)),
+                Span::styled("] Cycle type  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[", Style::default().fg(Color::DarkGray)),
+                Span::styled("Esc", Style::default().fg(Color::White)),
+                Span::styled("] Done ", Style::default().fg(Color::DarkGray)),
+            ],
+        };
+
+        let left_w: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
+        let right_w: usize = right_spans.iter().map(|s| s.content.chars().count()).sum();
+        let gap = (footer_area.width as usize).saturating_sub(left_w + right_w);
+        let mut spans = left_spans;
+        spans.push(Span::raw(" ".repeat(gap)));
+        spans.extend(right_spans);
+        f.render_widget(Paragraph::new(Line::from(spans)), footer_area);
+
+        // Popups (overlays stay unchanged)
         if self.show_entity_detail {
             self.render_entity_detail_popup(f, area);
         }
@@ -4229,7 +3812,7 @@ impl Dashboard {
                     Span::styled(
                         &entity.canonical_name,
                         Style::default()
-                            .fg(Color::Cyan)
+                            .fg(ACCENT)
                             .add_modifier(Modifier::BOLD),
                     ),
                 ]),
@@ -4288,10 +3871,10 @@ impl Dashboard {
                         .title(format!("Entity Details - {}", entity.canonical_name))
                         .title_style(
                             Style::default()
-                                .fg(Color::Cyan)
+                                .fg(ACCENT)
                                 .add_modifier(Modifier::BOLD),
                         )
-                        .border_style(Style::default().fg(Color::Cyan)),
+                        .border_style(Style::default().fg(ACCENT)),
                 )
                 .wrap(Wrap { trim: true });
 
@@ -4341,7 +3924,7 @@ impl Dashboard {
 
         let type_display: Vec<Span> = ENTITY_TYPES.iter().map(|t| {
             if *t == self.entity_add_type {
-                Span::styled(format!(" [{}] ", t), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+                Span::styled(format!(" [{}] ", t), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
             } else {
                 Span::styled(format!("  {}  ", t), Style::default().fg(Color::Gray))
             }
@@ -4430,7 +4013,7 @@ impl Dashboard {
 
         let type_display: Vec<Span> = ENTITY_TYPES.iter().map(|t| {
             if *t == self.entity_edit_type {
-                Span::styled(format!(" [{}] ", t), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+                Span::styled(format!(" [{}] ", t), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
             } else {
                 Span::styled(format!("  {}  ", t), Style::default().fg(Color::Gray))
             }
@@ -4557,7 +4140,7 @@ impl Dashboard {
                 Span::styled("Merge ", Style::default().fg(Color::White)),
                 Span::styled(source_name, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
                 Span::styled(" INTO ", Style::default().fg(Color::White)),
-                Span::styled(target_name, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(target_name, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
                 Span::styled("?", Style::default().fg(Color::White)),
             ]),
             Line::from(""),
@@ -4621,70 +4204,46 @@ impl Dashboard {
     }
 
     fn render_transcript_popup(&mut self, f: &mut Frame, area: ratatui::layout::Rect) {
-        let popup_area = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Percentage(3),
-                Constraint::Percentage(94),
-                Constraint::Percentage(3),
-            ])
-            .split(area)[1];
-
-        let popup_area = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(2),
-                Constraint::Percentage(96),
-                Constraint::Percentage(2),
-            ])
-            .split(popup_area)[1];
-
-        f.render_widget(Clear, popup_area);
-
-        // Check if we have enrichment data
-        let has_enrichment = self.transcript_summary.is_some()
-            || self.transcript_topics.is_some()
-            || self.transcript_entities.is_some();
-
-        // Dynamic chat panel height for transcript view
+        // Dynamic chat panel height
         let has_chat_content = !self.chat.messages.is_empty()
             || !self.chat.pending_blocks.is_empty()
             || self.chat.is_generating;
 
-        let chat_panel_h: u16 = if has_chat_content {
-            let available = popup_area.height;
-            (available * 45 / 100).max(8)
+        let chat_h: u16 = if has_chat_content {
+            (area.height * 45 / 100).max(8)
         } else {
             (self.chat.suggestions.len() as u16 + 4).max(5).min(8)
         };
 
-        // Build constraints dynamically
-        let mut constraints: Vec<Constraint> = Vec::new();
-
-        if has_enrichment {
-            constraints.push(Constraint::Length(self.calculate_enrichment_height()));
-        }
-        constraints.push(Constraint::Min(5)); // Transcript (flexible)
-        constraints.push(Constraint::Length(chat_panel_h)); // Unified chat panel
-
-        let content_chunks = Layout::default()
+        let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints(constraints)
-            .split(popup_area);
+            .constraints([
+                Constraint::Length(2),      // header
+                Constraint::Min(5),         // content (enrichment + transcript preview)
+                Constraint::Length(2),      // blank + separator
+                Constraint::Length(chat_h), // chat panel
+                Constraint::Length(2),      // footer
+            ])
+            .split(area);
 
-        let mut chunk_idx = 0;
+        // ── Header ──────────────────────────────────────────────────────
+        self.render_transcript_header(f, chunks[0]);
 
-        if has_enrichment {
-            self.render_enrichment_section(f, content_chunks[chunk_idx]);
-            chunk_idx += 1;
-        }
+        // ── Content (enrichment + transcript preview) ───────────────────
+        self.render_transcript_body(f, chunks[1]);
 
-        // Transcript
-        self.render_transcript_content(f, content_chunks[chunk_idx]);
-        chunk_idx += 1;
+        // ── Separator (blank line + ─) ───────────────────────────────────
+        let sep = "\u{2500}".repeat(area.width as usize);
+        f.render_widget(
+            Paragraph::new(sep).style(Style::default().fg(Color::Indexed(237))),
+            Rect { x: chunks[2].x, y: chunks[2].y + 1, width: chunks[2].width, height: 1 },
+        );
 
-        // Unified chat panel
-        self.chat.render(f, content_chunks[chunk_idx]);
+        // ── Chat panel ──────────────────────────────────────────────────
+        self.chat.render(f, chunks[3]);
+
+        // ── Footer ──────────────────────────────────────────────────────
+        self.render_transcript_footer(f, chunks[4]);
 
         // Notification overlay (e.g. "Copied to clipboard")
         if let Some((ref msg, _)) = self.notification_message {
@@ -4694,10 +4253,10 @@ impl Dashboard {
             } else {
                 Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
             };
-            let notif_area = ratatui::layout::Rect {
-                x: popup_area.x,
-                y: popup_area.y + popup_area.height.saturating_sub(1),
-                width: popup_area.width,
+            let notif_area = Rect {
+                x: area.x,
+                y: area.y + area.height.saturating_sub(1),
+                width: area.width,
                 height: 1,
             };
             let para = Paragraph::new(msg.as_str())
@@ -4707,146 +4266,280 @@ impl Dashboard {
         }
     }
 
-    fn calculate_enrichment_height(&self) -> u16 {
-        let mut height: u16 = 2; // Border
+    fn render_transcript_header(&self, f: &mut Frame, area: Rect) {
+        // Row 0: "  Name · Xm · Mar 8, 12:30"
+        let recording = self.current_transcript_recording.as_ref();
+        let name = recording
+            .and_then(|r| r.display_name.as_deref())
+            .or(recording.map(|r| r.directory_name.as_str()))
+            .unwrap_or("Recording");
+        let dur_secs = recording.and_then(|r| r.duration_seconds).unwrap_or(0);
+        let dur_str = if dur_secs >= 3600 {
+            format!("{}h {}m", dur_secs / 3600, (dur_secs % 3600) / 60)
+        } else {
+            format!("{}m", dur_secs / 60)
+        };
+        let date_str = recording
+            .map(|r| r.created_at.format("%b %-d, %H:%M").to_string())
+            .unwrap_or_default();
 
-        if self.transcript_summary.is_some() {
-            height += 3; // Summary label + content + spacing
-        }
-        if self.transcript_topics.is_some() {
-            height += 2; // Topics line + spacing
-        }
-        if self.transcript_entities.is_some() {
-            height += 2; // Entities line + spacing
-        }
-        if self.transcript_key_points.as_ref().map_or(false, |kp| !kp.is_empty()) {
-            height += 3; // Key points label + first point + spacing
-        }
+        let header_line = Line::from(vec![
+            Span::raw("  "),
+            Span::styled(name, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" \u{00B7} {} \u{00B7} {}", dur_str, date_str), Style::default().fg(Color::DarkGray)),
+        ]);
+        f.render_widget(Paragraph::new(header_line), Rect { x: area.x, y: area.y, width: area.width, height: 1 });
 
-        height.min(12) // Cap at reasonable size
+        // Row 1: separator
+        let sep = "\u{2500}".repeat(area.width as usize);
+        f.render_widget(
+            Paragraph::new(sep).style(Style::default().fg(Color::Indexed(237))),
+            Rect { x: area.x, y: area.y + 1, width: area.width, height: 1 },
+        );
     }
 
-    fn render_enrichment_section(&self, f: &mut Frame, area: ratatui::layout::Rect) {
+    /// Build combined enrichment + transcript lines and render as a single scrollable Paragraph.
+    fn render_transcript_body(&self, f: &mut Frame, area: Rect) {
+        let content_width = area.width.saturating_sub(4) as usize; // 2 padding each side
         let mut lines: Vec<Line> = Vec::new();
 
-        // Summary
-        if let Some(summary) = &self.transcript_summary {
-            lines.push(Line::from(vec![
-                Span::styled("Summary: ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-                Span::styled(summary, Style::default().fg(Color::White)),
-            ]));
+        // ── Enrichment metadata (inline) ────────────────────────────────
+        let has_enrichment = self.transcript_summary.is_some()
+            || self.transcript_topics.is_some()
+            || self.transcript_entities.is_some();
+
+        if has_enrichment {
             lines.push(Line::from(""));
-        }
 
-        // Topics
-        if let Some(topics) = &self.transcript_topics {
-            if !topics.is_empty() {
-                let topic_spans: Vec<Span> = std::iter::once(
-                    Span::styled("Topics: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
-                )
-                .chain(topics.iter().enumerate().flat_map(|(i, topic)| {
-                    let mut spans = vec![Span::styled(
-                        format!("[{}]", topic),
-                        Style::default().fg(Color::Cyan),
-                    )];
-                    if i < topics.len() - 1 {
-                        spans.push(Span::raw(" "));
-                    }
-                    spans
-                }))
-                .collect();
-                lines.push(Line::from(topic_spans));
-            }
-        }
-
-        // Entities
-        if let Some(entities) = &self.transcript_entities {
-            if !entities.is_empty() {
-                let entity_spans: Vec<Span> = std::iter::once(
-                    Span::styled("Entities: ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))
-                )
-                .chain(entities.iter().enumerate().flat_map(|(i, (name, etype))| {
-                    let color = match etype.as_str() {
-                        "person" => Color::Green,
-                        "organization" => Color::Blue,
-                        _ => Color::Gray,
-                    };
-                    let mut spans = vec![Span::styled(name, Style::default().fg(color))];
-                    if i < entities.len() - 1 {
-                        spans.push(Span::raw(", "));
-                    }
-                    spans
-                }))
-                .collect();
-                lines.push(Line::from(entity_spans));
-            }
-        }
-
-        // Key points (just first one to save space)
-        if let Some(key_points) = &self.transcript_key_points {
-            if !key_points.is_empty() {
-                lines.push(Line::from(""));
+            // Summary
+            if let Some(summary) = &self.transcript_summary {
                 lines.push(Line::from(vec![
-                    Span::styled("Key: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                    Span::styled(&key_points[0], Style::default().fg(Color::White)),
+                    Span::raw("  "),
+                    Span::styled("Summary", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+                ]));
+                // Wrap summary text
+                let wrapped = textwrap::wrap(summary, content_width);
+                for wl in &wrapped {
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(wl.to_string(), Style::default().fg(Color::Indexed(249))),
+                    ]));
+                }
+                lines.push(Line::from(""));
+            }
+
+            // Topics
+            if let Some(topics) = &self.transcript_topics {
+                if !topics.is_empty() {
+                    let joined = topics.join(" \u{00B7} ");
+                    Self::push_labeled_wrap(&mut lines, "Topics  ", &joined, content_width);
+                }
+            }
+
+            // People / Entities
+            if let Some(entities) = &self.transcript_entities {
+                if !entities.is_empty() {
+                    let people: Vec<&str> = entities.iter()
+                        .filter(|(_, t)| t == "person")
+                        .map(|(n, _)| n.as_str())
+                        .collect();
+                    let orgs: Vec<&str> = entities.iter()
+                        .filter(|(_, t)| t == "organization")
+                        .map(|(n, _)| n.as_str())
+                        .collect();
+                    let others: Vec<&str> = entities.iter()
+                        .filter(|(_, t)| t != "person" && t != "organization")
+                        .map(|(n, _)| n.as_str())
+                        .collect();
+
+                    if !people.is_empty() {
+                        Self::push_labeled_wrap(&mut lines, "People  ", &people.join(" \u{00B7} "), content_width);
+                    }
+                    if !orgs.is_empty() {
+                        Self::push_labeled_wrap(&mut lines, "Orgs    ", &orgs.join(" \u{00B7} "), content_width);
+                    }
+                    if !others.is_empty() {
+                        Self::push_labeled_wrap(&mut lines, "Entities ", &others.join(" \u{00B7} "), content_width);
+                    }
+                }
+            }
+
+            // Key takeaway (first point only)
+            if let Some(key_points) = &self.transcript_key_points {
+                if !key_points.is_empty() {
+                    lines.push(Line::from(""));
+                    let wrapped = textwrap::wrap(&key_points[0], content_width);
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled("Key takeaway", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+                    ]));
+                    for wl in &wrapped {
+                        lines.push(Line::from(vec![
+                            Span::raw("  "),
+                            Span::styled(wl.to_string(), Style::default().fg(Color::Indexed(249))),
+                        ]));
+                    }
+                }
+            }
+
+            // Separator between enrichment and transcript
+            lines.push(Line::from(""));
+            let sep = "\u{2500}".repeat(area.width as usize);
+            lines.push(Line::from(Span::styled(sep, Style::default().fg(Color::Indexed(237)))));
+        }
+
+        // ── Transcript preview (compact, max ~15 lines, faded tail) ────
+        lines.push(Line::from(""));
+        let max_preview = 15usize;
+        let mut preview_lines: Vec<Line> = Vec::new();
+        let transcript_lines_total = self.transcript_content.lines().count();
+        let mut source_lines_used = 0usize;
+        for text_line in self.transcript_content.lines() {
+            if preview_lines.len() >= max_preview {
+                break;
+            }
+            source_lines_used += 1;
+            if text_line.is_empty() {
+                preview_lines.push(Line::from(""));
+            } else {
+                let wrapped = textwrap::wrap(text_line, content_width);
+                for wl in &wrapped {
+                    if preview_lines.len() >= max_preview {
+                        break;
+                    }
+                    preview_lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(wl.to_string(), Style::default().fg(Color::White)),
+                    ]));
+                }
+            }
+        }
+
+        // Truncated if we didn't consume all source lines, OR if wrapping
+        // filled the preview before we finished even the lines we did visit.
+        let remaining_source = transcript_lines_total.saturating_sub(source_lines_used);
+        let is_truncated = remaining_source > 0 || preview_lines.len() >= max_preview;
+
+        // Fade out the last few lines + hint when transcript is truncated
+        if is_truncated {
+            let fade_count = 3usize;
+            let fade_colors: [Color; 3] = [
+                Color::Indexed(249),
+                Color::Indexed(245),
+                Color::Indexed(240),
+            ];
+            let total_preview = preview_lines.len();
+            if total_preview > fade_count {
+                for (i, color) in fade_colors.iter().enumerate() {
+                    let idx = total_preview - fade_count + i;
+                    if idx < total_preview {
+                        let text: String = preview_lines[idx].spans.iter().map(|s| s.content.to_string()).collect();
+                        preview_lines[idx] = Line::from(Span::styled(text, Style::default().fg(*color)));
+                    }
+                }
+            }
+        }
+
+        let shown_count = preview_lines.len();
+        lines.extend(preview_lines);
+
+        // Hint line for truncated transcripts
+        if is_truncated {
+            lines.push(Line::from(""));
+            // Count total wrapped display lines for accurate "X more lines"
+            let total_display_lines: usize = self.transcript_content.lines().map(|l| {
+                if l.is_empty() { 1 } else { textwrap::wrap(l, content_width).len() }
+            }).sum();
+            let more = total_display_lines.saturating_sub(shown_count);
+
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!("{} more lines not shown \u{00B7} ", more),
+                    Style::default().fg(Color::Indexed(240)),
+                ),
+                Span::styled("[", Style::default().fg(Color::Indexed(240))),
+                Span::styled("Ctrl+Y", Style::default().fg(Color::Indexed(249))),
+                Span::styled("] copy full transcript", Style::default().fg(Color::Indexed(240))),
+            ]));
+        }
+
+        let para = Paragraph::new(lines);
+        f.render_widget(para, area);
+    }
+
+    fn render_transcript_footer(&self, f: &mut Frame, area: Rect) {
+        // Separator
+        let sep = "\u{2500}".repeat(area.width as usize);
+        f.render_widget(
+            Paragraph::new(sep).style(Style::default().fg(Color::Indexed(237))),
+            Rect { x: area.x, y: area.y, width: area.width, height: 1 },
+        );
+
+        let footer_area = if area.height > 1 {
+            Rect { x: area.x, y: area.y + 1, width: area.width, height: area.height - 1 }
+        } else {
+            area
+        };
+
+        // Left: ▸ scriba · vX.Y.Z
+        let version = env!("CARGO_PKG_VERSION");
+        let left_spans = vec![
+            Span::styled(" \u{25B8} ", Style::default().fg(ACCENT)),
+            Span::styled(format!("scriba \u{00B7} v{}", version), Style::default().fg(Color::DarkGray)),
+        ];
+
+        // Right: [Ctrl+Y] Copy  [Ctrl+T] Re-transcribe  [Esc] Back
+        let right_spans = vec![
+            Span::styled("[", Style::default().fg(Color::DarkGray)),
+            Span::styled("Ctrl+Y", Style::default().fg(Color::White)),
+            Span::styled("] Copy  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(Color::DarkGray)),
+            Span::styled("Ctrl+T", Style::default().fg(Color::White)),
+            Span::styled("] Re-transcribe  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc", Style::default().fg(Color::White)),
+            Span::styled("] Back ", Style::default().fg(Color::DarkGray)),
+        ];
+
+        let left_width: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
+        let right_width: usize = right_spans.iter().map(|s| s.content.chars().count()).sum();
+        let gap = (footer_area.width as usize).saturating_sub(left_width + right_width);
+
+        let mut spans = left_spans;
+        spans.push(Span::raw(" ".repeat(gap)));
+        spans.extend(right_spans);
+
+        f.render_widget(Paragraph::new(Line::from(spans)), footer_area);
+    }
+
+    /// Push a "Label  value text..." line that wraps, with continuation lines indented to align.
+    fn push_labeled_wrap(lines: &mut Vec<Line<'_>>, label: &str, value: &str, max_width: usize) {
+        let prefix_len = 2 + label.len(); // "  " + label
+        let value_width = max_width.saturating_sub(prefix_len);
+        if value_width == 0 {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(label.to_string(), Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+                Span::styled(value.to_string(), Style::default().fg(Color::Indexed(249))),
+            ]));
+            return;
+        }
+        let wrapped = textwrap::wrap(value, value_width);
+        for (i, wl) in wrapped.iter().enumerate() {
+            if i == 0 {
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(label.to_string(), Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+                    Span::styled(wl.to_string(), Style::default().fg(Color::Indexed(249))),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::raw(" ".repeat(prefix_len)),
+                    Span::styled(wl.to_string(), Style::default().fg(Color::Indexed(249))),
                 ]));
             }
         }
-
-        let enrichment = Paragraph::new(lines)
-            .style(Style::default().fg(Color::White))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Green))
-                    .title("Knowledge Extract")
-                    .title_style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-            )
-            .wrap(Wrap { trim: true });
-
-        f.render_widget(enrichment, area);
-    }
-
-    fn render_transcript_content(&self, f: &mut Frame, area: ratatui::layout::Rect) {
-        // Calculate available height and width for content (subtract borders)
-        let content_height = area.height.saturating_sub(2) as usize;
-        let content_width = area.width.saturating_sub(4) as usize;
-
-        // Handle text wrapping for very long lines
-        let wrapped_lines = self.wrap_text_to_lines(&self.transcript_content, content_width);
-        let total_lines = wrapped_lines.len();
-
-        // Create scrollable content
-        let (visible_content, scroll_info) = if total_lines > content_height {
-            let max_scroll = total_lines.saturating_sub(content_height);
-            let actual_offset = std::cmp::min(self.transcript_scroll_offset, max_scroll);
-            let end = std::cmp::min(actual_offset + content_height, total_lines);
-
-            let visible_lines = wrapped_lines[actual_offset..end].join("\n");
-            let scroll_info = format!(
-                "Transcript [{}/{}] - up/down: scroll, C: copy, T: re-transcribe, ESC: close",
-                actual_offset + 1,
-                total_lines
-            );
-            (visible_lines, scroll_info)
-        } else {
-            (
-                self.transcript_content.clone(),
-                "Transcript - C: copy, T: re-transcribe, ESC: close".to_string(),
-            )
-        };
-
-        let para = Paragraph::new(visible_content)
-            .style(Style::default().fg(Color::White))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .style(Style::default().fg(Color::Cyan))
-                    .title(scroll_info),
-            )
-            .scroll((0, 0));
-
-        f.render_widget(para, area);
     }
 
     fn render_delete_confirmation_popup(&self, f: &mut Frame, area: ratatui::layout::Rect) {
@@ -4932,7 +4625,7 @@ impl Dashboard {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .style(Style::default().fg(Color::Cyan))
+                    .style(Style::default().fg(ACCENT))
                     .title("Search Recordings"),
             );
 
@@ -5056,20 +4749,6 @@ impl Dashboard {
         });
 
         Ok(())
-    }
-
-    fn format_duration(&self, seconds: i64) -> String {
-        let hours = seconds / 3600;
-        let minutes = (seconds % 3600) / 60;
-        let secs = seconds % 60;
-
-        if hours > 0 {
-            format!("{}h {}m", hours, minutes)
-        } else if minutes > 0 {
-            format!("{}m {}s", minutes, secs)
-        } else {
-            format!("{}s", secs)
-        }
     }
 
     async fn create_stereo_temp_file(
@@ -5563,10 +5242,10 @@ impl Dashboard {
                     .title(title)
                     .title_style(
                         Style::default()
-                            .fg(Color::Cyan)
+                            .fg(ACCENT)
                             .add_modifier(Modifier::BOLD),
                     )
-                    .border_style(Style::default().fg(Color::Cyan)),
+                    .border_style(Style::default().fg(ACCENT)),
             )
             .wrap(Wrap { trim: true });
 
@@ -5638,24 +5317,97 @@ impl Dashboard {
         }
     }
 
+    fn generate_greeting(&mut self) {
+        use crate::tui::chat::HomeRecording;
+
+        // Owner first name
+        let first_name = self.owner_name.split_whitespace().next().unwrap_or("").to_string();
+
+        // Count today's recordings and total duration
+        let today = chrono::Local::now().date_naive();
+        let today_recordings: Vec<&Recording> = self.recordings.iter().filter(|r| {
+            r.created_at.with_timezone(&chrono::Local).date_naive() == today
+        }).collect();
+        let today_count = today_recordings.len();
+
+        // Greeting text
+        self.greeting_text = if first_name.is_empty() {
+            "Welcome back.".to_string()
+        } else {
+            format!("Welcome back, {}.", first_name)
+        };
+
+        // Subtitle
+        self.greeting_subtitle = if today_count == 0 {
+            "No recordings today yet.".to_string()
+        } else if today_count == 1 {
+            "You had 1 recording today.".to_string()
+        } else {
+            format!("You had {} recordings today.", today_count)
+        };
+
+        // Build home recordings (most recent first, cap at 5)
+        let mut home_recs: Vec<HomeRecording> = today_recordings.iter().take(5).map(|r| {
+            let name = r.display_name.as_ref()
+                .unwrap_or(&r.directory_name)
+                .clone();
+            let duration_mins = r.duration_seconds.unwrap_or(0) / 60;
+            let summary_line = r.summary.as_ref().and_then(|s| {
+                let first = s.split(&['.', '!', '?'][..]).next().unwrap_or("").trim();
+                if first.is_empty() { None } else { Some(format!("{}.", first)) }
+            });
+            let recording_id = r.id.unwrap_or(0);
+            HomeRecording { recording_id, name, duration_mins, summary_line }
+        }).collect();
+        // If no duration info, show at least 1m
+        for rec in &mut home_recs {
+            if rec.duration_mins == 0 {
+                rec.duration_mins = 1;
+            }
+        }
+
+        // Copy into chat state
+        self.chat.greeting_text = self.greeting_text.clone();
+        self.chat.greeting_subtitle = self.greeting_subtitle.clone();
+        self.chat.home_recordings = home_recs;
+        self.chat.selected_action = 0;
+
+        self.chat.placeholder = "Ask anything...".to_string();
+    }
+
     fn init_global_chat(&mut self) {
         // Load world context for owner name
         let world = WorldContext::load().ok()
             .and_then(|wc| WorldData::from_json(&wc.content).ok())
             .unwrap_or_default();
 
-        let owner_name = if world.owner.name.is_empty() {
-            "User".to_string()
+        self.owner_name = if world.owner.name.is_empty() {
+            // Fall back to system username, capitalize first letter
+            let sys_user = std::env::var("USER").unwrap_or_default();
+            if sys_user.is_empty() {
+                String::new()
+            } else {
+                let mut chars = sys_user.chars();
+                match chars.next() {
+                    Some(c) => c.to_uppercase().to_string() + chars.as_str(),
+                    None => String::new(),
+                }
+            }
         } else {
             world.owner.name.clone()
         };
 
         // All providers use agent prompt (tools handle data fetching)
-        self.chat.system_prompt = chat_prompts::build_agent_global_prompt(&owner_name);
+        self.chat.system_prompt = chat_prompts::build_agent_global_prompt(&self.owner_name);
 
         self.chat.context = ChatContext::Global;
         self.chat.suggestions = self.generate_suggestions();
         self.chat.show_suggestions = self.chat.messages.is_empty();
+        self.chat.show_home_screen = self.chat.messages.is_empty();
+        self.chat.borderless = true;
+        self.chat.focus = ChatFocus::ChatInput;
+
+        self.generate_greeting();
     }
 
     fn init_recording_chat(&mut self, recording: &Recording) {
@@ -5700,6 +5452,8 @@ impl Dashboard {
         self.current_transcript_recording = Some(recording.clone());
         self.chat.suggestions = self.generate_suggestions();
         self.chat.show_suggestions = true;
+        self.chat.borderless = true;
+        self.chat.show_home_screen = false;
     }
 
     fn restore_global_chat(&mut self) {
@@ -5713,7 +5467,15 @@ impl Dashboard {
         self.current_transcript_recording = None;
         self.chat.suggestions = self.generate_suggestions();
         self.chat.show_suggestions = self.chat.messages.is_empty();
-        self.chat.focus = ChatFocus::Table;
+        self.chat.show_home_screen = self.chat.messages.is_empty();
+        // Restore home-screen chat state when returning to Main
+        if self.current_view == DashboardView::Main {
+            self.chat.borderless = true;
+            self.chat.focus = ChatFocus::ChatInput;
+        } else {
+            self.chat.borderless = false;
+            self.chat.focus = ChatFocus::Table;
+        }
     }
 
     fn send_chat_message(&mut self) {
@@ -5732,6 +5494,7 @@ impl Dashboard {
             let msg = self.chat.input_buffer.clone();
             self.chat.input_buffer.clear();
             self.chat.show_suggestions = false;
+            self.chat.show_home_screen = false;
             msg
         } else {
             return;
@@ -5766,21 +5529,85 @@ impl Dashboard {
         }));
     }
 
+    /// Execute the selected action from the home screen quick-action menu.
+    fn execute_home_action(&mut self) {
+        let idx = self.chat.selected_action.min(
+            self.chat.home_recordings.len().saturating_sub(1),
+        );
+        let rec = self.chat.home_recordings[idx].clone();
+        self.chat.action_menu_open = false;
+
+        match self.chat.action_menu_selection {
+            0 => {
+                // View transcript — find the recording and open transcript popup
+                if let Some(recording) = self.recordings.iter()
+                    .find(|r| r.id == Some(rec.recording_id))
+                    .cloned()
+                {
+                    if recording.has_transcript {
+                        if let Ok(content) = self.load_transcript_content(&recording) {
+                            self.transcript_content = content;
+                            self.show_transcript = true;
+                            self.load_enrichment_data(&recording);
+                            self.init_recording_chat(&recording);
+                        }
+                    }
+                }
+            }
+            1 | 2 => {
+                // Fresh chat for this recording
+                self.chat.messages.clear();
+                self.chat.pending_blocks.clear();
+                self.chat.current_status = None;
+                self.chat.scroll_offset = 0;
+                self.chat.auto_scroll = true;
+                self.chat.invalidate_cache();
+                self.chat.show_home_screen = false;
+                self.chat.show_suggestions = false;
+                self.global_chat_messages.clear();
+
+                if self.chat.action_menu_selection == 1 {
+                    // Summarize — send immediately
+                    self.chat.input_buffer = format!("Summarize my {} recording (recording id={}).", rec.name, rec.recording_id);
+                    self.send_chat_message();
+                } else {
+                    // Ask about it — fill input, let user edit
+                    self.chat.input_buffer = format!("What happened in my {}? (recording id={})", rec.name, rec.recording_id);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn handle_chat_key(&mut self, key_code: KeyCode) -> bool {
         match key_code {
             KeyCode::Tab => {
-                // Toggle focus
-                self.chat.focus = match self.chat.focus {
-                    ChatFocus::Table => ChatFocus::ChatInput,
-                    ChatFocus::ChatInput => ChatFocus::Table,
-                };
+                if self.current_view == DashboardView::Main {
+                    // Main → Browse
+                    self.current_view = DashboardView::Browse;
+                } else {
+                    // Transcript view: toggle focus
+                    self.chat.focus = match self.chat.focus {
+                        ChatFocus::Table => ChatFocus::ChatInput,
+                        ChatFocus::ChatInput => ChatFocus::Table,
+                    };
+                }
                 true
             }
             _ if self.chat.focus == ChatFocus::ChatInput => {
                 match key_code {
                     KeyCode::Enter => {
-                        if self.chat.is_generating {
-                            // Queue the message — will auto-send when generation completes
+                        let on_home = self.chat.show_home_screen
+                            && self.chat.input_buffer.is_empty()
+                            && !self.chat.home_recordings.is_empty();
+                        if on_home && !self.chat.action_menu_open {
+                            // Open action menu for selected recording
+                            self.chat.action_menu_open = true;
+                            self.chat.action_menu_selection = 0;
+                        } else if on_home && self.chat.action_menu_open {
+                            // Execute selected action
+                            self.execute_home_action();
+                        } else if self.chat.is_generating {
                             if !self.chat.input_buffer.is_empty() {
                                 self.chat.pending_message = Some(self.chat.input_buffer.clone());
                                 self.chat.input_buffer.clear();
@@ -5790,60 +5617,90 @@ impl Dashboard {
                         }
                     }
                     KeyCode::Esc => {
-                        if !self.chat.input_buffer.is_empty() {
+                        if self.chat.action_menu_open {
+                            self.chat.action_menu_open = false;
+                        } else if !self.chat.input_buffer.is_empty() {
                             self.chat.input_buffer.clear();
-                        } else {
+                        } else if self.current_view == DashboardView::Main
+                            && !self.chat.show_home_screen
+                            && !self.chat.is_generating
+                        {
+                            // Return to home screen from chat
+                            self.chat.messages.clear();
+                            self.chat.pending_blocks.clear();
+                            self.chat.current_status = None;
+                            self.chat.scroll_offset = 0;
+                            self.chat.show_home_screen = true;
+                            self.chat.show_suggestions = true;
+                            self.chat.selected_suggestion = 0;
+                            self.chat.selected_action = 0;
+                            self.chat.action_menu_open = false;
+                            self.chat.auto_scroll = true;
+                            self.chat.invalidate_cache();
+                            self.generate_greeting();
+                        }
+                        else if self.current_view != DashboardView::Main {
                             self.chat.focus = ChatFocus::Table;
                         }
+                        // On home screen with nothing to dismiss — do nothing
                     }
                     KeyCode::Backspace => {
                         self.chat.input_buffer.pop();
                     }
                     KeyCode::Up => {
-                        if self.chat.show_suggestions && !self.chat.suggestions.is_empty() {
+                        if self.chat.action_menu_open {
+                            if self.chat.action_menu_selection > 0 {
+                                self.chat.action_menu_selection -= 1;
+                            }
+                        } else if self.chat.show_home_screen
+                            && self.chat.input_buffer.is_empty()
+                            && !self.chat.home_recordings.is_empty()
+                        {
+                            if self.chat.selected_action > 0 {
+                                self.chat.selected_action -= 1;
+                            }
+                        } else if self.chat.show_suggestions && !self.chat.suggestions.is_empty() {
                             if self.chat.selected_suggestion > 0 {
                                 self.chat.selected_suggestion -= 1;
                             }
                         } else {
-                            // Disengage auto-scroll when user scrolls up
                             if self.chat.auto_scroll {
-                                // Snap scroll_offset to current bottom before disengaging
-                                self.chat.scroll_offset = usize::MAX; // will be clamped in render
+                                self.chat.scroll_offset = usize::MAX;
                             }
                             self.chat.auto_scroll = false;
                             self.chat.scroll_offset = self.chat.scroll_offset.saturating_sub(1);
                         }
                     }
                     KeyCode::Down => {
-                        if self.chat.show_suggestions && !self.chat.suggestions.is_empty() {
-                            let max_idx = self.chat.suggestions.len(); // last = free-form
+                        if self.chat.action_menu_open {
+                            if self.chat.action_menu_selection < 2 {
+                                self.chat.action_menu_selection += 1;
+                            }
+                        } else if self.chat.show_home_screen
+                            && self.chat.input_buffer.is_empty()
+                            && !self.chat.home_recordings.is_empty()
+                        {
+                            let max_idx = self.chat.home_recordings.len().saturating_sub(1);
+                            if self.chat.selected_action < max_idx {
+                                self.chat.selected_action += 1;
+                            }
+                        } else if self.chat.show_suggestions && !self.chat.suggestions.is_empty() {
+                            let max_idx = self.chat.suggestions.len();
                             if self.chat.selected_suggestion < max_idx {
                                 self.chat.selected_suggestion += 1;
                             }
                         } else if !self.chat.auto_scroll {
                             self.chat.scroll_offset += 1;
-                            // Re-engage auto-scroll if we've scrolled to the bottom
-                            // (the render will clamp, so just check a generous threshold)
-                            self.chat.auto_scroll = true; // will be re-checked — if user scrolls up again, it disengages
+                            self.chat.auto_scroll = true;
                         }
                     }
                     KeyCode::Char(c) => {
                         self.chat.input_buffer.push(c);
                         self.chat.show_suggestions = false;
+                        self.chat.action_menu_open = false;
                     }
                     _ => {}
                 }
-                true
-            }
-            // Auto-focus: printable chars when table is focused go to chat
-            KeyCode::Char(c) if self.chat.focus == ChatFocus::Table
-                && !self.show_transcript
-                && !self.search_mode
-                && c.is_alphanumeric()
-                && !matches!(c, 'q' | 'h' | 'H' | 's' | 'S' | 'r' | 'R' | 'a' | 'A' | 't' | 'T' | 'w' | 'W' | 'd' | 'p' | 'P' | '/' | '[' | ']') => {
-                self.chat.focus = ChatFocus::ChatInput;
-                self.chat.input_buffer.push(c);
-                self.chat.show_suggestions = false;
                 true
             }
             _ => false,
@@ -6012,45 +5869,6 @@ impl Dashboard {
             }
             _ => {}
         }
-    }
-
-    // ── Rendering ──────────────────────────────────────────────────────────
-
-    fn render_compressed_footer(&self, f: &mut Frame, area: ratatui::layout::Rect) {
-        // Show notification if present (auto-dismissing)
-        if let Some((ref msg, _)) = self.notification_message {
-            let is_error = msg.contains("failed") || msg.contains("Failed");
-            let style = if is_error {
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
-            };
-            let para = Paragraph::new(msg.as_str())
-                .style(style)
-                .alignment(Alignment::Center);
-            f.render_widget(para, area);
-            return;
-        }
-
-        let voice_status = if self.voice_mode_active { " | Voice" } else { "" };
-        let queue_len = self.transcription_queue.len();
-        let transcribing = if self.active_transcription.is_some() {
-            if queue_len > 0 {
-                format!(" | Transcribing... (+{} queued)", queue_len)
-            } else {
-                " | Transcribing...".to_string()
-            }
-        } else {
-            String::new()
-        };
-        let controls = format!(
-            "TAB: Focus | ↑↓: Nav | /: Search | R: Record | A: Add | W: World | S: Settings | H: Help | Q: Quit{}{}",
-            transcribing, voice_status
-        );
-        let para = Paragraph::new(controls)
-            .style(Style::default().fg(Color::DarkGray))
-            .alignment(Alignment::Center);
-        f.render_widget(para, area);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -6424,10 +6242,10 @@ impl Dashboard {
         let outer_block = Block::default()
             .borders(Borders::ALL)
             .border_type(ratatui::widgets::BorderType::Double)
-            .border_style(Style::default().fg(Color::Cyan))
+            .border_style(Style::default().fg(ACCENT))
             .title(Span::styled(
                 " SCRIBA ",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ))
             .title_alignment(Alignment::Center);
         f.render_widget(outer_block, area);
@@ -6501,7 +6319,7 @@ impl Dashboard {
                         let ch = SPARKLE_CHARS[hash % 4]; // skip space
                         let color = match hash % 3 {
                             0 => Color::Yellow,
-                            1 => Color::Cyan,
+                            1 => ACCENT,
                             _ => Color::White,
                         };
                         spans.push(Span::styled(ch.to_string(), Style::default().fg(color)));
@@ -6595,7 +6413,7 @@ impl Dashboard {
                         let threshold = (burst_density * 100.0) as usize;
                         if hash < threshold {
                             let ch = SPARKLE_CHARS[hash % 4];
-                            let color = match hash % 3 { 0 => Color::Yellow, 1 => Color::Cyan, _ => Color::White };
+                            let color = match hash % 3 { 0 => Color::Yellow, 1 => ACCENT, _ => Color::White };
                             let spark_area = ratatui::layout::Rect { x: bx, y: by, width: 1, height: 1 };
                             let p = Paragraph::new(ch.to_string()).style(Style::default().fg(color));
                             f.render_widget(p, spark_area);
@@ -6703,10 +6521,10 @@ impl Dashboard {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan))
+                    .border_style(Style::default().fg(ACCENT))
                     .title(Span::styled(
                         " SCRIBA ",
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                     )),
             )
             .wrap(Wrap { trim: false });
@@ -6794,7 +6612,7 @@ impl Dashboard {
             if i == current_idx {
                 dots.push(Span::styled(" @ ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)));
             } else if i < current_idx {
-                dots.push(Span::styled(" O ", Style::default().fg(Color::Cyan)));
+                dots.push(Span::styled(" O ", Style::default().fg(ACCENT)));
             } else {
                 dots.push(Span::styled(" . ", Style::default().fg(Color::DarkGray)));
             }
@@ -6878,7 +6696,7 @@ impl Dashboard {
                         let ch_idx = (hash + frame) % SPARKLE_CHARS.len();
                         let ch = SPARKLE_CHARS[ch_idx];
                         let color = match (hash + frame) % 3 {
-                            0 => Color::Cyan,
+                            0 => ACCENT,
                             1 => Color::Yellow,
                             _ => Color::White,
                         };
@@ -6902,7 +6720,7 @@ impl Dashboard {
                 let line_str: String = std::iter::repeat(flash_char).take(area.width as usize).collect();
                 lines.push(Line::from(Span::styled(
                     line_str,
-                    Style::default().fg(Color::Cyan),
+                    Style::default().fg(ACCENT),
                 )));
             }
             let p = Paragraph::new(lines);
