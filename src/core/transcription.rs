@@ -164,7 +164,7 @@ fn save_transcript_to_files_and_db(
     Ok(())
 }
 
-fn find_ffmpeg() -> Result<String> {
+pub(crate) fn find_ffmpeg() -> Result<String> {
     let possible_paths = [
         "ffmpeg",
         "/opt/homebrew/bin/ffmpeg",
@@ -455,6 +455,69 @@ pub(crate) async fn ensure_model_path_local(size: LocalModelSize, quiet: bool) -
             }))
         }
     }
+}
+
+/// Check if a Whisper model is already downloaded locally.
+pub(crate) fn check_whisper_model(size: LocalModelSize) -> bool {
+    let models_dir = BASE_PATH.join("models");
+    let local_candidates: Vec<&str> = match size {
+        LocalModelSize::Tiny => vec!["ggml-tiny.bin", "tiny.gguf", "ggml-tiny-q5_0.gguf"],
+        LocalModelSize::Base => vec!["ggml-base.bin", "base.gguf", "ggml-base-q5_0.gguf"],
+        LocalModelSize::Small => vec!["ggml-small.bin", "small.gguf", "ggml-small-q5_0.gguf"],
+        LocalModelSize::Medium => vec!["ggml-medium.bin", "medium.gguf", "ggml-medium-q5_0.gguf"],
+        LocalModelSize::Large => vec![
+            "ggml-large-v3.bin", "large-v3.gguf", "ggml-large-v3-q5_0.gguf",
+        ],
+        LocalModelSize::Turbo => vec![
+            "ggml-large-v3-turbo.gguf", "ggml-large-v3-turbo-q5_0.gguf",
+            "large-v3-turbo.gguf", "ggml-large-v3-turbo.bin",
+        ],
+    };
+    local_candidates.iter().any(|name| models_dir.join(name).exists())
+}
+
+/// Download a Whisper model, sending progress (0–100) through the channel.
+pub(crate) async fn download_whisper_with_progress(
+    size: LocalModelSize,
+    tx: tokio::sync::mpsc::UnboundedSender<u8>,
+) -> Result<()> {
+    let models_dir = BASE_PATH.join("models");
+    std::fs::create_dir_all(&models_dir).ok();
+
+    // If already exists, report done immediately
+    if check_whisper_model(size) {
+        let _ = tx.send(100);
+        return Ok(());
+    }
+
+    let (name, url) = match size {
+        LocalModelSize::Tiny => ("ggml-tiny.bin", "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin"),
+        LocalModelSize::Base => ("ggml-base.bin", "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin"),
+        LocalModelSize::Small => ("ggml-small.bin", "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin"),
+        LocalModelSize::Medium => ("ggml-medium.bin", "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin"),
+        LocalModelSize::Large => ("ggml-large-v3.bin", "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin"),
+        LocalModelSize::Turbo => ("ggml-large-v3-turbo-q5_0.gguf", "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.gguf"),
+    };
+
+    let dest = models_dir.join(name);
+    let client = Client::new();
+    let resp = client.get(url).send().await?.error_for_status()?;
+    let total = resp.content_length();
+    let mut stream = resp.bytes_stream();
+    let mut file = std::fs::File::create(&dest).context("Failed to create model file")?;
+    let mut downloaded: u64 = 0;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        std::io::Write::write_all(&mut file, &chunk)?;
+        downloaded += chunk.len() as u64;
+        if let Some(total) = total {
+            let pct = ((downloaded as f64 / total as f64) * 100.0).min(100.0) as u8;
+            let _ = tx.send(pct);
+        }
+    }
+    let _ = tx.send(100);
+    Ok(())
 }
 
 async fn download_model(

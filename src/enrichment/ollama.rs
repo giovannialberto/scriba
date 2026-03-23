@@ -357,6 +357,79 @@ impl OllamaClient {
     }
 }
 
+/// Pull an Ollama model with streaming progress.
+///
+/// Sends progress as `(status_text, percentage)` where percentage is 0–100
+/// or `None` for status-only updates. Completes when pull is done.
+pub async fn pull_model_with_progress(
+    endpoint: &str,
+    model: &str,
+    tx: tokio::sync::mpsc::UnboundedSender<(String, Option<u8>)>,
+) -> Result<(), OllamaError> {
+    use futures_util::StreamExt;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(600))
+        .build()
+        .map_err(|e| OllamaError::RequestFailed { message: e.to_string() })?;
+
+    let url = format!("{}/api/pull", endpoint.trim_end_matches('/'));
+    let body = serde_json::json!({ "name": model, "stream": true });
+
+    let response = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|_| OllamaError::NotRunning { endpoint: endpoint.to_string() })?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body_text = response.text().await.unwrap_or_default();
+        return Err(OllamaError::RequestFailed {
+            message: format!("HTTP {}: {}", status, body_text),
+        });
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut buffer = String::new();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| OllamaError::RequestFailed { message: e.to_string() })?;
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+        while let Some(newline_pos) = buffer.find('\n') {
+            let line = buffer[..newline_pos].trim().to_string();
+            buffer = buffer[newline_pos + 1..].to_string();
+
+            if line.is_empty() {
+                continue;
+            }
+
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+                let status_text = val.get("status")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                let pct = match (val.get("completed"), val.get("total")) {
+                    (Some(c), Some(t)) => {
+                        let completed = c.as_u64().unwrap_or(0);
+                        let total = t.as_u64().unwrap_or(1).max(1);
+                        Some(((completed as f64 / total as f64) * 100.0).min(100.0) as u8)
+                    }
+                    _ => None,
+                };
+
+                let _ = tx.send((status_text, pct));
+            }
+        }
+    }
+
+    let _ = tx.send(("success".to_string(), Some(100)));
+    Ok(())
+}
+
 impl From<OllamaError> for ProviderError {
     fn from(err: OllamaError) -> Self {
         match err {
