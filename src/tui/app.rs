@@ -17,7 +17,7 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
@@ -36,7 +36,7 @@ use tokio::process::Command as TokioCommand;
 
 use super::chat::{
     ChatContext, ChatFocus, ChatMessage, ChatRole, ChatState, ChatStreamEvent,
-    chat_agent_pipeline,
+    chat_agent_pipeline, ACCENT,
 };
 
 pub struct Dashboard {
@@ -54,8 +54,8 @@ pub struct Dashboard {
     message: String,
     show_transcript: bool,
     transcript_content: String,
-    transcript_scroll_offset: usize,
     show_delete_confirm: bool,
+    delete_confirm_selection: usize,  // 0 = Yes, 1 = No
     delete_candidate: Option<Recording>,
     current_playback_pid: Option<u32>,
     playback_finished_rx: Option<mpsc::Receiver<()>>, // Channel to receive playback completion
@@ -65,12 +65,13 @@ pub struct Dashboard {
     active_transcription: Option<ActiveTranscription>, // Currently running transcription
     transcription_queue: VecDeque<PendingTranscription>, // FIFO queue of pending transcriptions
     notification_message: Option<(String, usize)>, // (message, frames_remaining) — auto-dismiss
-    header_anim_frame: usize, // Main header owl animation counter
     recording_task: Option<tokio::task::JoinHandle<Result<RecordingResult, anyhow::Error>>>,
     recording_mode: Option<RecordingMode>, // Track if we should transcribe after recording
     recording_stop_tx: Option<mpsc::Sender<()>>, // Channel to stop recording
     recording_level_rx: Option<mpsc::Receiver<f32>>, // Channel to receive volume levels
     current_volume_level: f32,             // Current recording volume for display
+    recording_start_instant: Option<std::time::Instant>, // When recording started (for elapsed time)
+    volume_history: VecDeque<f32>,         // Recent volume samples for waveform display
     config: ScribaConfig,                  // App configuration
     settings_selection: usize,             // Current setting selection
     editing_api_key: bool,                 // Whether we're editing API key
@@ -102,17 +103,13 @@ pub struct Dashboard {
     entity_edit_type: String,
     entity_edit_context: String,
     merge_source_entity: Option<Entity>,
+    confirm_selection: usize,  // shared for entity delete/merge confirms: 0 = Yes, 1 = No
     // Add entity state
     entity_add_name: String,
     entity_add_type: String,
     entity_add_context: String,
     entity_add_aliases: String,
     entity_add_field: EntityEditField,
-    // Owl world view state
-    owl_quip: String,
-    owl_quip_timer: usize,
-    owl_world_anim_frame: usize,
-    owl_world_mood: OwlWorldMood,
     // Transcript enrichment data
     transcript_summary: Option<String>,
     transcript_key_points: Option<Vec<String>>,
@@ -132,11 +129,17 @@ pub struct Dashboard {
     global_chat_messages: Vec<ChatMessage>,
     // Track the currently-viewed recording for chat context
     current_transcript_recording: Option<Recording>,
+
+    // Home screen greeting
+    greeting_text: String,
+    greeting_subtitle: String,
+    owner_name: String,
 }
 
 #[derive(Debug, PartialEq)]
 enum DashboardView {
     Main,
+    Browse,
     Help,
     Settings,
     Entities,
@@ -152,36 +155,67 @@ enum OnboardingStep {
     Entrance,
     Intro,
     ModeSelection,
+    // Cloud flow
     ProviderSelection,
     ApiKeyEntry,
     ApiKeyValidation,
+    // Privacy flow
+    SystemCheck,
+    ModelSetup,
+    // Shared
     AskName,
     AskRole,
-    AskAliases,
     Processing,
     Confirmation,
     Done,
 }
 
+#[derive(Clone, Debug)]
+enum CheckStatus {
+    Pending,
+    Running,
+    Passed,
+    Failed(String),
+}
+
+#[derive(Clone, Debug)]
+enum DownloadStatus {
+    Pending,
+    InProgress(u8),
+    Done,
+    Failed(String),
+}
+
+struct DownloadProgress {
+    index: usize,
+    status: DownloadStatus,
+}
+
+const WHISPER_MODELS: &[(LocalModelSize, &str, &str)] = &[
+    (LocalModelSize::Turbo, "Turbo (Recommended)", "~1.4 GB"),
+    (LocalModelSize::Large, "Large", "~2.9 GB"),
+    (LocalModelSize::Medium, "Medium", "~1.5 GB"),
+    (LocalModelSize::Small, "Small", "~466 MB"),
+];
+
 struct OnboardingState {
     step: OnboardingStep,
-    // Typewriter
+    // Text (instant, no typewriter)
     full_text: String,
     visible_chars: usize,
     text_complete: bool,
     // Animation
     anim_frame: usize,
-    entrance_complete: bool,
     // Mode selection
     selected_mode: usize,         // 0 = Cloud, 1 = Privacy (local)
     selected_provider: usize,     // 0 = Anthropic, 1 = OpenAI, 2 = Google
     api_key_input: String,
     api_key_valid: Option<bool>,  // None = not checked, Some(true/false) = result
+    validation_fail_selection: usize, // 0 = Try different key, 1 = Skip
     validation_task: Option<tokio::task::JoinHandle<Result<bool, anyhow::Error>>>,
     // User inputs
     user_name: String,
     user_role: String,
-    user_aliases: String,
     // Processing
     /// Returns (world_result, provider_hint). Hint is set when provider is unavailable.
     processing_task: Option<tokio::task::JoinHandle<Result<(Option<(WorldData, WorldEntityExtractionResult)>, Option<String>), anyhow::Error>>>,
@@ -196,6 +230,25 @@ struct OnboardingState {
     confirm_role: String,
     confirm_org: String,
     confirm_people: String,
+    confirm_selection: usize,     // 0 = Looks good, 1 = Fix
+
+    // ── Privacy flow: SystemCheck ──
+    system_checks: Vec<(String, CheckStatus)>,
+    system_check_rx: Option<mpsc::UnboundedReceiver<(usize, bool, String)>>,
+    system_check_task: Option<tokio::task::JoinHandle<()>>,
+    system_check_done: bool,
+    system_check_selection: usize,  // 0 = Check again, 1 = Continue anyway
+    ollama_reachable: bool,
+
+    // ── Privacy flow: ModelSetup ──
+    setup_phase: u8,                    // 0=whisper, 1=ollama, 2=confirm, 3=downloading
+    whisper_model_selection: usize,     // index into WHISPER_MODELS
+    ollama_model_selection: usize,      // index into available models
+    ollama_available_models: Vec<String>,
+    ollama_models_fetched: bool,
+    download_task: Option<tokio::task::JoinHandle<()>>,
+    download_rx: Option<mpsc::UnboundedReceiver<DownloadProgress>>,
+    download_items: Vec<(String, DownloadStatus)>,
 }
 
 impl OnboardingState {
@@ -206,15 +259,14 @@ impl OnboardingState {
             visible_chars: 0,
             text_complete: false,
             anim_frame: 0,
-            entrance_complete: false,
             selected_mode: 0,
             selected_provider: 0,
             api_key_input: String::new(),
             api_key_valid: None,
+            validation_fail_selection: 0,
             validation_task: None,
             user_name: String::new(),
             user_role: String::new(),
-            user_aliases: String::new(),
             processing_task: None,
             processed_world: None,
             processed_entities: None,
@@ -225,13 +277,59 @@ impl OnboardingState {
             confirm_role: String::new(),
             confirm_org: String::new(),
             confirm_people: String::new(),
+            confirm_selection: 0,
+            // Privacy flow: SystemCheck
+            system_checks: Vec::new(),
+            system_check_rx: None,
+            system_check_task: None,
+            system_check_done: false,
+            system_check_selection: 0,
+            ollama_reachable: false,
+            // Privacy flow: ModelSetup
+            setup_phase: 0,
+            whisper_model_selection: 0,
+            ollama_model_selection: 0,
+            ollama_available_models: Vec::new(),
+            ollama_models_fetched: false,
+            download_task: None,
+            download_rx: None,
+            download_items: Vec::new(),
         }
     }
 
-    fn set_step_text(&mut self, text: &str) {
+    fn set_step_text(&mut self, text: &str, animated: bool) {
         self.full_text = text.to_string();
-        self.visible_chars = 0;
-        self.text_complete = false;
+        if animated {
+            self.visible_chars = 0;
+            self.text_complete = false;
+        } else {
+            self.visible_chars = self.full_text.chars().count();
+            self.text_complete = true;
+        }
+    }
+
+    fn tick_typewriter_lines(&mut self) {
+        if self.text_complete {
+            return;
+        }
+        // Reveal one line every 2nd tick (~200ms per line)
+        if self.anim_frame % 2 != 0 {
+            return;
+        }
+        let total = self.full_text.chars().count();
+        // Find the next '\n' at or after visible_chars, advance past it
+        let mut found_nl = false;
+        for (i, ch) in self.full_text.chars().enumerate() {
+            if i >= self.visible_chars && ch == '\n' {
+                self.visible_chars = i + 1; // include the newline
+                found_nl = true;
+                break;
+            }
+        }
+        if !found_nl {
+            self.visible_chars = total;
+            self.text_complete = true;
+        }
     }
 
     fn visible_text(&self) -> &str {
@@ -252,58 +350,7 @@ impl OnboardingState {
         }
         &self.full_text[..byte_end]
     }
-
-    fn tick_typewriter(&mut self) {
-        if !self.text_complete {
-            let char_count = self.full_text.chars().count();
-            self.visible_chars = (self.visible_chars + 4).min(char_count);
-            if self.visible_chars >= char_count {
-                self.text_complete = true;
-            }
-        }
-    }
-
-    fn complete_text(&mut self) {
-        self.visible_chars = self.full_text.chars().count();
-        self.text_complete = true;
-    }
 }
-
-// Owl animation frames
-const OWL_IDLE: [&str; 2] = [
-    // Normal
-    "   (o,o)\n   {`\"'}\n   -\"-\"-",
-    // Blink
-    "   (-,-)\n   {`\"'}\n   -\"-\"-",
-];
-
-// Entrance frames: owl flies in from right (position offset decreases)
-const OWL_FLYING: &str = "~(o,o)~";
-const OWL_APPROACH: &str = "(^,^)";
-const OWL_LANDED: &str = "   (o,o)\n   {`\"'}\n   -\"-\"-";
-
-// Thinking animation: 8 frames (played at 1/3 speed — one change every ~300ms)
-const OWL_THINKING: [&str; 8] = [
-    "   (o,o)  ?\n   {`\"'}\n   -\"-\"-",
-    "   (o,o)\n   {`~'}  ~\n   -\"-\"-",
-    "   (o,o)  !\n   {`\"'}\n   -\"-\"-",
-    "   (o,o)\n   {`~'}  ~~\n   -\"-\"-",
-    "   (-,-)  ?\n   {`\"'}\n   -\"-\"-",
-    "   (o,o)\n   {`~'}  ~~~\n   -\"-\"-",
-    "   (o,o)  !\n   {`\"'}\n   -\"-\"-",
-    "   (o,o)  ...\n   {`\"'}\n   -\"-\"-",
-];
-
-// Celebration: 4 frames
-const OWL_CELEBRATE: [&str; 4] = [
-    "  \\(^,^)/\n   {`\"'}\n   -\"-\"-",
-    "  /(^,^)\\\n   {`\"'}\n   -\"-\"-",
-    "  \\(^,^)/\n   {`\"'}\n   -\"-\"-",
-    "   (^,^)\n   {`\"'}\n   -\"-\"-",
-];
-
-// Sparkle characters for magic transition
-const SPARKLE_CHARS: [char; 5] = ['*', '+', '.', '~', ' '];
 
 #[derive(Debug, PartialEq)]
 enum FileDialogStage {
@@ -367,13 +414,6 @@ enum EntityMode {
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
-enum OwlWorldMood {
-    Idle,
-    Thinking,
-    Celebrating,
-}
-
-#[derive(Debug, PartialEq, Clone, Copy)]
 enum EntityEditField {
     Name,
     Type,
@@ -413,8 +453,8 @@ impl Dashboard {
             message: String::new(),
             show_transcript: false,
             transcript_content: String::new(),
-            transcript_scroll_offset: 0,
             show_delete_confirm: false,
+            delete_confirm_selection: 1, // default to No
             delete_candidate: None,
             current_playback_pid: None,
             playback_finished_rx: None,
@@ -424,12 +464,13 @@ impl Dashboard {
             active_transcription: None,
             transcription_queue: VecDeque::new(),
             notification_message: None,
-            header_anim_frame: 0,
             recording_task: None,
             recording_mode: None,
             recording_stop_tx: None,
             recording_level_rx: None,
             current_volume_level: 0.0,
+            recording_start_instant: None,
+            volume_history: VecDeque::with_capacity(48),
             config,
             settings_selection: 0,
             editing_api_key: false,
@@ -461,17 +502,13 @@ impl Dashboard {
             entity_edit_type: String::new(),
             entity_edit_context: String::new(),
             merge_source_entity: None,
+            confirm_selection: 1, // default to No
             // Add entity state
             entity_add_name: String::new(),
             entity_add_type: "person".to_string(),
             entity_add_context: String::new(),
             entity_add_aliases: String::new(),
             entity_add_field: EntityEditField::Name,
-            // Owl world view state
-            owl_quip: String::new(),
-            owl_quip_timer: 0,
-            owl_world_anim_frame: 0,
-            owl_world_mood: OwlWorldMood::Idle,
             // Transcript enrichment data
             transcript_summary: None,
             transcript_key_points: None,
@@ -490,6 +527,11 @@ impl Dashboard {
             chat: ChatState::new(),
             global_chat_messages: Vec::new(),
             current_transcript_recording: None,
+
+            // Greeting
+            greeting_text: String::new(),
+            greeting_subtitle: String::new(),
+            owner_name: String::new(),
         })
     }
 
@@ -559,16 +601,17 @@ impl Dashboard {
                     self.recording_stop_tx = None;
                     self.recording_level_rx = None;
                     self.current_volume_level = 0.0;
+                    self.recording_start_instant = None;
+                    self.volume_history.clear();
 
                     match completed_task.await {
                         Ok(Ok(result)) => {
                             let recording_name = result.recording_name;
                             let auto_stopped = result.auto_stopped;
 
-                            // Show owl quip if silence auto-stopped
                             if auto_stopped {
                                 self.notification_message = Some((
-                                    "Hoo left the mic on? I stopped it for you.".to_string(),
+                                    "Silence detected \u{2014} recording stopped automatically.".to_string(),
                                     120,
                                 ));
                             }
@@ -648,6 +691,11 @@ impl Dashboard {
             if let Some(level_rx) = &mut self.recording_level_rx {
                 if let Ok(level) = level_rx.try_recv() {
                     self.current_volume_level = level;
+                    // Keep a rolling history for the waveform display
+                    if self.volume_history.len() >= 48 {
+                        self.volume_history.pop_front();
+                    }
+                    self.volume_history.push_back(level);
                 }
             }
 
@@ -676,34 +724,48 @@ impl Dashboard {
             // Check for Ollama model list completion
             if let Some(ref mut rx) = self.ollama_models_rx {
                 if let Ok(result) = rx.try_recv() {
-                    let current_model = self.config.enrichment.model_name().to_string();
-                    match result {
-                        Ok(names) if !names.is_empty() => {
-                            let mut items: Vec<ModelPickerItem> = names
-                                .iter()
-                                .map(|n| ModelPickerItem {
-                                    display_name: n.clone(),
-                                    model_id: Some(n.clone()),
-                                })
-                                .collect();
-                            items.push(ModelPickerItem {
-                                display_name: "Custom...".into(),
-                                model_id: None,
-                            });
-                            let sel = names
-                                .iter()
-                                .position(|n| *n == current_model)
-                                .unwrap_or(items.len() - 1);
-                            self.model_picker_items = items;
-                            self.model_picker_selection = sel;
+                    // Check if we're in onboarding ModelSetup phase 1 — populate onboarding models
+                    let in_onboarding_model_setup = self.onboarding.as_ref()
+                        .map(|ob| ob.step == OnboardingStep::ModelSetup && ob.setup_phase == 1)
+                        .unwrap_or(false);
+
+                    if in_onboarding_model_setup {
+                        if let Ok(names) = &result {
+                            if let Some(ref mut ob) = self.onboarding {
+                                ob.ollama_available_models = names.clone();
+                                ob.ollama_model_selection = 0;
+                            }
                         }
-                        _ => {
-                            // Error or empty — show only Custom...
-                            self.model_picker_items = vec![ModelPickerItem {
-                                display_name: "Custom...".into(),
-                                model_id: None,
-                            }];
-                            self.model_picker_selection = 0;
+                    } else {
+                        let current_model = self.config.enrichment.model_name().to_string();
+                        match result {
+                            Ok(names) if !names.is_empty() => {
+                                let mut items: Vec<ModelPickerItem> = names
+                                    .iter()
+                                    .map(|n| ModelPickerItem {
+                                        display_name: n.clone(),
+                                        model_id: Some(n.clone()),
+                                    })
+                                    .collect();
+                                items.push(ModelPickerItem {
+                                    display_name: "Custom...".into(),
+                                    model_id: None,
+                                });
+                                let sel = names
+                                    .iter()
+                                    .position(|n| *n == current_model)
+                                    .unwrap_or(items.len() - 1);
+                                self.model_picker_items = items;
+                                self.model_picker_selection = sel;
+                            }
+                            _ => {
+                                // Error or empty — show only Custom...
+                                self.model_picker_items = vec![ModelPickerItem {
+                                    display_name: "Custom...".into(),
+                                    model_id: None,
+                                }];
+                                self.model_picker_selection = 0;
+                            }
                         }
                     }
                     self.ollama_models_rx = None;
@@ -739,27 +801,126 @@ impl Dashboard {
 
                 match ob.step {
                     OnboardingStep::Entrance => {
-                        // Auto-advance after 40 frames (~4s)
-                        if ob.anim_frame >= 40 {
-                            ob.entrance_complete = true;
+                        // Auto-advance after 25 frames (~2.5s)
+                        if ob.anim_frame >= 25 {
                             ob.step = OnboardingStep::Intro;
                             ob.set_step_text(
-                                "Hoo hoo! I'm Scriba, your personal audio owl.\n\n\
+                                "Welcome to Scriba.\n\n\
                                  I listen to your recordings, transcribe them,\n\
-                                 and remember everything -- names, places, topics.\n\
-                                 Think of me as your wise little note-taker\n\
-                                 with very large ears.\n\n\
-                                 Let me get to know you first!"
+                                 and remember everything \u{2014} names, places, topics.\n\
+                                 Think of me as your personal note-taker\n\
+                                 with a very good memory.\n\n\
+                                 Let me get to know you first.",
+                                true,
                             );
                         }
                     }
-                    OnboardingStep::Intro | OnboardingStep::ModeSelection | OnboardingStep::ProviderSelection
-                    | OnboardingStep::ApiKeyEntry
-                    | OnboardingStep::AskName | OnboardingStep::AskRole | OnboardingStep::AskAliases => {
-                        ob.tick_typewriter();
+                    OnboardingStep::Intro => {
+                        // Line-by-line reveal after logo pause (3 frames = 300ms)
+                        if ob.anim_frame >= 3 {
+                            ob.tick_typewriter_lines();
+                        }
+                    }
+                    OnboardingStep::AskName | OnboardingStep::AskRole => {
+                        ob.tick_typewriter_lines();
+                    }
+                    OnboardingStep::ModeSelection | OnboardingStep::ProviderSelection
+                    | OnboardingStep::ApiKeyEntry => {
+                        // Instant text — no typewriter
+                    }
+                    OnboardingStep::ModelSetup => {
+                        // Phase 3: drain download progress
+                        if ob.setup_phase == 3 {
+                            if let Some(ref mut rx) = ob.download_rx {
+                                while let Ok(prog) = rx.try_recv() {
+                                    if prog.index < ob.download_items.len() {
+                                        ob.download_items[prog.index].1 = prog.status;
+                                    }
+                                }
+                            }
+                            if let Some(ref task) = ob.download_task {
+                                if task.is_finished() {
+                                    ob.download_task.take();
+                                    ob.download_rx.take();
+                                    for item in ob.download_items.iter_mut() {
+                                        if matches!(item.1, DownloadStatus::Pending | DownloadStatus::InProgress(_)) {
+                                            item.1 = DownloadStatus::Done;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Phases 0, 1, 2: instant text, no typewriter
+                    }
+                    OnboardingStep::SystemCheck => {
+                        // Drain system check channel
+                        let mut all_resolved = false;
+                        if let Some(ref mut rx) = ob.system_check_rx {
+                            while let Ok((idx, passed, hint)) = rx.try_recv() {
+                                if idx < ob.system_checks.len() {
+                                    if hint.is_empty() && !passed {
+                                        // "Running" signal (empty hint, false)
+                                        ob.system_checks[idx].1 = CheckStatus::Running;
+                                    } else if passed {
+                                        ob.system_checks[idx].1 = CheckStatus::Passed;
+                                        if idx == 2 {
+                                            ob.ollama_reachable = true;
+                                        }
+                                    } else {
+                                        ob.system_checks[idx].1 = CheckStatus::Failed(hint);
+                                    }
+                                }
+                            }
+                        }
+                        // Check if task is done
+                        if let Some(ref task) = ob.system_check_task {
+                            if task.is_finished() {
+                                ob.system_check_task.take();
+                                ob.system_check_rx.take();
+                                all_resolved = true;
+                            }
+                        }
+                        if all_resolved {
+                            let any_failed = ob.system_checks.iter().any(|(_, s)| matches!(s, CheckStatus::Failed(_)));
+                            ob.system_check_done = true;
+                            if any_failed {
+                                ob.system_check_selection = 0;
+                            } else {
+                                // All passed — start linger counter (will auto-advance after ~1.5s)
+                                ob.transition_frame = 0;
+
+                                // Pre-fetch Ollama models while lingering
+                                if ob.ollama_reachable {
+                                    let endpoint = if let EnrichmentMode::Local { ollama_endpoint, .. } = &self.config.enrichment.mode {
+                                        ollama_endpoint.clone()
+                                    } else {
+                                        "http://localhost:11434".to_string()
+                                    };
+                                    let (tx, rx) = mpsc::channel(1);
+                                    self.ollama_models_rx = Some(rx);
+                                    tokio::spawn(async move {
+                                        let result = OllamaClient::fetch_models(&endpoint).await;
+                                        let _ = tx.send(result.map_err(|e| e.to_string())).await;
+                                    });
+                                }
+                            }
+                        }
+
+                        // Linger on all-green for ~1.5s before auto-advancing
+                        let all_passed = ob.system_check_done
+                            && !ob.system_checks.iter().any(|(_, s)| matches!(s, CheckStatus::Failed(_)));
+                        if all_passed && anim_tick {
+                            ob.transition_frame += 1;
+                            if ob.transition_frame >= 15 {
+                                ob.step = OnboardingStep::ModelSetup;
+                                ob.anim_frame = 0;
+                                ob.setup_phase = 0;
+                                ob.transition_frame = 0;
+                                ob.set_step_text("Choose your transcription model", false);
+                            }
+                        }
                     }
                     OnboardingStep::ApiKeyValidation => {
-                        ob.tick_typewriter();
                         // Poll the async validation task
                         if let Some(ref task) = ob.validation_task {
                             if task.is_finished() {
@@ -771,23 +932,24 @@ impl Dashboard {
                                             ob.step = OnboardingStep::AskName;
                                             ob.anim_frame = 0;
                                             ob.set_step_text(
-                                                "API key works! We're in business.\n\n\
-                                                 So, who am I working for?\n\nWhat's your name?"
+                                                "API key verified.\n\n\
+                                                 What's your name?",
+                                                true,
                                             );
                                         } else {
+                                            ob.validation_fail_selection = 0;
                                             ob.set_step_text(
-                                                "Hmm, that key didn't work.\n\n\
-                                                 [1] Try a different key\n\
-                                                 [2] Skip for now (you can set it later)"
+                                                "API key validation failed.",
+                                                false,
                                             );
                                         }
                                     }
                                     _ => {
                                         ob.api_key_valid = Some(false);
+                                        ob.validation_fail_selection = 0;
                                         ob.set_step_text(
-                                            "Hmm, that key didn't work.\n\n\
-                                             [1] Try a different key\n\
-                                             [2] Skip for now (you can set it later)"
+                                            "API key validation failed.",
+                                            false,
                                         );
                                     }
                                 }
@@ -795,7 +957,6 @@ impl Dashboard {
                         }
                     }
                     OnboardingStep::Processing => {
-                        ob.tick_typewriter();
                         // Check if processing task completed
                         if let Some(ref task) = ob.processing_task {
                             if task.is_finished() {
@@ -818,41 +979,51 @@ impl Dashboard {
                                         ob.ollama_available = true;
                                         // Advance to confirmation
                                         ob.step = OnboardingStep::Confirmation;
-                                        let text = format!(
-                                            "Here's what I've got:\n\n\
-                                             Owner: {}\n\
-                                             Role:  {}\n\
-                                             Org:   {}\n\
-                                             Known: {}\n\n\
-                                             Does that look right?",
-                                            ob.confirm_owner, ob.confirm_role, ob.confirm_org, ob.confirm_people
-                                        );
-                                        ob.set_step_text(&text);
+                                        ob.confirm_selection = 0;
+                                        ob.set_step_text("Here's what I've got:", false);
                                     }
                                     Ok(Ok((None, hint))) => {
-                                        // Ollama not available — show actionable hint
                                         ob.ollama_available = false;
                                         let msg = if let Some(hint) = hint {
                                             format!(
-                                                "Hm, I can't think right now.\n\n\
-                                                 {}\n\n\
-                                                 No worries -- I saved your info as-is.\n\
-                                                 Fix that, restart scriba, and I'll be much smarter!",
+                                                "{}\n\n\
+                                                 Your info has been saved.\n\
+                                                 You can fix this later in Settings (Ctrl+S).",
                                                 hint
                                             )
                                         } else {
-                                            "Hm, my brain (Ollama) seems to be sleeping.\n\n\
-                                             No worries -- I saved your info as-is.\n\
-                                             Set up Ollama later and I'll get much smarter!".to_string()
+                                            "Enrichment provider is not reachable.\n\n\
+                                             Your info has been saved.\n\
+                                             You can fix this later in Settings (Ctrl+S).".to_string()
                                         };
-                                        ob.set_step_text(&msg);
+                                        ob.set_step_text(&msg, false);
                                     }
-                                    Ok(Err(_)) | Err(_) => {
+                                    Ok(Err(e)) => {
                                         ob.ollama_available = false;
+                                        let err_msg = format!("{:#}", e);
                                         ob.set_step_text(
-                                            "Hm, something went wrong with my brain.\n\n\
-                                             No worries -- I saved your info as-is.\n\
-                                             Set up Ollama later and I'll get much smarter!"
+                                            &format!(
+                                                "Something went wrong during setup:\n\
+                                                 {}\n\n\
+                                                 Your info has been saved.\n\
+                                                 You can fix this later in Settings (Ctrl+S).",
+                                                err_msg,
+                                            ),
+                                            false,
+                                        );
+                                    }
+                                    Err(e) => {
+                                        ob.ollama_available = false;
+                                        let err_msg = format!("{:#}", e);
+                                        ob.set_step_text(
+                                            &format!(
+                                                "Something went wrong during setup:\n\
+                                                 {}\n\n\
+                                                 Your info has been saved.\n\
+                                                 You can fix this later in Settings (Ctrl+S).",
+                                                err_msg,
+                                            ),
+                                            false,
                                         );
                                     }
                                 }
@@ -860,18 +1031,14 @@ impl Dashboard {
                         }
                     }
                     OnboardingStep::Confirmation => {
-                        ob.tick_typewriter();
+                        // Text is instant now
                     }
                     OnboardingStep::Done => {
-                        ob.tick_typewriter();
-                        // After text is complete and celebration plays (~3s), start transition
-                        if ob.text_complete && ob.anim_frame > 40 && !ob.transitioning {
-                            ob.transitioning = true;
-                            ob.transition_frame = 0;
-                        }
-                        if ob.transitioning {
+                        ob.tick_typewriter_lines();
+                        // Fade-out transition (triggered by Enter key, throttled to anim_tick ~100ms)
+                        if ob.transitioning && anim_tick {
                             ob.transition_frame += 1;
-                            if ob.transition_frame > 30 {
+                            if ob.transition_frame > 10 {
                                 // Transition complete — go to main dashboard
                                 self.onboarding = None;
                                 self.current_view = DashboardView::Main;
@@ -895,23 +1062,7 @@ impl Dashboard {
             if anim_tick {
                 self.chat.spinner_frame = self.chat.spinner_frame.wrapping_add(1);
 
-                if self.current_view == DashboardView::Main {
-                    self.header_anim_frame = self.header_anim_frame.wrapping_add(1);
-                }
 
-                if self.current_view == DashboardView::Entities {
-                    self.owl_world_anim_frame = self.owl_world_anim_frame.wrapping_add(1);
-                    if self.owl_quip_timer > 0 {
-                        self.owl_quip_timer -= 1;
-                        if self.owl_quip_timer == 0 {
-                            self.owl_world_mood = OwlWorldMood::Idle;
-                            self.set_owl_quip_for_browse();
-                        }
-                    }
-                    if self.owl_world_mood == OwlWorldMood::Celebrating && self.owl_quip_timer == 0 {
-                        self.owl_world_mood = OwlWorldMood::Idle;
-                    }
-                }
             }
 
             terminal.draw(|f| self.ui(f))?;
@@ -921,7 +1072,13 @@ impl Dashboard {
                 match event::read()? {
                     Event::Key(key) => {
                         if key.kind == KeyEventKind::Press {
-                            match self.handle_key_event(key.code).await {
+                            // Ctrl+C quits from anywhere
+                            if key.code == KeyCode::Char('c')
+                                && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                            {
+                                break 'main;
+                            }
+                            match self.handle_key_event(key.code, key.modifiers).await {
                                 Ok(DashboardAction::Continue) => {}
                                 Ok(DashboardAction::Quit) => break 'main,
                                 Ok(action) => {
@@ -944,7 +1101,7 @@ impl Dashboard {
         Ok(())
     }
 
-    async fn handle_key_event(&mut self, key_code: KeyCode) -> Result<DashboardAction> {
+    async fn handle_key_event(&mut self, key_code: KeyCode, modifiers: crossterm::event::KeyModifiers) -> Result<DashboardAction> {
         // If audio is playing and ESC is pressed, stop it immediately
         if matches!(key_code, KeyCode::Esc) {
             // Check if we're in audio playback mode (either with PID or with playback message)
@@ -1039,6 +1196,43 @@ impl Dashboard {
         }
 
         if self.show_transcript {
+            // Ctrl+Y: copy full transcript (works regardless of focus)
+            if key_code == KeyCode::Char('y')
+                && modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+            {
+                match self.copy_transcript_to_clipboard() {
+                    Ok(()) => {
+                        self.notification_message = Some(("Transcript copied to clipboard".to_string(), 40));
+                    }
+                    Err(e) => {
+                        self.notification_message = Some((format!("Copy failed: {}", e), 40));
+                    }
+                }
+                return Ok(DashboardAction::Continue);
+            }
+
+            // Ctrl+T: re-transcribe (works regardless of focus)
+            if key_code == KeyCode::Char('t')
+                && modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+            {
+                if let Some(recording) = self.get_current_recording() {
+                    if self.has_active_transcription() {
+                        self.message = "Transcription already in progress".to_string();
+                        self.show_message = true;
+                    } else {
+                        self.show_transcript = false;
+                        self.transcript_content.clear();
+                        let transcription_mode = self.config.transcription.clone();
+                        let directory_name = recording.directory_name.clone();
+                        self.enqueue_transcription(PendingTranscription::Retranscribe {
+                            recording_name: directory_name,
+                            transcription_mode,
+                        });
+                    }
+                }
+                return Ok(DashboardAction::Continue);
+            }
+
             // Chat keys in transcript view take priority when chat is focused
             if self.handle_transcript_chat_key(key_code) {
                 return Ok(DashboardAction::Continue);
@@ -1050,41 +1244,60 @@ impl Dashboard {
             return self.handle_delete_confirmation(key_code).await;
         }
 
-        // Chat key handling (Tab focus toggle, chat input when focused)
+        // Browse view keys
+        if self.current_view == DashboardView::Browse {
+            return self.handle_browse_keys(key_code).await;
+        }
+
+        // Chat key handling (Tab → Browse, chat input when focused)
+        // Global Ctrl+ shortcuts (work from any Main view state)
+        let ctrl = modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
+        if ctrl {
+            match key_code {
+                KeyCode::Char('s') => {
+                    self.current_view = DashboardView::Settings;
+                    self.settings_selection = 0;
+                    return Ok(DashboardAction::Continue);
+                }
+                KeyCode::Char('w') => {
+                    self.load_entities()?;
+                    self.current_view = DashboardView::Entities;
+                    self.entity_table_state.select(Some(0));
+                    return Ok(DashboardAction::Continue);
+                }
+                KeyCode::Char('r') => {
+                    return Ok(DashboardAction::RecordAndTranscribe);
+                }
+                _ => {}
+            }
+        }
+
+        // F1 / ? for help (? only when input is empty to avoid conflicts)
+        if matches!(key_code, KeyCode::F(1))
+            || (key_code == KeyCode::Char('?') && self.chat.input_buffer.is_empty())
+        {
+            self.show_help = true;
+            self.current_view = DashboardView::Help;
+            return Ok(DashboardAction::Continue);
+        }
+
         if self.handle_chat_key(key_code) {
             return Ok(DashboardAction::Continue);
         }
 
+        Ok(DashboardAction::Continue)
+    }
+
+    async fn handle_browse_keys(&mut self, key_code: KeyCode) -> Result<DashboardAction> {
         match key_code {
-            KeyCode::Char('q') | KeyCode::Esc => return Ok(DashboardAction::Quit),
-            KeyCode::Char('h') | KeyCode::Char('H') | KeyCode::F(1) => {
-                self.show_help = true;
-                self.current_view = DashboardView::Help;
-            }
-            KeyCode::Char('s') | KeyCode::Char('S') => {
-                self.current_view = DashboardView::Settings;
-                self.settings_selection = 0;
-            }
-            KeyCode::Char('w') | KeyCode::Char('W') => {
-                self.load_entities()?;
-                self.current_view = DashboardView::Entities;
-                self.entity_table_state.select(Some(0));
-                self.owl_world_anim_frame = 0;
-                self.owl_world_mood = OwlWorldMood::Idle;
-                self.set_owl_quip_for_browse();
-            }
-            KeyCode::Char('r') | KeyCode::Char('R') => {
-                return Ok(DashboardAction::RecordAndTranscribe);
-            }
-            KeyCode::Char('a') | KeyCode::Char('A') => {
-                return Ok(DashboardAction::AddExternalFile);
-            }
-            KeyCode::Char('t') | KeyCode::Char('T') => {
-                return Ok(DashboardAction::TranscribeSelected);
-            }
-            KeyCode::Char('/') => {
-                self.search_mode = true;
-                self.search_query.clear();
+            KeyCode::Tab | KeyCode::Esc => {
+                self.current_view = DashboardView::Main;
+                self.chat.focus = ChatFocus::ChatInput;
+                self.chat.borderless = true;
+                if self.chat.messages.is_empty() {
+                    self.chat.show_home_screen = true;
+                    self.chat.show_suggestions = true;
+                }
             }
             KeyCode::Up => {
                 self.previous_recording();
@@ -1105,11 +1318,11 @@ impl Dashboard {
                     self.show_message = true;
                 }
             },
-            KeyCode::Char('d') => {
-                self.show_delete_confirmation();
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                return Ok(DashboardAction::RecordAndTranscribe);
             }
-            KeyCode::Delete => {
-                self.show_delete_confirmation();
+            KeyCode::Char('t') | KeyCode::Char('T') => {
+                return Ok(DashboardAction::TranscribeSelected);
             }
             KeyCode::Char('p') | KeyCode::Char('P') => match self.play_selected_recording().await {
                 Ok(()) => {}
@@ -1118,9 +1331,15 @@ impl Dashboard {
                     self.show_message = true;
                 }
             },
+            KeyCode::Char('d') | KeyCode::Delete => {
+                self.show_delete_confirmation();
+            }
+            KeyCode::Char('/') => {
+                self.search_mode = true;
+                self.search_query.clear();
+            }
             _ => {}
         }
-
         Ok(DashboardAction::Continue)
     }
 
@@ -1226,6 +1445,11 @@ impl Dashboard {
             self.table_state.select(None);
         }
 
+        // Refresh greeting with updated recording data
+        if !self.owner_name.is_empty() {
+            self.generate_greeting();
+        }
+
         Ok(())
     }
 
@@ -1283,6 +1507,7 @@ impl Dashboard {
                         if let Some(idx) = self.entity_table_state.selected() {
                             if let Some(entity) = self.entities.get(idx) {
                                 self.selected_entity = Some(entity.clone());
+                                self.confirm_selection = 1; // default to No
                                 self.entity_mode = EntityMode::DeleteConfirm;
                             }
                         }
@@ -1308,8 +1533,6 @@ impl Dashboard {
                 match key_code {
                     KeyCode::Esc => {
                         self.entity_mode = EntityMode::Browse;
-                        self.owl_world_mood = OwlWorldMood::Idle;
-                        self.set_owl_quip_for_browse();
                     }
                     KeyCode::Tab | KeyCode::Down => {
                         self.entity_add_field = match self.entity_add_field {
@@ -1411,11 +1634,21 @@ impl Dashboard {
             }
             EntityMode::DeleteConfirm => {
                 match key_code {
-                    KeyCode::Char('y') | KeyCode::Char('Y') => {
-                        self.perform_entity_delete()?;
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.confirm_selection = 0;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.confirm_selection = 1;
+                    }
+                    KeyCode::Enter => {
+                        if self.confirm_selection == 0 {
+                            self.perform_entity_delete()?;
+                        } else {
+                            self.selected_entity = None;
+                        }
                         self.entity_mode = EntityMode::Browse;
                     }
-                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    KeyCode::Esc => {
                         self.selected_entity = None;
                         self.entity_mode = EntityMode::Browse;
                     }
@@ -1437,6 +1670,7 @@ impl Dashboard {
                                     .and_then(|e| e.id);
                                 if source_id != target.id {
                                     self.selected_entity = Some(target.clone());
+                                    self.confirm_selection = 1; // default to No
                                     self.entity_mode = EntityMode::MergeConfirm;
                                 }
                             }
@@ -1451,11 +1685,22 @@ impl Dashboard {
             }
             EntityMode::MergeConfirm => {
                 match key_code {
-                    KeyCode::Char('y') | KeyCode::Char('Y') => {
-                        self.perform_entity_merge()?;
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.confirm_selection = 0;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.confirm_selection = 1;
+                    }
+                    KeyCode::Enter => {
+                        if self.confirm_selection == 0 {
+                            self.perform_entity_merge()?;
+                        } else {
+                            self.selected_entity = None;
+                            self.merge_source_entity = None;
+                        }
                         self.entity_mode = EntityMode::Browse;
                     }
-                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    KeyCode::Esc => {
                         self.selected_entity = None;
                         self.merge_source_entity = None;
                         self.entity_mode = EntityMode::Browse;
@@ -1492,9 +1737,6 @@ impl Dashboard {
                 self.entity_edit_context = entity.context.clone().unwrap_or_default();
                 self.entity_edit_field = EntityEditField::Name;
                 self.entity_mode = EntityMode::Editing;
-                self.owl_world_mood = OwlWorldMood::Thinking;
-                self.owl_quip = "Editing... I'm watching closely.".to_string();
-                self.owl_quip_timer = 0;
             }
         }
     }
@@ -1537,7 +1779,6 @@ impl Dashboard {
             let _ = rebuild_world_from_entities(&self.db);
             self.load_entities()?;
             self.selected_entity = None;
-            self.set_owl_quip_action("Noted! Knowledge updated.");
         }
         Ok(())
     }
@@ -1557,9 +1798,6 @@ impl Dashboard {
             }
         }
         self.selected_entity = None;
-        self.owl_quip = "Gone but not forgotten... well, actually forgotten.".to_string();
-        self.owl_quip_timer = 30;
-        self.owl_world_mood = OwlWorldMood::Idle;
         Ok(())
     }
 
@@ -1577,25 +1815,7 @@ impl Dashboard {
 
         self.merge_source_entity = None;
         self.selected_entity = None;
-        self.set_owl_quip_action("Two become one. Efficient!");
         Ok(())
-    }
-
-    fn set_owl_quip_for_browse(&mut self) {
-        let count = self.entities.len();
-        self.owl_quip = match count {
-            0 => "Nothing here yet... record something and I'll fill this up!".to_string(),
-            1..=3 => "Just getting started... record more!".to_string(),
-            4..=10 => "A growing world... I like it.".to_string(),
-            _ => "Hoo knows everyone around here!".to_string(),
-        };
-        self.owl_quip_timer = 0;
-    }
-
-    fn set_owl_quip_action(&mut self, quip: &str) {
-        self.owl_quip = quip.to_string();
-        self.owl_quip_timer = 30;
-        self.owl_world_mood = OwlWorldMood::Celebrating;
     }
 
     fn start_entity_add(&mut self) {
@@ -1605,9 +1825,6 @@ impl Dashboard {
         self.entity_add_aliases.clear();
         self.entity_add_field = EntityEditField::Name;
         self.entity_mode = EntityMode::Adding;
-        self.owl_world_mood = OwlWorldMood::Thinking;
-        self.owl_quip = "Tell me about this new entry...".to_string();
-        self.owl_quip_timer = 0;
     }
 
     fn save_entity_add(&mut self) -> Result<()> {
@@ -1640,7 +1857,6 @@ impl Dashboard {
         if let Some(pos) = self.entities.iter().position(|e| e.canonical_name == self.entity_add_name.trim()) {
             self.entity_table_state.select(Some(pos));
         }
-        self.set_owl_quip_action("Hoo hoo! Welcome to the world!");
         Ok(())
     }
 
@@ -2037,6 +2253,7 @@ impl Dashboard {
         if let Some(selected) = self.table_state.selected() {
             if let Some(recording) = self.recordings.get(selected).cloned() {
                 self.delete_candidate = Some(recording);
+                self.delete_confirm_selection = 1; // default to No
                 self.show_delete_confirm = true;
             }
         }
@@ -2044,147 +2261,14 @@ impl Dashboard {
 
     async fn handle_transcript_keys(&mut self, key_code: KeyCode) -> Result<DashboardAction> {
         match key_code {
-            KeyCode::Up => {
-                // Scroll up (decrease offset)
-                if self.transcript_scroll_offset > 0 {
-                    self.transcript_scroll_offset = self.transcript_scroll_offset.saturating_sub(1);
-                }
-                Ok(DashboardAction::Continue)
-            }
-            KeyCode::Down => {
-                // Scroll down (increase offset)
-                let content_width = 120; // Conservative estimate for terminal width
-                let content_height = 25; // Conservative estimate for terminal height
-                let wrapped_lines =
-                    self.wrap_text_to_lines(&self.transcript_content, content_width);
-                let max_scroll = wrapped_lines.len().saturating_sub(content_height);
-                if self.transcript_scroll_offset < max_scroll {
-                    self.transcript_scroll_offset += 1;
-                }
-                Ok(DashboardAction::Continue)
-            }
-            KeyCode::Char('c') | KeyCode::Char('C') => {
-                // Copy transcript to clipboard
-                match self.copy_transcript_to_clipboard() {
-                    Ok(()) => {
-                        self.message = "Transcript copied to clipboard.".to_string();
-                        self.show_message = true;
-                    }
-                    Err(e) => {
-                        self.message = format!("Failed to copy to clipboard: {}", e);
-                        self.show_message = true;
-                    }
-                }
-                Ok(DashboardAction::Continue)
-            }
-            KeyCode::PageUp => {
-                // Page up (scroll up by larger amount)
-                self.transcript_scroll_offset = self.transcript_scroll_offset.saturating_sub(10);
-                Ok(DashboardAction::Continue)
-            }
-            KeyCode::PageDown => {
-                // Page down (scroll down by larger amount)
-                let content_width = 120; // Conservative estimate for terminal width
-                let content_height = 25; // Conservative estimate for terminal height
-                let wrapped_lines =
-                    self.wrap_text_to_lines(&self.transcript_content, content_width);
-                let max_offset = wrapped_lines.len().saturating_sub(content_height);
-                self.transcript_scroll_offset =
-                    std::cmp::min(self.transcript_scroll_offset + 10, max_offset);
-                Ok(DashboardAction::Continue)
-            }
-            KeyCode::Home => {
-                // Jump to top of transcript
-                self.transcript_scroll_offset = 0;
-                Ok(DashboardAction::Continue)
-            }
-            KeyCode::End => {
-                // Jump to bottom of transcript
-                let content_width = 120; // Conservative estimate for terminal width
-                let content_height = 25; // Conservative estimate for terminal height
-                let wrapped_lines =
-                    self.wrap_text_to_lines(&self.transcript_content, content_width);
-                if wrapped_lines.len() > content_height {
-                    self.transcript_scroll_offset =
-                        wrapped_lines.len().saturating_sub(content_height);
-                } else {
-                    self.transcript_scroll_offset = 0;
-                }
-                Ok(DashboardAction::Continue)
-            }
-            KeyCode::Char('g') => {
-                // Jump to top of transcript (vim-style, alternative to Home)
-                self.transcript_scroll_offset = 0;
-                Ok(DashboardAction::Continue)
-            }
-            KeyCode::Char('G') => {
-                // Jump to bottom of transcript (vim-style, alternative to End)
-                let content_width = 120; // Conservative estimate for terminal width
-                let content_height = 25; // Conservative estimate for terminal height
-                let wrapped_lines =
-                    self.wrap_text_to_lines(&self.transcript_content, content_width);
-                if wrapped_lines.len() > content_height {
-                    self.transcript_scroll_offset =
-                        wrapped_lines.len().saturating_sub(content_height);
-                } else {
-                    self.transcript_scroll_offset = 0;
-                }
-                Ok(DashboardAction::Continue)
-            }
-            KeyCode::Char('b') => {
-                // Page up (vim-style, alternative to PageUp)
-                self.transcript_scroll_offset = self.transcript_scroll_offset.saturating_sub(10);
-                Ok(DashboardAction::Continue)
-            }
-            KeyCode::Char('f') => {
-                // Page down (vim-style, alternative to PageDown)
-                let content_width = 120; // Conservative estimate for terminal width
-                let content_height = 25; // Conservative estimate for terminal height
-                let wrapped_lines =
-                    self.wrap_text_to_lines(&self.transcript_content, content_width);
-                let max_offset = wrapped_lines.len().saturating_sub(content_height);
-                self.transcript_scroll_offset =
-                    std::cmp::min(self.transcript_scroll_offset + 10, max_offset);
-                Ok(DashboardAction::Continue)
-            }
-            KeyCode::Char('t') | KeyCode::Char('T') => {
-                // Re-transcribe the current recording
-                if let Some(recording) = self.get_current_recording() {
-                    if self.has_active_transcription() {
-                        self.message = "Transcription already in progress".to_string();
-                        self.show_message = true;
-                        return Ok(DashboardAction::Continue);
-                    }
-
-                    // Close transcript view
-                    self.show_transcript = false;
-                    self.transcript_content.clear();
-                    self.transcript_scroll_offset = 0;
-
-                    // Enqueue re-transcription
-                    let transcription_mode = self.config.transcription.clone();
-                    let directory_name = recording.directory_name.clone();
-
-                    self.enqueue_transcription(PendingTranscription::Retranscribe {
-                        recording_name: directory_name,
-                        transcription_mode,
-                    });
-                }
-                Ok(DashboardAction::Continue)
-            }
             KeyCode::Esc => {
-                // Only Esc key closes the transcript (consistent behavior)
                 self.show_transcript = false;
                 self.transcript_content.clear();
-                self.transcript_scroll_offset = 0;
                 self.clear_enrichment_data();
                 self.restore_global_chat();
                 Ok(DashboardAction::Continue)
             }
-            _ => {
-                // Other keys are ignored (consistent behavior)
-                Ok(DashboardAction::Continue)
-            }
+            _ => Ok(DashboardAction::Continue),
         }
     }
 
@@ -2657,28 +2741,32 @@ impl Dashboard {
 
     async fn handle_delete_confirmation(&mut self, key_code: KeyCode) -> Result<DashboardAction> {
         match key_code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                // Confirm deletion
-                if let Some(recording) = self.delete_candidate.take() {
-                    match self.perform_delete_recording(recording).await {
-                        Ok(()) => {}
-                        Err(e) => {
-                            self.message = format!("Failed to delete recording: {}", e);
-                            self.show_message = true;
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.delete_confirm_selection = 0;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.delete_confirm_selection = 1;
+            }
+            KeyCode::Enter => {
+                if self.delete_confirm_selection == 0 {
+                    if let Some(recording) = self.delete_candidate.take() {
+                        match self.perform_delete_recording(recording).await {
+                            Ok(()) => {}
+                            Err(e) => {
+                                self.message = format!("Failed to delete recording: {}", e);
+                                self.show_message = true;
+                            }
                         }
                     }
                 }
                 self.show_delete_confirm = false;
                 self.delete_candidate = None;
             }
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                // Cancel deletion
+            KeyCode::Esc => {
                 self.show_delete_confirm = false;
                 self.delete_candidate = None;
             }
-            _ => {
-                // Any other key, just ignore
-            }
+            _ => {}
         }
         Ok(DashboardAction::Continue)
     }
@@ -2828,91 +2916,6 @@ impl Dashboard {
         Err(anyhow::anyhow!("No transcript file found (expected transcript.txt)"))
     }
 
-    fn wrap_text_to_lines(&self, text: &str, max_width: usize) -> Vec<String> {
-        let mut result = Vec::new();
-
-        for line in text.lines() {
-            if line.len() <= max_width {
-                result.push(line.to_string());
-            } else {
-                // Split long lines into multiple wrapped lines
-                let words: Vec<&str> = line.split_whitespace().collect();
-                let mut current_line = String::new();
-
-                for word in words {
-                    if word.len() > max_width {
-                        // Handle extremely long words by character breaking
-                        if !current_line.is_empty() {
-                            result.push(current_line);
-                            current_line = String::new();
-                        }
-
-                        let chars: Vec<char> = word.chars().collect();
-                        for chunk in chars.chunks(max_width) {
-                            result.push(chunk.iter().collect());
-                        }
-                    } else {
-                        let test_line = if current_line.is_empty() {
-                            word.to_string()
-                        } else {
-                            format!("{} {}", current_line, word)
-                        };
-
-                        if test_line.len() <= max_width {
-                            current_line = test_line;
-                        } else {
-                            result.push(current_line);
-                            current_line = word.to_string();
-                        }
-                    }
-                }
-
-                if !current_line.is_empty() {
-                    result.push(current_line);
-                }
-            }
-        }
-
-        // Handle edge case where text has no newlines at all
-        if result.is_empty() && !text.is_empty() {
-            let words: Vec<&str> = text.split_whitespace().collect();
-            let mut current_line = String::new();
-
-            for word in words {
-                if word.len() > max_width {
-                    if !current_line.is_empty() {
-                        result.push(current_line);
-                        current_line = String::new();
-                    }
-
-                    let chars: Vec<char> = word.chars().collect();
-                    for chunk in chars.chunks(max_width) {
-                        result.push(chunk.iter().collect());
-                    }
-                } else {
-                    let test_line = if current_line.is_empty() {
-                        word.to_string()
-                    } else {
-                        format!("{} {}", current_line, word)
-                    };
-
-                    if test_line.len() <= max_width {
-                        current_line = test_line;
-                    } else {
-                        result.push(current_line);
-                        current_line = word.to_string();
-                    }
-                }
-            }
-
-            if !current_line.is_empty() {
-                result.push(current_line);
-            }
-        }
-
-        result
-    }
-
     fn copy_transcript_to_clipboard(&self) -> Result<()> {
         use arboard::Clipboard;
 
@@ -2928,6 +2931,7 @@ impl Dashboard {
     fn ui(&mut self, f: &mut Frame) {
         match self.current_view {
             DashboardView::Main => self.render_main_dashboard(f),
+            DashboardView::Browse => self.render_browse_view(f),
             DashboardView::Help => self.render_help(f, f.size()),
             DashboardView::Settings => self.render_settings(f, f.size()),
             DashboardView::Entities => self.render_entities_view(f, f.size()),
@@ -2937,6 +2941,11 @@ impl Dashboard {
 
     fn render_main_dashboard(&mut self, f: &mut Frame) {
         let size = f.size();
+
+        if self.recording_task.is_some() {
+            self.render_recording_view(f, size);
+            return;
+        }
 
         if self.show_file_dialog {
             self.render_file_dialog_popup(f, size);
@@ -2958,417 +2967,387 @@ impl Dashboard {
             return;
         }
 
-        // Dynamic chat panel height (unified: suggestions/messages + input in one block)
-        let has_chat_content = !self.chat.messages.is_empty()
-            || !self.chat.pending_blocks.is_empty()
-            || self.chat.is_generating;
-
-        let chat_panel_height: u16 = if has_chat_content {
-            let available = size.height.saturating_sub(5 + 1); // header + footer
-            (available * 65 / 100).max(10)
+        // Center-constrain only the home screen; full width once chatting
+        let content_area = if self.chat.show_home_screen && self.chat.messages.is_empty() {
+            let max_width: u16 = 90;
+            let h_pad = size.width.saturating_sub(max_width) / 2;
+            Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Length(h_pad),
+                    Constraint::Min(1),
+                    Constraint::Length(h_pad),
+                ])
+                .split(size)[1]
         } else {
-            // Suggestions + input + borders: enough for suggestions + input line
-            (self.chat.suggestions.len() as u16 + 4).max(5).min(8)
+            size
         };
 
         let main_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(5),                // Header (owl + text)
-                Constraint::Min(6),                   // Recordings Table (shrinks when chat grows)
-                Constraint::Length(chat_panel_height), // Unified chat panel
-                Constraint::Length(1),                // Footer (compressed)
+                Constraint::Min(6),   // Chat
+                Constraint::Length(2), // Footer
             ])
-            .split(size);
+            .split(content_area);
 
-        // Header
-        self.render_header(f, main_chunks[0]);
+        self.chat.render(f, main_chunks[0]);
+        self.render_home_footer(f, main_chunks[1]);
 
-        // Table (with stats in title)
-        self.render_recordings_table(f, main_chunks[1]);
-
-        // Unified chat panel
-        self.chat.render(f, main_chunks[2]);
-
-        // Compressed footer
-        self.render_compressed_footer(f, main_chunks[3]);
-
-        // Search input overlay
         if self.search_mode {
             self.render_search_input(f, size);
         }
     }
 
-    fn render_header(&self, f: &mut Frame, area: ratatui::layout::Rect) {
-        use ratatui::text::{Line, Span};
+    fn render_browse_view(&mut self, f: &mut Frame) {
+        let size = f.size();
 
-        let cycle = self.header_anim_frame % 300;
-        let yellow_bold = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
-        let gray = Style::default().fg(Color::DarkGray);
+        if self.recording_task.is_some() {
+            self.render_recording_view(f, size);
+            return;
+        }
 
-        let inner_width = (area.width as usize).saturating_sub(2);
-        let logo_end: usize = 28;
-        let trail_len = inner_width.saturating_sub(logo_end + 2);
-        let skip_anim = trail_len < 10;
+        if self.show_file_dialog {
+            self.render_file_dialog_popup(f, size);
+            return;
+        }
 
-        let logo_lines = [
-            "         ╔═╗╔═╗╦═╗╦╔╗ ╔═╗",
-            "         ╚═╗║  ╠╦╝║╠╩╗╠═╣",
-            "         ╚═╝╚═╝╩╚═╩╚═╝╩ ╩",
-        ];
+        if self.show_message {
+            self.render_message_popup(f, size);
+            return;
+        }
 
-        let lines = if skip_anim || cycle < 120 || cycle >= 290 {
-            // Idle A (0-119), Idle B (290-299), or narrow terminal fallback
-            let is_blink = (cycle % 40) < 3;
-            let face = if is_blink { "(-,-)" } else { "(o,o)" };
-            vec![
-                Line::from(Span::styled(
-                    format!("  {}  ╔═╗╔═╗╦═╗╦╔╗ ╔═╗", face),
-                    yellow_bold,
-                )),
-                Line::from(Span::styled(
-                    "  {`\"'}  ╚═╗║  ╠╦╝║╠╩╗╠═╣",
-                    yellow_bold,
-                )),
-                Line::from(vec![
-                    Span::styled(
-                        "  -\"-\"-  ╚═╝╚═╝╩╚═╩╚═╝╩ ╩",
-                        yellow_bold,
-                    ),
-                    Span::styled(
-                        " — hoo remembers everything",
-                        gray,
-                    ),
-                ]),
-            ]
-        } else if cycle < 130 {
-            // Owl notices ground (120-129): eyes look right, no trail yet
-            let notice = cycle - 120; // 0..9
-            let face = if notice < 5 { "(o,>)" } else { "(O,>)" };
-            vec![
-                Line::from(Span::styled(
-                    format!("  {}  ╔═╗╔═╗╦═╗╦╔╗ ╔═╗", face),
-                    yellow_bold,
-                )),
-                Line::from(Span::styled(
-                    "  {`\"'}  ╚═╗║  ╠╦╝║╠╩╗╠═╣",
-                    yellow_bold,
-                )),
-                Line::from(vec![
-                    Span::styled(
-                        "  -\"-\"-  ╚═╝╚═╝╩╚═╩╚═╝╩ ╩",
-                        yellow_bold,
-                    ),
-                    Span::styled(
-                        " — hoo remembers everything",
-                        gray,
-                    ),
-                ]),
-            ]
-        } else if cycle < 180 {
-            // Wing cut (130-179): owl flies right on line 1, wing scores sand trail
-            let cut = cycle - 130; // 0..49
-            let progress = cut as f64 / 49.0;
-            let eased = if progress < 0.5 {
-                2.0 * progress * progress
-            } else {
-                1.0 - (-2.0 * progress + 2.0).powi(2) / 2.0
-            };
-            let max_cut = trail_len.saturating_sub(1);
-            let cut_pos = (eased * max_cut as f64) as usize;
-            // Owl face on line 1, centered above the wing tip
-            let owl_face = "(o,o)";
-            let owl_col = cut_pos.saturating_sub(2).min(trail_len.saturating_sub(5));
-            let owl_gap = " ".repeat(owl_col);
-            // Trail on line 2: scored dots behind wing + wing tip + blank ahead
-            let wing = if cut % 2 == 0 { "\\" } else { "/" };
-            let scored: String = "·".repeat(cut_pos);
-            vec![
-                Line::from(Span::styled(logo_lines[0], yellow_bold)),
-                Line::from(vec![
-                    Span::styled(logo_lines[1], yellow_bold),
-                    Span::styled(format!(" {}{}", owl_gap, owl_face), yellow_bold),
-                ]),
-                Line::from(vec![
-                    Span::styled(logo_lines[2], yellow_bold),
-                    Span::styled(format!(" {}", scored), gray),
-                    Span::styled(wing, yellow_bold),
-                ]),
-            ]
-        } else if cycle < 195 {
-            // Return (180-194): owl flies back to start, full trail visible
-            let ret = cycle - 180; // 0..14
-            let progress = ret as f64 / 14.0;
-            let eased = 1.0 - (1.0 - progress).powi(2); // ease-out
-            let max_pos = trail_len.saturating_sub(5);
-            let gap_size = ((1.0 - eased) * max_pos as f64) as usize;
-            let gap = " ".repeat(gap_size);
-            let owl_face = if ret % 2 == 0 { "~(o,o)~" } else { " (o,o) " };
-            let trail: String = "·".repeat(trail_len);
-            vec![
-                Line::from(Span::styled(logo_lines[0], yellow_bold)),
-                Line::from(vec![
-                    Span::styled(logo_lines[1], yellow_bold),
-                    Span::styled(format!(" {}{}", gap, owl_face), yellow_bold),
-                ]),
-                Line::from(vec![
-                    Span::styled(logo_lines[2], yellow_bold),
-                    Span::styled(format!(" {}", trail), gray),
-                ]),
-            ]
-        } else if cycle < 250 {
-            // Owl eats trail (195-249): owl on line 1 above trail, vacuums dots upward
-            let eat = cycle - 195; // 0..54
-            let progress = eat as f64 / 54.0;
-            let eased = if progress < 0.5 {
-                2.0 * progress * progress
-            } else {
-                1.0 - (-2.0 * progress + 2.0).powi(2) / 2.0
-            };
-            // Eating front: how far into the trail the owl has eaten
-            let max_eat = trail_len.saturating_sub(1);
-            let eat_pos = (eased * max_eat as f64) as usize;
-            // Owl face on line 1, centered above the eating front
-            let owl_face = if eat % 2 == 0 { "(o,o)" } else { "(O,O)" };
-            let owl_col = eat_pos.saturating_sub(2).min(trail_len.saturating_sub(5));
-            let owl_gap = " ".repeat(owl_col);
-            // Trail on line 2: eaten (blank) + suction char + remaining dots
-            let suction = if eat % 2 == 0 { "'" } else { "^" };
-            let eaten_blank = " ".repeat(eat_pos);
-            let remaining = trail_len.saturating_sub(eat_pos + 1);
-            let dots: String = "·".repeat(remaining);
-            vec![
-                Line::from(Span::styled(logo_lines[0], yellow_bold)),
-                Line::from(vec![
-                    Span::styled(logo_lines[1], yellow_bold),
-                    Span::styled(format!(" {}{}", owl_gap, owl_face), yellow_bold),
-                ]),
-                Line::from(vec![
-                    Span::styled(logo_lines[2], yellow_bold),
-                    Span::styled(format!(" {}{}", eaten_blank, suction), yellow_bold),
-                    Span::styled(dots, gray),
-                ]),
-            ]
-        } else if cycle < 265 {
-            // Crazy celebration (250-264): owl ecstatic, shouts HOOOOOO!!
-            let celeb = cycle - 250; // 0..14
-            // Fast-cycling crazy sprites (every 2 frames)
-            let owl_str = match (celeb / 2) % 4 {
-                0 => "\\(@,@)/",
-                1 => "/(O,O)\\",
-                2 => "\\(x,X)/",
-                _ => "|(O,o)|",
-            };
-            let owl_col = trail_len.saturating_sub(7);
-            let owl_gap = " ".repeat(owl_col);
-            // Growing "HOOOOOO!!" shout on line 2, expanding right-to-left
-            let shout_target = ((celeb + 1) as f64 / 15.0 * trail_len as f64) as usize;
-            let shout_len = shout_target.max(4).min(trail_len);
-            let num_os = shout_len.saturating_sub(3).max(1);
-            let shout = format!("H{}!!", "O".repeat(num_os));
-            let shout_gap = " ".repeat(trail_len.saturating_sub(shout.len()));
-            vec![
-                Line::from(Span::styled(logo_lines[0], yellow_bold)),
-                Line::from(vec![
-                    Span::styled(logo_lines[1], yellow_bold),
-                    Span::styled(format!(" {}{}", owl_gap, owl_str), yellow_bold),
-                ]),
-                Line::from(vec![
-                    Span::styled(logo_lines[2], yellow_bold),
-                    Span::styled(format!(" {}{}", shout_gap, shout), yellow_bold),
-                ]),
-            ]
-        } else {
-            // Fly back (265-289): owl flaps back to rest position
-            let fly = cycle - 265; // 0..24
-            let progress = fly as f64 / 24.0;
-            let eased = 1.0 - (1.0 - progress).powi(2); // ease-out
-            let max_pos = trail_len.saturating_sub(7);
-            let gap_size = ((1.0 - eased) * max_pos as f64) as usize;
-            let gap = " ".repeat(gap_size);
-            let owl_str = if fly % 2 == 0 { "~(o,o)~" } else { " (o,o) " };
-            vec![
-                Line::from(vec![
-                    Span::styled(logo_lines[0], yellow_bold),
-                    Span::styled(
-                        format!(" {}{}", gap, owl_str),
-                        yellow_bold,
-                    ),
-                ]),
-                Line::from(Span::styled(logo_lines[1], yellow_bold)),
-                Line::from(vec![
-                    Span::styled(logo_lines[2], yellow_bold),
-                    Span::styled(
-                        " — hoo remembers everything",
-                        gray,
-                    ),
-                ]),
-            ]
-        };
+        if self.show_transcript {
+            self.render_transcript_popup(f, size);
+            return;
+        }
 
-        let header = Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .style(Style::default().fg(Color::Cyan))
-                    .border_type(ratatui::widgets::BorderType::Double),
-            );
-        f.render_widget(header, area);
+        if self.show_delete_confirm {
+            self.render_delete_confirmation_popup(f, size);
+            return;
+        }
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(6),   // Recording list
+                Constraint::Length(2), // Footer (separator + line)
+            ])
+            .split(size);
+
+        self.render_recording_list(f, chunks[0]);
+        self.render_browse_footer(f, chunks[1]);
+
+        if self.search_mode {
+            self.render_search_input(f, size);
+        }
     }
 
-    fn render_recordings_table(&mut self, f: &mut Frame, area: ratatui::layout::Rect) {
-        let header_cells = ["#", "Status", "Name", "Duration", "Model", "Created"]
-            .iter()
-            .map(|h| {
-                Cell::from(*h).style(
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                )
-            });
+    fn render_home_footer(&self, f: &mut Frame, area: ratatui::layout::Rect) {
+        // Align footer with chat box: 1 char left pad, 3 chars right pad
+        let aligned = Rect {
+            x: area.x + 1,
+            width: area.width.saturating_sub(4),
+            ..area
+        };
 
-        let header = Row::new(header_cells)
-            .style(Style::default())
-            .height(1)
-            .bottom_margin(1);
+        // Notification override
+        if let Some((ref msg, _)) = self.notification_message {
+            let is_error = msg.contains("failed") || msg.contains("Failed");
+            let style = if is_error {
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+            };
+            let para = Paragraph::new(msg.as_str())
+                .style(style)
+                .alignment(Alignment::Center);
+            f.render_widget(para, aligned);
+            return;
+        }
 
-        let rows: Vec<Row> = self
-            .recordings
-            .iter()
-            .enumerate()
-            .map(|(i, recording)| {
-                let display_name = recording
-                    .display_name
-                    .as_ref()
-                    .unwrap_or(&recording.directory_name);
+        // Separator line
+        let sep = "\u{2500}".repeat(aligned.width as usize);
+        f.render_widget(
+            Paragraph::new(sep).style(Style::default().fg(Color::Indexed(237))),
+            Rect { x: aligned.x, y: aligned.y, width: aligned.width, height: 1 },
+        );
 
-                let duration = recording
-                    .duration_seconds
-                    .map(|d| self.format_duration(d))
-                    .unwrap_or_else(|| "Unknown".to_string());
+        // Footer content area (below separator)
+        let footer_area = if aligned.height > 1 {
+            Rect { x: aligned.x, y: aligned.y + 1, width: aligned.width, height: aligned.height - 1 }
+        } else {
+            aligned
+        };
 
-                let is_active = self.active_transcription.as_ref()
-                    .is_some_and(|a| a.recording_name == recording.directory_name);
-                let is_queued = !is_active
-                    && self.transcription_queue.iter().any(|p| p.recording_name() == recording.directory_name);
-                let status = if is_active {
-                    match self.progress_frame % 4 {
-                        0 => "[|]",
-                        1 => "[/]",
-                        2 => "[-]",
-                        _ => "[\\]",
-                    }
-                } else if is_queued {
-                    "[Q]"
-                } else if recording.has_transcript {
-                    "[T]"
-                } else {
-                    "[A]"
+        // Left side: ▸ scriba · v0.21.2
+        let version = env!("CARGO_PKG_VERSION");
+        let left_spans = vec![
+            Span::styled(" \u{25B8} ", Style::default().fg(ACCENT)),
+            Span::styled(format!("scriba \u{00B7} v{}", version), Style::default().fg(Color::DarkGray)),
+        ];
+
+        // Right side: shortcuts (context-dependent)
+        let in_chat = !self.chat.show_home_screen && !self.chat.messages.is_empty();
+        let mut right_spans: Vec<Span> = Vec::new();
+        if in_chat {
+            right_spans.extend([
+                Span::styled("[", Style::default().fg(Color::DarkGray)),
+                Span::styled("Esc", Style::default().fg(Color::White)),
+                Span::styled("] Home  ", Style::default().fg(Color::DarkGray)),
+            ]);
+        }
+        right_spans.extend([
+            Span::styled("[", Style::default().fg(Color::DarkGray)),
+            Span::styled("Tab", Style::default().fg(Color::White)),
+            Span::styled("] Browse  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(Color::DarkGray)),
+            Span::styled("Ctrl+R", Style::default().fg(Color::White)),
+            Span::styled("] Record  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(Color::DarkGray)),
+            Span::styled("?", Style::default().fg(Color::White)),
+            Span::styled("] Help ", Style::default().fg(Color::DarkGray)),
+        ]);
+
+        // Compute widths to fill gap with spaces
+        let left_width: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
+        let right_width: usize = right_spans.iter().map(|s| s.content.chars().count()).sum();
+        let gap = (footer_area.width as usize).saturating_sub(left_width + right_width);
+
+        let mut spans = left_spans;
+        spans.push(Span::raw(" ".repeat(gap)));
+        spans.extend(right_spans);
+
+        let line = Line::from(spans);
+        f.render_widget(Paragraph::new(line), footer_area);
+    }
+
+    fn render_browse_footer(&self, f: &mut Frame, area: ratatui::layout::Rect) {
+        // Notification override
+        if let Some((ref msg, _)) = self.notification_message {
+            let is_error = msg.contains("failed") || msg.contains("Failed");
+            let style = if is_error {
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+            };
+            let para = Paragraph::new(msg.as_str())
+                .style(style)
+                .alignment(Alignment::Center);
+            f.render_widget(para, area);
+            return;
+        }
+
+        // Separator line
+        let sep = "\u{2500}".repeat(area.width as usize);
+        f.render_widget(
+            Paragraph::new(sep).style(Style::default().fg(Color::Indexed(237))),
+            Rect { x: area.x, y: area.y, width: area.width, height: 1 },
+        );
+
+        // Footer content area (below separator)
+        let footer_area = if area.height > 1 {
+            Rect { x: area.x, y: area.y + 1, width: area.width, height: area.height - 1 }
+        } else {
+            area
+        };
+
+        // Left side: ▸ scriba · v0.21.2 · N recordings · Xh Ym
+        let version = env!("CARGO_PKG_VERSION");
+        let rec_count = self.stats.as_ref().map(|s| s.total_recordings).unwrap_or(0);
+        let total_secs = self.stats.as_ref().map(|s| s.total_duration_seconds).unwrap_or(0);
+        let total_h = total_secs / 3600;
+        let total_m = (total_secs % 3600) / 60;
+        let duration_str = if total_h > 0 {
+            format!("{}h {}m", total_h, total_m)
+        } else {
+            format!("{}m", total_m)
+        };
+
+        let mut left_spans = vec![
+            Span::styled(" \u{25B8} ", Style::default().fg(ACCENT)),
+            Span::styled(
+                format!("scriba \u{00B7} v{} \u{00B7} {} recordings \u{00B7} {}", version, rec_count, duration_str),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ];
+
+        // Transcribing indicator
+        if self.active_transcription.is_some() {
+            left_spans.push(Span::styled(
+                " \u{00B7} Transcribing...",
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+
+        // Right side: shortcuts
+        let right_spans = vec![
+            Span::styled("[", Style::default().fg(Color::DarkGray)),
+            Span::styled("Tab", Style::default().fg(Color::White)),
+            Span::styled("] Home  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(Color::DarkGray)),
+            Span::styled("Ctrl+R", Style::default().fg(Color::White)),
+            Span::styled("] Record  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(Color::DarkGray)),
+            Span::styled("/", Style::default().fg(Color::White)),
+            Span::styled("] Search ", Style::default().fg(Color::DarkGray)),
+        ];
+
+        // Compute widths to fill gap
+        let left_width: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
+        let right_width: usize = right_spans.iter().map(|s| s.content.chars().count()).sum();
+        let gap = (footer_area.width as usize).saturating_sub(left_width + right_width);
+
+        let mut spans = left_spans;
+        spans.push(Span::raw(" ".repeat(gap)));
+        spans.extend(right_spans);
+
+        let line = Line::from(spans);
+        f.render_widget(Paragraph::new(line), footer_area);
+    }
+
+
+    fn render_recording_list(&mut self, f: &mut Frame, area: ratatui::layout::Rect) {
+        if self.recordings.is_empty() {
+            let msg = if self.search_query.is_empty() {
+                "No recordings yet. Press Ctrl+R to start recording."
+            } else {
+                "No recordings match your search."
+            };
+            let para = Paragraph::new(msg)
+                .style(Style::default().fg(Color::DarkGray))
+                .alignment(Alignment::Center);
+            f.render_widget(para, area);
+            return;
+        }
+
+        let selected_idx = self.table_state.selected().unwrap_or(0);
+        let today = chrono::Local::now().date_naive();
+        let yesterday = today - chrono::Duration::days(1);
+
+        // Build lines and track which line maps to which recording index
+        let mut lines: Vec<Line> = Vec::new();
+        let mut line_to_recording: Vec<Option<usize>> = Vec::new();
+        let mut current_group: Option<String> = None;
+
+        let name_col_width = (area.width as usize).saturating_sub(16); // leave room for prefix + duration + time
+
+        for (i, recording) in self.recordings.iter().enumerate() {
+            let rec_date = recording.created_at.with_timezone(&chrono::Local).date_naive();
+            let group_label = if rec_date == today {
+                "Today".to_string()
+            } else if rec_date == yesterday {
+                "Yesterday".to_string()
+            } else {
+                rec_date.format("%b %-d").to_string()
+            };
+
+            if current_group.as_ref() != Some(&group_label) {
+                // Blank line before group (except first)
+                if current_group.is_some() {
+                    lines.push(Line::from(""));
+                    line_to_recording.push(None);
+                }
+                // Date header
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", group_label),
+                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+                )));
+                line_to_recording.push(None);
+                current_group = Some(group_label);
+            }
+
+            let is_selected = i == selected_idx;
+            let is_active = self.active_transcription.as_ref()
+                .is_some_and(|a| a.recording_name == recording.directory_name);
+            let is_queued = !is_active
+                && self.transcription_queue.iter().any(|p| p.recording_name() == recording.directory_name);
+
+            // Selection marker
+            let marker = if is_selected { "\u{25B8} " } else { "  " };
+            let marker_style = Style::default().fg(Color::White);
+
+            // Status dot
+            let (dot, dot_style) = if is_active {
+                let spinner = match self.progress_frame % 4 {
+                    0 => "\u{25D0}",
+                    1 => "\u{25D3}",
+                    2 => "\u{25D1}",
+                    _ => "\u{25D2}",
                 };
-                let created = recording.created_at.format("%m/%d %H:%M").to_string();
+                (spinner, Style::default().fg(Color::Yellow))
+            } else if is_queued {
+                ("\u{25CB}", Style::default().fg(Color::Yellow))
+            } else if recording.has_transcript {
+                ("\u{25CF}", Style::default().fg(ACCENT))
+            } else {
+                ("\u{25CB}", Style::default().fg(Color::DarkGray))
+            };
 
-                // Calculate global index across all pages
-                let global_index = (self.current_page * self.page_size) + i + 1;
+            // Name
+            let display_name = recording.display_name.as_ref()
+                .unwrap_or(&recording.directory_name);
+            let name_style = if is_selected {
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Indexed(249))
+            };
 
-                // Format model used for display
-                let model_display = if recording.has_transcript {
-                    // Parse the model_used field to show a user-friendly format
-                    match recording.model_used.as_str() {
-                        // API models
-                        "whisper-1" => "API",
-                        s if s.starts_with("gpt") || s.contains("openai") => "API",
-                        // Local models - extract size from format like "whisper-tiny", "whisper-turbo"
-                        s if s.starts_with("whisper-") => {
-                            let size = s.strip_prefix("whisper-").unwrap_or("");
-                            match size {
-                                "tiny" => "Tiny",
-                                "base" => "Base",
-                                "small" => "Small",
-                                "medium" => "Medium",
-                                "large" => "Large",
-                                "large-v2" => "Large-v2",
-                                "large-v3" => "Large-v3",
-                                "turbo" => "Turbo",
-                                _ => "Local",
-                            }
-                        }
-                        // Legacy formats
-                        "whisper" | "whisper.cpp" | "whisper-rs" => "Local",
-                        // Unknown/empty
-                        s if s.is_empty() => "-",
-                        _ => &recording.model_used,
+            // Duration (short format)
+            let duration = recording.duration_seconds
+                .map(|d| {
+                    let mins = d / 60;
+                    if mins >= 60 {
+                        format!("{}h{}m", mins / 60, mins % 60)
+                    } else {
+                        format!("{}m", mins)
                     }
-                } else {
-                    "-"
-                };
+                })
+                .unwrap_or_default();
 
-                let cells = vec![
-                    Cell::from(global_index.to_string()),
-                    Cell::from(status).style(if is_active || is_queued {
-                        Style::default().fg(Color::Yellow)
-                    } else if recording.has_transcript {
-                        Style::default().fg(Color::Green)
-                    } else {
-                        Style::default().fg(Color::Blue)
-                    }),
-                    Cell::from(display_name.clone()),
-                    Cell::from(duration),
-                    Cell::from(model_display).style(if model_display == "API" {
-                        Style::default().fg(Color::Cyan)
-                    } else if model_display == "-" {
-                        Style::default().fg(Color::Gray)
-                    } else {
-                        Style::default().fg(Color::Yellow)
-                    }),
-                    Cell::from(created),
-                ];
+            // Time
+            let time = recording.created_at
+                .with_timezone(&chrono::Local)
+                .format("%H:%M")
+                .to_string();
 
-                Row::new(cells).height(1).bottom_margin(0)
-            })
-            .collect();
+            // Truncate name to fit
+            let right_part = format!("{:>6}  {}", duration, time);
+            let max_name = name_col_width.saturating_sub(right_part.len() + 6); // 6 = "  ▸ ● "
+            let truncated_name: String = if display_name.chars().count() > max_name {
+                display_name.chars().take(max_name.saturating_sub(1)).collect::<String>() + "\u{2026}"
+            } else {
+                display_name.clone()
+            };
+            let name_padding = max_name.saturating_sub(truncated_name.chars().count());
 
-        let table = Table::new(
-            rows,
-            [
-                Constraint::Length(4),  // #
-                Constraint::Length(8),  // Status
-                Constraint::Min(15),    // Name (flexible)
-                Constraint::Length(10), // Duration
-                Constraint::Length(8),  // Model
-                Constraint::Length(12), // Created
-            ],
-        )
-        .header(header)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .style(Style::default().fg(Color::Cyan))
-                .title({
-                    let start_index = (self.current_page * self.page_size) + 1;
-                    let end_index = start_index + self.recordings.len() - 1;
-                    let stats_suffix = if let Some(stats) = &self.stats {
-                        format!(" — {} total, {}", stats.total_recordings, stats.format_duration())
-                    } else {
-                        String::new()
-                    };
-                    format!(
-                        "Recordings (Page {} - #{}-#{}){}",
-                        self.current_page + 1,
-                        start_index,
-                        end_index,
-                        stats_suffix
-                    )
-                }),
-        )
-        .highlight_style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("▶ ");
+            let spans = vec![
+                Span::styled(format!("  {}", marker), marker_style),
+                Span::styled(format!("{} ", dot), dot_style),
+                Span::styled(truncated_name, name_style),
+                Span::raw(" ".repeat(name_padding)),
+                Span::styled(right_part, Style::default().fg(Color::DarkGray)),
+            ];
 
-        f.render_stateful_widget(table, area, &mut self.table_state);
+            lines.push(Line::from(spans));
+            line_to_recording.push(Some(i));
+        }
+
+        // Find the line index for the selected recording to keep it in view
+        let selected_line = line_to_recording.iter()
+            .position(|r| *r == Some(selected_idx))
+            .unwrap_or(0);
+
+        // Calculate scroll offset
+        let visible_height = area.height as usize;
+        let scroll = if selected_line >= visible_height {
+            selected_line - visible_height + 2 // keep 1 line below selected visible
+        } else {
+            0
+        };
+
+        let para = Paragraph::new(lines).scroll((scroll as u16, 0));
+        f.render_widget(para, area);
     }
 
     fn render_help(&self, f: &mut Frame, area: ratatui::layout::Rect) {
@@ -3395,44 +3374,33 @@ impl Dashboard {
         let help_text = vec![
             Line::from("SCRIBA HELP"),
             Line::from(""),
-            Line::from("Quick Actions:"),
-            Line::from("  R          - Record Audio + Auto-Transcribe (Esc to stop)"),
-            Line::from("  A          - Add External Audio File & Transcribe"),
-            Line::from("  T          - Transcribe Selected Recording (also in transcript view)"),
+            Line::from("Global Shortcuts:"),
+            Line::from("  Ctrl+R     - Record audio (Esc to stop)"),
+            Line::from("  Tab        - Browse recordings"),
+            Line::from("  Ctrl+S     - Settings"),
+            Line::from("  Ctrl+W     - World (entities)"),
+            Line::from("  ?/F1       - Show this help"),
+            Line::from("  Esc        - Back / Quit"),
             Line::from(""),
-            Line::from("Navigation:"),
-            Line::from("  ↑/↓        - Navigate recordings"),
-            Line::from("  PgUp/PgDn  - Change pages (or '['/']')"),
+            Line::from("Home:"),
+            Line::from("  Type in the chat box to ask questions about your recordings"),
+            Line::from(""),
+            Line::from("Browse:"),
+            Line::from("  \u{2191}/\u{2193}        - Navigate recordings"),
+            Line::from("  PgUp/PgDn  - Change pages"),
             Line::from("  Enter      - View transcript"),
             Line::from("  P          - Play recording"),
-            Line::from(""),
-            Line::from("Actions:"),
-            Line::from("  D          - Delete recording (with confirmation)"),
+            Line::from("  D          - Delete recording"),
             Line::from("  /          - Search recordings"),
-            Line::from("  S          - Settings (transcription mode, models)"),
-            Line::from("  H/F1       - Show this help"),
-            Line::from("  Q/Esc      - Quit"),
+            Line::from("  A          - Add external audio file"),
             Line::from(""),
             Line::from("Transcript Viewer:"),
-            Line::from("  ↑/↓        - Scroll up/down"),
-            Line::from("  PgUp/PgDn  - Page up/down (or 'b'/'f')"),
-            Line::from("  Home/End   - Jump to top/bottom (or 'g'/'G')"),
-            Line::from("  C          - Copy transcript to clipboard"),
-            Line::from("  T          - Re-transcribe recording"),
-            Line::from("  ESC        - Close transcript"),
+            Line::from("  \u{2191}/\u{2193}        - Scroll"),
+            Line::from("  Ctrl+Y     - Copy transcript"),
+            Line::from("  Ctrl+T     - Re-transcribe"),
+            Line::from("  Esc        - Close"),
             Line::from(""),
-            Line::from("Recording Control:"),
-            Line::from("  • Press R/A to start recording immediately"),
-            Line::from("  • Press Esc during recording to stop and save"),
-            Line::from("  • Real-time progress indicators for all operations"),
-            Line::from(""),
-            Line::from("Features:"),
-            Line::from("  • Statistics always visible at bottom"),
-            Line::from("  • Full-text search through transcripts"),
-            Line::from("  • Integrated playback support"),
-            Line::from("  • Direct recording from dashboard"),
-            Line::from(""),
-            Line::from("Press Esc to continue..."),
+            Line::from("Press Esc to close this help."),
         ];
 
         let help_paragraph = Paragraph::new(help_text)
@@ -3449,201 +3417,131 @@ impl Dashboard {
     }
 
     fn render_settings(&self, f: &mut Frame, area: ratatui::layout::Rect) {
-        let popup_area = Layout::default()
+        // Full-screen borderless layout: header + body + footer
+        let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Percentage(15),
-                Constraint::Percentage(70),
-                Constraint::Percentage(15),
+                Constraint::Length(2),  // Header
+                Constraint::Min(10),   // Body
+                Constraint::Length(2),  // Footer
             ])
-            .split(area)[1];
+            .split(area);
 
-        let popup_area = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(15),
-                Constraint::Percentage(70),
-                Constraint::Percentage(15),
-            ])
-            .split(popup_area)[1];
+        // ── Header ──────────────────────────────────────────────────
+        let header_line = Line::from(vec![
+            Span::raw("  "),
+            Span::styled("Settings", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        ]);
+        f.render_widget(Paragraph::new(header_line), Rect { x: chunks[0].x, y: chunks[0].y, width: chunks[0].width, height: 1 });
+        let sep = "\u{2500}".repeat(chunks[0].width as usize);
+        f.render_widget(
+            Paragraph::new(sep).style(Style::default().fg(Color::Indexed(237))),
+            Rect { x: chunks[0].x, y: chunks[0].y + 1, width: chunks[0].width, height: 1 },
+        );
 
-        f.render_widget(Clear, popup_area);
+        // ── Body ────────────────────────────────────────────────────
+        let label_style = Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD);
+        let val_normal = Style::default().fg(Color::White);
+        let val_selected = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+        let val_editing = Style::default().fg(Color::Green).add_modifier(Modifier::BOLD);
+        let hint_style = Style::default().fg(Color::DarkGray);
+        let val_disabled = Style::default().fg(Color::DarkGray);
+        let section_style = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+        let pad = 20; // label column width
 
-        let mut settings_text = vec![
-            Line::from(vec![Span::styled(
-                "SETTINGS",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )]),
-            Line::from(""),
-        ];
+        let sel = self.settings_selection;
+        let mut lines: Vec<Line> = Vec::new();
 
-        // Current transcription mode
-        let mode_text = match &self.config.transcription {
-            TranscriptionMode::Local { model_size } => {
-                format!("Local (Whisper {})  <- Press Enter to change", model_size)
-            }
-            TranscriptionMode::Api { .. } => "OpenAI API  <- Press Enter to change".to_string(),
+        // Helper closure-like macro for building a setting line
+        macro_rules! setting_line {
+            ($label:expr, $value:expr, $idx:expr, $hint:expr, $style_override:expr) => {{
+                let padded_label = format!("  {:<width$}", $label, width = pad);
+                let is_sel = sel == $idx;
+                let v_style = if let Some(s) = $style_override { s } else if is_sel { val_selected } else { val_normal };
+                let mut spans = vec![
+                    Span::styled(padded_label, label_style),
+                    Span::styled($value.to_string(), v_style),
+                ];
+                if is_sel && !$hint.is_empty() {
+                    spans.push(Span::styled(format!("  {}", $hint), hint_style));
+                }
+                lines.push(Line::from(spans));
+            }};
+        }
+
+        // ── TRANSCRIPTION ───────────────────────────────────────────
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::raw("  "), Span::styled("TRANSCRIPTION", section_style)]));
+
+        let mode_value = match &self.config.transcription {
+            TranscriptionMode::Local { model_size } => format!("Local (Whisper {})", model_size),
+            TranscriptionMode::Api { .. } => "OpenAI API".to_string(),
         };
-
-        let mode_style = if self.settings_selection == 0 {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White)
-        };
-
-        settings_text.push(Line::from(vec![
-            Span::styled("Transcription Mode: ", Style::default().fg(Color::Green)),
-            Span::styled(mode_text, mode_style),
-        ]));
+        setting_line!("Mode", mode_value, 0, "\u{2190} Enter to change", None::<Style>);
 
         // Model size (only for local mode)
         if let TranscriptionMode::Local { model_size } = &self.config.transcription {
-            let model_style = if self.settings_selection == 1 {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
+            setting_line!("Model Size", model_size, 1, "\u{2190} Enter to cycle", None::<Style>);
+        }
+
+        // API key (only for API mode)
+        if let TranscriptionMode::Api { api_key } = &self.config.transcription {
+            let api_key_display = if self.editing_api_key {
+                format!("{}_", self.api_key_input)
+            } else if api_key.is_empty() {
+                "[Not Set]".to_string()
             } else {
-                Style::default().fg(Color::White)
+                format!("{}******", &api_key[..api_key.len().min(4)])
             };
-
-            settings_text.push(Line::from(vec![
-                Span::styled("Model Size: ", Style::default().fg(Color::Green)),
-                Span::styled(
-                    format!("{} <- Press Enter to cycle", model_size),
-                    model_style,
-                ),
-            ]));
+            let style_override = if sel == 1 && self.editing_api_key { Some(val_editing) } else { None };
+            setting_line!("OpenAI API Key", api_key_display, 1, "\u{2190} Enter to edit", style_override);
         }
 
-        // Add mode-specific settings
-        match &self.config.transcription {
-            TranscriptionMode::Api { api_key } => {
-                // API Mode: Show API Key configuration at index 1
-                let api_key_display = if self.editing_api_key {
-                    format!("{}_", self.api_key_input) // Show cursor
-                } else {
-                    if api_key.is_empty() {
-                        "[Not Set] <- Press Enter to edit".to_string()
-                    } else {
-                        format!(
-                            "{}****** <- Press Enter to edit",
-                            &api_key[..api_key.len().min(4)]
-                        )
-                    }
-                };
+        // ── ENRICHMENT ──────────────────────────────────────────────
+        lines.push(Line::from(""));
+        let enrichment_label = if self.config.enrichment.is_local() { "ENRICHMENT (Privacy)" } else { "ENRICHMENT" };
+        lines.push(Line::from(vec![Span::raw("  "), Span::styled(enrichment_label, section_style)]));
 
-                let api_key_style = if self.settings_selection == 1 {
-                    if self.editing_api_key {
-                        Style::default()
-                            .fg(Color::Green)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD)
-                    }
-                } else {
-                    Style::default().fg(Color::White)
-                };
+        setting_line!("Provider", self.config.enrichment.provider_display_name(), 2, "\u{2190} Enter to cycle", None::<Style>);
 
-                settings_text.push(Line::from(vec![
-                    Span::styled("OpenAI API Key: ", Style::default().fg(Color::Green)),
-                    Span::styled(api_key_display, api_key_style),
-                ]));
-            }
-            TranscriptionMode::Local { .. } => {
-                // Local Mode: No API Key shown, Model Size is already shown above
-            }
-        }
-
-        // Enrichment settings section
-        settings_text.push(Line::from(""));
-        let enrichment_header = if self.config.enrichment.is_local() {
-            "ENRICHMENT (Privacy Mode)"
-        } else {
-            "ENRICHMENT"
-        };
-        settings_text.push(Line::from(vec![Span::styled(
-            enrichment_header,
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )]));
-
-        // Provider (index 2) — cycle through providers
-        let provider_display = format!(
-            "{} <- Press Enter to cycle",
-            self.config.enrichment.provider_display_name()
-        );
-        let provider_style = if self.settings_selection == 2 {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        settings_text.push(Line::from(vec![
-            Span::styled("Provider: ", Style::default().fg(Color::Green)),
-            Span::styled(provider_display, provider_style),
-        ]));
-
-        // Model (index 3) — picker or closed
+        // Model (index 3)
         if self.model_picker_state == ModelPickerState::Closed {
-            let model_display = format!(
-                "{} <- Press Enter to choose",
-                self.config.enrichment.model_name()
-            );
-            let model_style = if self.settings_selection == 3 {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            settings_text.push(Line::from(vec![
-                Span::styled("Model: ", Style::default().fg(Color::Green)),
-                Span::styled(model_display, model_style),
-            ]));
+            setting_line!("Model", self.config.enrichment.model_name(), 3, "\u{2190} Enter to choose", None::<Style>);
         } else {
-            // Picker is open or editing custom
-            settings_text.push(Line::from(vec![
-                Span::styled("Model: ", Style::default().fg(Color::Green)),
-                Span::styled("(select below)", Style::default().fg(Color::DarkGray)),
+            // Picker is open
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {:<width$}", "Model", width = pad), label_style),
+                Span::styled("(select below)", hint_style),
             ]));
 
             let current_model = self.config.enrichment.model_name().to_string();
-
             for (i, item) in self.model_picker_items.iter().enumerate() {
                 let is_cursor = i == self.model_picker_selection;
                 let is_current = item.model_id.as_deref() == Some(current_model.as_str());
                 let is_custom_sentinel = item.model_id.is_none() && item.display_name == "Custom...";
 
-                let arrow = if is_cursor { "  > " } else { "    " };
+                let arrow = if is_cursor { "    \u{25B8} " } else { "      " };
 
                 let style = if is_cursor {
                     if self.model_picker_state == ModelPickerState::EditingCustom && is_custom_sentinel {
-                        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                        val_editing
                     } else {
-                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                        val_selected
                     }
                 } else if is_current {
-                    Style::default().fg(Color::Cyan)
+                    Style::default().fg(ACCENT)
                 } else {
-                    Style::default().fg(Color::White)
+                    val_normal
                 };
 
                 if is_custom_sentinel && self.model_picker_state == ModelPickerState::EditingCustom {
-                    settings_text.push(Line::from(vec![
+                    lines.push(Line::from(vec![
                         Span::styled(arrow, style),
                         Span::styled(format!("Custom: {}_", self.model_picker_custom_input), style),
                     ]));
                 } else {
                     let suffix = if is_current && !is_cursor { " (current)" } else { "" };
-                    settings_text.push(Line::from(vec![
+                    lines.push(Line::from(vec![
                         Span::styled(arrow, style),
                         Span::styled(format!("{}{}", item.display_name, suffix), style),
                     ]));
@@ -3656,382 +3554,159 @@ impl Dashboard {
             let endpoint_display = if self.editing_enrichment_endpoint {
                 format!("{}_", self.enrichment_endpoint_input)
             } else {
-                format!(
-                    "{} <- Press Enter to edit",
-                    self.config.enrichment.ollama_endpoint()
-                )
+                self.config.enrichment.ollama_endpoint().to_string()
             };
-            let endpoint_style = if self.settings_selection == 4 {
-                if self.editing_enrichment_endpoint {
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD)
-                }
-            } else {
-                Style::default().fg(Color::White)
-            };
-            settings_text.push(Line::from(vec![
-                Span::styled("Ollama Server: ", Style::default().fg(Color::Green)),
-                Span::styled(endpoint_display, endpoint_style),
-            ]));
+            let style_override = if sel == 4 && self.editing_enrichment_endpoint { Some(val_editing) } else { None };
+            setting_line!("Ollama Server", endpoint_display, 4, "\u{2190} Enter to edit", style_override);
         } else {
-            // Provider-specific label and env var hint
-            let (key_label, env_hint) = match self.config.enrichment.cloud_provider() {
-                Some(p) => (
-                    format!("{} API Key: ", p.display_name()),
-                    format!(" (or set {})", p.env_var_name()),
-                ),
-                None => ("API Key: ".to_string(), String::new()),
+            let key_label = match self.config.enrichment.cloud_provider() {
+                Some(p) => format!("{} API Key", p.display_name()),
+                None => "API Key".to_string(),
+            };
+            let env_hint = match self.config.enrichment.cloud_provider() {
+                Some(p) => format!(" (or set {})", p.env_var_name()),
+                None => String::new(),
             };
             let key_display = if self.editing_enrichment_api_key {
                 format!("{}_", self.enrichment_api_key_input)
             } else {
                 match self.config.enrichment.api_key() {
-                    Some(key) if key.len() >= 4 => {
-                        format!("{}****** <- Press Enter to edit", &key[..4])
-                    }
-                    Some(_) => "****** <- Press Enter to edit".to_string(),
-                    None => format!("[Not Set]{} <- Press Enter to edit", env_hint),
+                    Some(key) if key.len() >= 4 => format!("{}******", &key[..4]),
+                    Some(_) => "******".to_string(),
+                    None => format!("[Not Set]{}", env_hint),
                 }
             };
-            let key_style = if self.settings_selection == 4 {
-                if self.editing_enrichment_api_key {
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD)
-                }
-            } else {
-                Style::default().fg(Color::White)
-            };
-            settings_text.push(Line::from(vec![
-                Span::styled(key_label, Style::default().fg(Color::Green)),
-                Span::styled(key_display, key_style),
-            ]));
+            let style_override = if sel == 4 && self.editing_enrichment_api_key { Some(val_editing) } else { None };
+            setting_line!(key_label, key_display, 4, "\u{2190} Enter to edit", style_override);
         }
 
-        // Recording section — silence auto-stop
-        settings_text.push(Line::from(""));
-        settings_text.push(Line::from(vec![Span::styled(
-            "RECORDING",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )]));
+        // ── RECORDING ───────────────────────────────────────────────
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::raw("  "), Span::styled("RECORDING", section_style)]));
 
-        // Silence Auto-Stop toggle (index 4)
         let silence_enabled = self.config.silence_auto_stop.enabled;
-        let silence_toggle_text = if silence_enabled {
-            "Enabled <- Press Enter to toggle"
-        } else {
-            "Disabled <- Press Enter to toggle"
-        };
-        let silence_toggle_style = if self.settings_selection == 5 {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        settings_text.push(Line::from(vec![
-            Span::styled("Silence Auto-Stop: ", Style::default().fg(Color::Green)),
-            Span::styled(silence_toggle_text, silence_toggle_style),
-        ]));
+        let silence_value = if silence_enabled { "Enabled" } else { "Disabled" };
+        setting_line!("Auto-Stop", silence_value, 5, "\u{2190} Enter to toggle", None::<Style>);
 
-        // Silence Timeout (index 5) — only interactive when enabled
         let timeout_secs = self.config.silence_auto_stop.timeout_seconds;
         let timeout_display = match timeout_secs {
             s if s < 60 => format!("{}s", s),
             s if s % 60 == 0 => format!("{}m", s / 60),
             s => format!("{}m {}s", s / 60, s % 60),
         };
-        let timeout_text = if silence_enabled {
-            format!("{} <- Press Enter to cycle", timeout_display)
-        } else {
-            format!("{} (enable auto-stop first)", timeout_display)
-        };
-        let timeout_style = if self.settings_selection == 6 {
-            if silence_enabled {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            }
-        } else {
-            if silence_enabled {
-                Style::default().fg(Color::White)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            }
-        };
-        settings_text.push(Line::from(vec![
-            Span::styled("Silence Timeout: ", Style::default().fg(Color::Green)),
-            Span::styled(timeout_text, timeout_style),
-        ]));
+        let timeout_style_override = if !silence_enabled { Some(val_disabled) } else { None };
+        let timeout_hint = if silence_enabled { "\u{2190} Enter to cycle" } else { "(enable auto-stop first)" };
+        setting_line!("Timeout", timeout_display, 6, timeout_hint, timeout_style_override);
 
-        // Diarization section
-        settings_text.push(Line::from(""));
-        settings_text.push(Line::from(vec![Span::styled(
-            "DIARIZATION",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )]));
+        // ── DIARIZATION ─────────────────────────────────────────────
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::raw("  "), Span::styled("DIARIZATION", section_style)]));
 
-        // Speaker Diarization toggle (index 6)
         let diarization_enabled = self.config.diarization.enabled;
-        let diarization_toggle_text = if diarization_enabled {
-            "Enabled <- Press Enter to toggle"
-        } else {
-            "Disabled <- Press Enter to toggle"
-        };
-        let diarization_toggle_style = if self.settings_selection == 7 {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        settings_text.push(Line::from(vec![
-            Span::styled("Speaker Diarization: ", Style::default().fg(Color::Green)),
-            Span::styled(diarization_toggle_text, diarization_toggle_style),
-        ]));
+        let diar_value = if diarization_enabled { "Enabled" } else { "Disabled" };
+        setting_line!("Speaker Diarization", diar_value, 7, "\u{2190} Enter to toggle", None::<Style>);
 
-        // Max Speakers (index 7) — only interactive when enabled
         let max_speakers = self.config.diarization.max_speakers;
-        let max_speakers_text = if diarization_enabled {
-            format!("{} <- Press Enter to cycle", max_speakers)
-        } else {
-            format!("{} (enable diarization first)", max_speakers)
-        };
-        let max_speakers_style = if self.settings_selection == 8 {
-            if diarization_enabled {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            }
-        } else if diarization_enabled {
-            Style::default().fg(Color::White)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        settings_text.push(Line::from(vec![
-            Span::styled("Max Speakers: ", Style::default().fg(Color::Green)),
-            Span::styled(max_speakers_text, max_speakers_style),
-        ]));
+        let speakers_style_override = if !diarization_enabled { Some(val_disabled) } else { None };
+        let speakers_hint = if diarization_enabled { "\u{2190} Enter to cycle" } else { "(enable diarization first)" };
+        setting_line!("Max Speakers", max_speakers, 8, speakers_hint, speakers_style_override);
 
-        // Voice mode section
-        settings_text.push(Line::from(""));
-        settings_text.push(Line::from(vec![Span::styled(
-            "VOICE MODE (Scriba Forever)",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )]));
+        // ── VOICE MODE ──────────────────────────────────────────────
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::raw("  "), Span::styled("VOICE MODE", section_style)]));
 
-        // Voice Mode toggle (index 9)
         let voice_enabled = self.voice_mode_active;
-        let voice_toggle_text = if voice_enabled {
-            "Active <- Press Enter to toggle"
-        } else {
-            "Off <- Press Enter to toggle"
-        };
-        let voice_toggle_style = if self.settings_selection == 9 {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        settings_text.push(Line::from(vec![
-            Span::styled("Voice Activation: ", Style::default().fg(Color::Green)),
-            Span::styled(voice_toggle_text, voice_toggle_style),
-        ]));
+        let voice_value = if voice_enabled { "Active" } else { "Off" };
+        setting_line!("Voice Activation", voice_value, 9, "\u{2190} Enter to toggle", None::<Style>);
 
-        // Voice Sensitivity (index 10)
         let sensitivity_label = match self.config.voice.vad_threshold {
             t if t <= 0.005 => "Very High (0.005)",
             t if t <= 0.01 => "High (0.01)",
             t if t <= 0.02 => "Medium (0.02)",
             _ => "Low (0.05)",
         };
-        let sensitivity_text = if voice_enabled {
-            format!("{} <- Press Enter to cycle", sensitivity_label)
-        } else {
-            format!("{} (enable voice mode first)", sensitivity_label)
-        };
-        let sensitivity_style = if self.settings_selection == 10 {
-            if voice_enabled {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            }
-        } else if voice_enabled {
-            Style::default().fg(Color::White)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        settings_text.push(Line::from(vec![
-            Span::styled("Voice Sensitivity: ", Style::default().fg(Color::Green)),
-            Span::styled(sensitivity_text, sensitivity_style),
-        ]));
+        let sens_style_override = if !voice_enabled { Some(val_disabled) } else { None };
+        let sens_hint = if voice_enabled { "\u{2190} Enter to cycle" } else { "(enable voice mode first)" };
+        setting_line!("Sensitivity", sensitivity_label, 10, sens_hint, sens_style_override);
 
-        settings_text.push(Line::from(""));
-        settings_text.push(Line::from(vec![Span::styled(
-            "↑↓ Navigate  ⏎ Enter  ⎋ Esc",
-            Style::default().fg(Color::Gray),
-        )]));
+        let body = Paragraph::new(lines).style(Style::default().fg(Color::White));
+        f.render_widget(body, chunks[1]);
 
-        let settings_paragraph = Paragraph::new(settings_text)
-            .style(Style::default().fg(Color::White))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Settings")
-                    .title_style(
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    )
-                    .border_style(Style::default().fg(Color::Cyan)),
-            )
-            .wrap(Wrap { trim: true });
+        // ── Footer ──────────────────────────────────────────────────
+        let sep2 = "\u{2500}".repeat(chunks[2].width as usize);
+        f.render_widget(
+            Paragraph::new(sep2).style(Style::default().fg(Color::Indexed(237))),
+            Rect { x: chunks[2].x, y: chunks[2].y, width: chunks[2].width, height: 1 },
+        );
 
-        f.render_widget(settings_paragraph, popup_area);
+        let footer_area = Rect { x: chunks[2].x, y: chunks[2].y + 1, width: chunks[2].width, height: 1 };
+        let version = env!("CARGO_PKG_VERSION");
+        let left_spans = vec![
+            Span::styled(" \u{25B8} ", Style::default().fg(ACCENT)),
+            Span::styled(format!("scriba \u{00B7} v{}", version), Style::default().fg(Color::DarkGray)),
+        ];
+        let right_spans = vec![
+            Span::styled("[", Style::default().fg(Color::DarkGray)),
+            Span::styled("\u{2191}\u{2193}", Style::default().fg(Color::White)),
+            Span::styled("] Navigate  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(Color::DarkGray)),
+            Span::styled("Enter", Style::default().fg(Color::White)),
+            Span::styled("] Change  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc", Style::default().fg(Color::White)),
+            Span::styled("] Back ", Style::default().fg(Color::DarkGray)),
+        ];
+        let left_w: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
+        let right_w: usize = right_spans.iter().map(|s| s.content.chars().count()).sum();
+        let gap = (footer_area.width as usize).saturating_sub(left_w + right_w);
+        let mut spans = left_spans;
+        spans.push(Span::raw(" ".repeat(gap)));
+        spans.extend(right_spans);
+        f.render_widget(Paragraph::new(Line::from(spans)), footer_area);
     }
 
     fn render_entities_view(&mut self, f: &mut Frame, area: ratatui::layout::Rect) {
         use ratatui::text::{Line, Span};
 
-        // Main layout: Header + Content + Footer
+        // Full-screen borderless layout: header + table + footer
         let main_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(5),  // Header (owl + summary + quip)
-                Constraint::Min(8),     // Entity table
-                Constraint::Length(3),  // Footer
+                Constraint::Length(2),  // Header
+                Constraint::Min(8),    // Entity table
+                Constraint::Length(2), // Footer
             ])
             .split(area);
 
-        // Animated owl header — fixed-width face + separate thought bubble
-        let (owl_face, owl_body, owl_feet, thought) = match self.owl_world_mood {
-            OwlWorldMood::Idle => {
-                let face = if self.owl_world_anim_frame % 30 < 3 { "(-,-)" } else { "(o,o)" };
-                (face, "{`\"'}", "-\"-\"-", "")
-            }
-            OwlWorldMood::Thinking => {
-                let frame = (self.owl_world_anim_frame / 3) % 8;
-                let face = if frame == 4 { "(-,-)" } else { "(o,o)" };
-                let bubble = match frame {
-                    0 => "  ?",
-                    1 => "  ~",
-                    2 => "  !",
-                    3 => " ~~",
-                    4 => "  ?",
-                    5 => "~~~",
-                    6 => "  !",
-                    _ => "...",
-                };
-                let beak = if frame % 2 == 1 { "{`~'}" } else { "{`\"'}" };
-                (face, beak, "-\"-\"-", bubble)
-            }
-            OwlWorldMood::Celebrating => {
-                let frame = (self.owl_world_anim_frame / 2) % 4;
-                let face = match frame {
-                    0 | 2 => "(^,^)",
-                    _ => "(^,^)",
-                };
-                (face, "{`\"'}", "-\"-\"-", "")
-            }
-        };
-
-        // Build owner summary from entities
-        let owner_entity = self.entities.iter().find(|e| {
-            e.context.as_deref().unwrap_or("").contains("Owner of this Scriba instance")
-        });
-        let owner_summary = if let Some(owner) = owner_entity {
-            let ctx = owner.context.as_deref().unwrap_or("");
-            let role_part = ctx.splitn(2, '.').nth(1).unwrap_or("").trim();
-            if role_part.is_empty() {
-                owner.canonical_name.clone()
-            } else {
-                format!("{} | {}", owner.canonical_name, role_part)
-            }
-        } else {
-            "No owner set".to_string()
-        };
-
-        let people_count = self.entities.iter().filter(|e| {
-            e.entity_type == "person" && !e.context.as_deref().unwrap_or("").contains("Owner of this Scriba instance")
-        }).count();
+        // ── Header ──────────────────────────────────────────────────
+        let people_count = self.entities.iter().filter(|e| e.entity_type == "person").count();
         let org_count = self.entities.iter().filter(|e| e.entity_type == "organization").count();
         let project_count = self.entities.iter().filter(|e| e.entity_type == "project").count();
 
-        let mut counts = Vec::new();
-        if people_count > 0 { counts.push(format!("{} people", people_count)); }
-        if org_count > 0 { counts.push(format!("{} orgs", org_count)); }
-        if project_count > 0 { counts.push(format!("{} projects", project_count)); }
-        let counts_str = if counts.is_empty() { String::new() } else { format!(" | {}", counts.join(", ")) };
+        let mut count_parts: Vec<String> = Vec::new();
+        if people_count > 0 { count_parts.push(format!("{} people", people_count)); }
+        if org_count > 0 { count_parts.push(format!("{} orgs", org_count)); }
+        if project_count > 0 { count_parts.push(format!("{} projects", project_count)); }
+        let counts_suffix = if count_parts.is_empty() {
+            String::new()
+        } else {
+            format!(" \u{00B7} {}", count_parts.join(" \u{00B7} "))
+        };
 
-        let header_lines = vec![
-            Line::from(vec![
-                Span::styled(
-                    format!("  {}  ", owl_face),
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    "SCRIBA'S WORLD",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!("  {}", thought),
-                    Style::default().fg(Color::White),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled(
-                    format!("  {}  ", owl_body),
-                    Style::default().fg(Color::Yellow),
-                ),
-                Span::styled(
-                    format!("{}{}", owner_summary, counts_str),
-                    Style::default().fg(Color::White),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled(
-                    format!("  {}  ", owl_feet),
-                    Style::default().fg(Color::Yellow),
-                ),
-                Span::styled(
-                    format!("\"{}\"", self.owl_quip),
-                    Style::default().fg(Color::Green),
-                ),
-            ]),
-        ];
+        let header_line = Line::from(vec![
+            Span::raw("  "),
+            Span::styled("Scriba's World", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(counts_suffix, Style::default().fg(Color::DarkGray)),
+        ]);
+        f.render_widget(Paragraph::new(header_line), Rect { x: main_chunks[0].x, y: main_chunks[0].y, width: main_chunks[0].width, height: 1 });
 
-        let header = Paragraph::new(header_lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .style(Style::default().fg(Color::Cyan))
-                    .border_type(ratatui::widgets::BorderType::Double),
-            );
-        f.render_widget(header, main_chunks[0]);
+        let sep = "\u{2500}".repeat(main_chunks[0].width as usize);
+        f.render_widget(
+            Paragraph::new(sep).style(Style::default().fg(Color::Indexed(237))),
+            Rect { x: main_chunks[0].x, y: main_chunks[0].y + 1, width: main_chunks[0].width, height: 1 },
+        );
 
-        // Entity table
+        // ── Entity table ────────────────────────────────────────────
         let header_cells = ["ID", "Type", "Name", "Aliases", "Context", "Mentions"]
             .iter()
             .map(|h| {
@@ -4120,48 +3795,102 @@ impl Dashboard {
             ],
         )
         .header(header_row)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .style(Style::default().fg(Color::Cyan))
-                .title(format!("Entities ({} total)", self.entities.len())),
-        )
+        .block(Block::default())
         .highlight_style(
             Style::default()
                 .fg(Color::Black)
-                .bg(Color::Cyan)
+                .bg(ACCENT)
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol("▶ ");
+        .highlight_symbol("\u{25B6} ");
 
         f.render_stateful_widget(table, main_chunks[1], &mut self.entity_table_state);
 
-        // Footer (changes based on entity mode)
-        let footer_text = match self.entity_mode {
-            EntityMode::Browse => "↑↓: Navigate | Enter: Details | A: Add | E: Edit | D: Delete | M: Merge | R: Refresh | Esc: Back".to_string(),
-            EntityMode::Adding => "Tab/↑↓: Switch Field | Type chars | Space: Cycle Type | Enter: Save | Esc: Cancel".to_string(),
-            EntityMode::Editing => "Tab/↑↓: Switch Field | Type chars | Space: Cycle Type | Esc: Save & Close".to_string(),
-            EntityMode::DeleteConfirm => "Y: Confirm Delete | N/Esc: Cancel".to_string(),
-            EntityMode::MergeSelectTarget => {
-                let src_name = self.merge_source_entity.as_ref()
-                    .map(|e| e.canonical_name.as_str())
-                    .unwrap_or("?");
-                format!("↑↓: Select target | Enter: Confirm | Esc: Cancel  (merging '{}')", src_name)
-            }
-            EntityMode::MergeConfirm => "Y: Confirm Merge | N/Esc: Cancel".to_string(),
-        };
-        let footer = Paragraph::new(footer_text)
-            .style(Style::default().fg(Color::White))
-            .alignment(Alignment::Center)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .style(Style::default().fg(Color::Blue))
-                    .title("Controls"),
-            );
-        f.render_widget(footer, main_chunks[2]);
+        // ── Footer ──────────────────────────────────────────────────
+        let sep2 = "\u{2500}".repeat(main_chunks[2].width as usize);
+        f.render_widget(
+            Paragraph::new(sep2).style(Style::default().fg(Color::Indexed(237))),
+            Rect { x: main_chunks[2].x, y: main_chunks[2].y, width: main_chunks[2].width, height: 1 },
+        );
 
-        // Popups
+        let footer_area = Rect { x: main_chunks[2].x, y: main_chunks[2].y + 1, width: main_chunks[2].width, height: 1 };
+        let version = env!("CARGO_PKG_VERSION");
+        let entity_count = self.entities.len();
+        let left_spans = vec![
+            Span::styled(" \u{25B8} ", Style::default().fg(ACCENT)),
+            Span::styled(
+                format!("scriba \u{00B7} v{} \u{00B7} {} entities", version, entity_count),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ];
+
+        let right_spans: Vec<Span> = match self.entity_mode {
+            EntityMode::Browse => vec![
+                Span::styled("[", Style::default().fg(Color::DarkGray)),
+                Span::styled("A", Style::default().fg(Color::White)),
+                Span::styled("] Add  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[", Style::default().fg(Color::DarkGray)),
+                Span::styled("E", Style::default().fg(Color::White)),
+                Span::styled("] Edit  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[", Style::default().fg(Color::DarkGray)),
+                Span::styled("D", Style::default().fg(Color::White)),
+                Span::styled("] Del  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[", Style::default().fg(Color::DarkGray)),
+                Span::styled("M", Style::default().fg(Color::White)),
+                Span::styled("] Merge  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[", Style::default().fg(Color::DarkGray)),
+                Span::styled("R", Style::default().fg(Color::White)),
+                Span::styled("] Refresh  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[", Style::default().fg(Color::DarkGray)),
+                Span::styled("Esc", Style::default().fg(Color::White)),
+                Span::styled("] Back ", Style::default().fg(Color::DarkGray)),
+            ],
+            EntityMode::MergeSelectTarget => vec![
+                Span::styled("[", Style::default().fg(Color::DarkGray)),
+                Span::styled("Enter", Style::default().fg(Color::White)),
+                Span::styled("] Confirm  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[", Style::default().fg(Color::DarkGray)),
+                Span::styled("Esc", Style::default().fg(Color::White)),
+                Span::styled("] Cancel ", Style::default().fg(Color::DarkGray)),
+            ],
+            EntityMode::DeleteConfirm => vec![
+                Span::styled("[", Style::default().fg(Color::DarkGray)),
+                Span::styled("Y", Style::default().fg(Color::White)),
+                Span::styled("] Confirm  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[", Style::default().fg(Color::DarkGray)),
+                Span::styled("N", Style::default().fg(Color::White)),
+                Span::styled("] Cancel ", Style::default().fg(Color::DarkGray)),
+            ],
+            EntityMode::MergeConfirm => vec![
+                Span::styled("[", Style::default().fg(Color::DarkGray)),
+                Span::styled("Y", Style::default().fg(Color::White)),
+                Span::styled("] Confirm  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[", Style::default().fg(Color::DarkGray)),
+                Span::styled("N", Style::default().fg(Color::White)),
+                Span::styled("] Cancel ", Style::default().fg(Color::DarkGray)),
+            ],
+            EntityMode::Adding | EntityMode::Editing => vec![
+                Span::styled("[", Style::default().fg(Color::DarkGray)),
+                Span::styled("Tab", Style::default().fg(Color::White)),
+                Span::styled("] Next field  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[", Style::default().fg(Color::DarkGray)),
+                Span::styled("Space", Style::default().fg(Color::White)),
+                Span::styled("] Cycle type  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[", Style::default().fg(Color::DarkGray)),
+                Span::styled("Esc", Style::default().fg(Color::White)),
+                Span::styled("] Done ", Style::default().fg(Color::DarkGray)),
+            ],
+        };
+
+        let left_w: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
+        let right_w: usize = right_spans.iter().map(|s| s.content.chars().count()).sum();
+        let gap = (footer_area.width as usize).saturating_sub(left_w + right_w);
+        let mut spans = left_spans;
+        spans.push(Span::raw(" ".repeat(gap)));
+        spans.extend(right_spans);
+        f.render_widget(Paragraph::new(Line::from(spans)), footer_area);
+
+        // Popups (overlays stay unchanged)
         if self.show_entity_detail {
             self.render_entity_detail_popup(f, area);
         }
@@ -4229,7 +3958,7 @@ impl Dashboard {
                     Span::styled(
                         &entity.canonical_name,
                         Style::default()
-                            .fg(Color::Cyan)
+                            .fg(ACCENT)
                             .add_modifier(Modifier::BOLD),
                     ),
                 ]),
@@ -4288,10 +4017,10 @@ impl Dashboard {
                         .title(format!("Entity Details - {}", entity.canonical_name))
                         .title_style(
                             Style::default()
-                                .fg(Color::Cyan)
+                                .fg(ACCENT)
                                 .add_modifier(Modifier::BOLD),
                         )
-                        .border_style(Style::default().fg(Color::Cyan)),
+                        .border_style(Style::default().fg(ACCENT)),
                 )
                 .wrap(Wrap { trim: true });
 
@@ -4341,7 +4070,7 @@ impl Dashboard {
 
         let type_display: Vec<Span> = ENTITY_TYPES.iter().map(|t| {
             if *t == self.entity_add_type {
-                Span::styled(format!(" [{}] ", t), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+                Span::styled(format!(" [{}] ", t), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
             } else {
                 Span::styled(format!("  {}  ", t), Style::default().fg(Color::Gray))
             }
@@ -4430,7 +4159,7 @@ impl Dashboard {
 
         let type_display: Vec<Span> = ENTITY_TYPES.iter().map(|t| {
             if *t == self.entity_edit_type {
-                Span::styled(format!(" [{}] ", t), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+                Span::styled(format!(" [{}] ", t), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
             } else {
                 Span::styled(format!("  {}  ", t), Style::default().fg(Color::Gray))
             }
@@ -4474,76 +4203,50 @@ impl Dashboard {
     }
 
     fn render_entity_delete_confirm(&self, f: &mut Frame, area: ratatui::layout::Rect) {
-        let popup_area = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Percentage(35),
-                Constraint::Length(7),
-                Constraint::Percentage(35),
-            ])
-            .split(area)[1];
-        let popup_area = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(20),
-                Constraint::Percentage(60),
-                Constraint::Percentage(20),
-            ])
-            .split(popup_area)[1];
-
-        f.render_widget(Clear, popup_area);
-
         let entity_name = self.selected_entity.as_ref()
             .map(|e| e.canonical_name.as_str())
             .unwrap_or("?");
 
-        let content = vec![
-            Line::from(""),
+        let sel = self.confirm_selection;
+        let sel_bg = Color::Indexed(236);
+        let labels = ["Yes, delete", "No, keep it"];
+        let label_width = labels.iter().map(|l| l.chars().count() + 2).max().unwrap_or(0);
+
+        let mut lines: Vec<Line> = vec![
             Line::from(vec![
                 Span::styled("Delete entity: ", Style::default().fg(Color::White)),
                 Span::styled(entity_name, Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
                 Span::styled("?", Style::default().fg(Color::White)),
             ]),
             Line::from(""),
-            Line::from(vec![
-                Span::styled("  [Y] Yes  ", Style::default().fg(Color::Red)),
-                Span::styled("  [N] No  ", Style::default().fg(Color::Green)),
-            ]),
         ];
+        for (i, label) in labels.iter().enumerate() {
+            if sel == i {
+                let pad = " ".repeat(label_width.saturating_sub(label.chars().count() + 2));
+                lines.push(Line::from(vec![
+                    Span::styled("\u{25B8} ", Style::default().fg(ACCENT).bg(sel_bg)),
+                    Span::styled(format!("{}{}", label, pad), Style::default().fg(Color::White).bg(sel_bg)),
+                ]));
+            } else {
+                lines.push(Line::from(Span::styled(format!("  {}", label), Style::default().fg(Color::DarkGray))));
+            }
+        }
 
-        let paragraph = Paragraph::new(content)
-            .alignment(Alignment::Center)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Confirm Delete")
-                    .title_style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
-                    .border_style(Style::default().fg(Color::Red)),
-            );
+        let max_w = lines.iter().map(|l| l.width() as u16).max().unwrap_or(0).max(30);
+        let content_width = max_w.min(area.width);
+        let left_pad = (area.width.saturating_sub(content_width)) / 2;
+        let line_count = lines.len();
+        let top_pad = (area.height as usize).saturating_sub(line_count) / 2;
+        let mut centered: Vec<Line> = Vec::with_capacity(top_pad + line_count);
+        for _ in 0..top_pad { centered.push(Line::from("")); }
+        centered.extend(lines);
 
-        f.render_widget(paragraph, popup_area);
+        f.render_widget(Clear, area);
+        let body = Rect { x: area.x + left_pad, width: content_width, ..area };
+        f.render_widget(Paragraph::new(centered).alignment(Alignment::Left), body);
     }
 
     fn render_entity_merge_confirm(&self, f: &mut Frame, area: ratatui::layout::Rect) {
-        let popup_area = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Percentage(30),
-                Constraint::Length(9),
-                Constraint::Percentage(30),
-            ])
-            .split(area)[1];
-        let popup_area = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(15),
-                Constraint::Percentage(70),
-                Constraint::Percentage(15),
-            ])
-            .split(popup_area)[1];
-
-        f.render_widget(Clear, popup_area);
-
         let source_name = self.merge_source_entity.as_ref()
             .map(|e| e.canonical_name.as_str())
             .unwrap_or("?");
@@ -4551,39 +4254,159 @@ impl Dashboard {
             .map(|e| e.canonical_name.as_str())
             .unwrap_or("?");
 
-        let content = vec![
-            Line::from(""),
+        let sel = self.confirm_selection;
+        let sel_bg = Color::Indexed(236);
+        let labels = ["Yes, merge", "No, cancel"];
+        let label_width = labels.iter().map(|l| l.chars().count() + 2).max().unwrap_or(0);
+
+        let mut lines: Vec<Line> = vec![
             Line::from(vec![
                 Span::styled("Merge ", Style::default().fg(Color::White)),
                 Span::styled(source_name, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                Span::styled(" INTO ", Style::default().fg(Color::White)),
-                Span::styled(target_name, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(" into ", Style::default().fg(Color::White)),
+                Span::styled(target_name, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
                 Span::styled("?", Style::default().fg(Color::White)),
             ]),
+            Line::from(Span::styled(
+                format!("'{}' becomes an alias. Mentions transferred.", source_name),
+                Style::default().fg(Color::DarkGray),
+            )),
             Line::from(""),
-            Line::from(vec![Span::styled(
-                format!("'{}' becomes an alias. Contexts combined. Mentions transferred.", source_name),
-                Style::default().fg(Color::Gray),
-            )]),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("  [Y] Yes  ", Style::default().fg(Color::Yellow)),
-                Span::styled("  [N] No  ", Style::default().fg(Color::Green)),
-            ]),
         ];
+        for (i, label) in labels.iter().enumerate() {
+            if sel == i {
+                let pad = " ".repeat(label_width.saturating_sub(label.chars().count() + 2));
+                lines.push(Line::from(vec![
+                    Span::styled("\u{25B8} ", Style::default().fg(ACCENT).bg(sel_bg)),
+                    Span::styled(format!("{}{}", label, pad), Style::default().fg(Color::White).bg(sel_bg)),
+                ]));
+            } else {
+                lines.push(Line::from(Span::styled(format!("  {}", label), Style::default().fg(Color::DarkGray))));
+            }
+        }
 
-        let paragraph = Paragraph::new(content)
-            .alignment(Alignment::Center)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Confirm Merge")
-                    .title_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
-                    .border_style(Style::default().fg(Color::Yellow)),
-            )
-            .wrap(Wrap { trim: true });
+        let max_w = lines.iter().map(|l| l.width() as u16).max().unwrap_or(0).max(30);
+        let content_width = max_w.min(area.width);
+        let left_pad = (area.width.saturating_sub(content_width)) / 2;
+        let line_count = lines.len();
+        let top_pad = (area.height as usize).saturating_sub(line_count) / 2;
+        let mut centered: Vec<Line> = Vec::with_capacity(top_pad + line_count);
+        for _ in 0..top_pad { centered.push(Line::from("")); }
+        centered.extend(lines);
 
-        f.render_widget(paragraph, popup_area);
+        f.render_widget(Clear, area);
+        let body = Rect { x: area.x + left_pad, width: content_width, ..area };
+        f.render_widget(Paragraph::new(centered).alignment(Alignment::Left).wrap(Wrap { trim: false }), body);
+    }
+
+    fn render_recording_view(&self, f: &mut Frame, area: ratatui::layout::Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),  // Header
+                Constraint::Min(6),    // Body
+                Constraint::Length(2),  // Footer
+            ])
+            .split(area);
+
+        // ── Header ──────────────────────────────────────────────────
+        let header_line = Line::from(vec![
+            Span::raw("  "),
+            Span::styled("Recording", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        ]);
+        f.render_widget(Paragraph::new(header_line), Rect { x: chunks[0].x, y: chunks[0].y, width: chunks[0].width, height: 1 });
+        let sep = "\u{2500}".repeat(chunks[0].width as usize);
+        f.render_widget(
+            Paragraph::new(sep).style(Style::default().fg(Color::Indexed(237))),
+            Rect { x: chunks[0].x, y: chunks[0].y + 1, width: chunks[0].width, height: 1 },
+        );
+
+        // ── Body (vertically centered) ─────────────────────────────
+        let body = chunks[1];
+        // 3 lines: spinner, blank, waveform
+        let content_height: u16 = 3;
+        let v_offset = body.height.saturating_sub(content_height) / 2;
+
+        // Spinner + elapsed time
+        let spinners = ["\u{280B}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283C}", "\u{2834}", "\u{2826}", "\u{2827}", "\u{2807}", "\u{280F}"];
+        let spinner = spinners[self.progress_frame % spinners.len()];
+        let elapsed = self.recording_start_instant
+            .map(|t| t.elapsed())
+            .unwrap_or_default();
+        let mins = elapsed.as_secs() / 60;
+        let secs = elapsed.as_secs() % 60;
+        let elapsed_str = format!("{}m {:02}s", mins, secs);
+
+        let spinner_line = Line::from(vec![
+            Span::styled(format!("{}  Recording \u{00B7} {}", spinner, elapsed_str), Style::default().fg(Color::White)),
+        ]);
+        let spinner_y = body.y + v_offset;
+        f.render_widget(
+            Paragraph::new(spinner_line).alignment(Alignment::Center),
+            Rect { x: body.x, y: spinner_y, width: body.width, height: 1 },
+        );
+
+        // Scrolling waveform using block-height characters
+        let wave_chars = [' ', '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}'];
+        let wave_width: usize = 40;
+
+        let mut spans: Vec<Span> = Vec::with_capacity(wave_width);
+        let hist_len = self.volume_history.len();
+        for i in 0..wave_width {
+            let level = if i < wave_width.saturating_sub(hist_len) {
+                0.0_f32
+            } else {
+                let idx = hist_len.saturating_sub(wave_width.saturating_sub(i));
+                // Average with neighbors for a smoother look
+                let raw = self.volume_history.get(idx).copied().unwrap_or(0.0);
+                let prev = if idx > 0 { self.volume_history.get(idx - 1).copied().unwrap_or(raw) } else { raw };
+                (raw * 0.7 + prev * 0.3).min(1.0)
+            };
+            let scaled = (level * 50.0).min(1.0);
+            let char_idx = (scaled * (wave_chars.len() - 1) as f32).round() as usize;
+            let ch = wave_chars[char_idx.min(wave_chars.len() - 1)];
+            // Dim bars vs bright bars based on intensity
+            let color = if char_idx <= 1 {
+                Color::Indexed(237) // dark gray for silence
+            } else {
+                ACCENT
+            };
+            spans.push(Span::styled(String::from(ch), Style::default().fg(color)));
+        }
+
+        let wave_line = Line::from(spans);
+        let wave_y = spinner_y + 2;
+        if wave_y < body.y + body.height {
+            f.render_widget(
+                Paragraph::new(wave_line).alignment(Alignment::Center),
+                Rect { x: body.x, y: wave_y, width: body.width, height: 1 },
+            );
+        }
+
+        // ── Footer ─────────────────────────────────────────────────
+        let sep2 = "\u{2500}".repeat(chunks[2].width as usize);
+        f.render_widget(
+            Paragraph::new(sep2).style(Style::default().fg(Color::Indexed(237))),
+            Rect { x: chunks[2].x, y: chunks[2].y, width: chunks[2].width, height: 1 },
+        );
+        let footer_area = Rect { x: chunks[2].x, y: chunks[2].y + 1, width: chunks[2].width, height: 1 };
+        let version = env!("CARGO_PKG_VERSION");
+        let left_spans = vec![
+            Span::styled(" \u{25B8} ", Style::default().fg(ACCENT)),
+            Span::styled(format!("scriba \u{00B7} v{}", version), Style::default().fg(Color::DarkGray)),
+        ];
+        let right_spans = vec![
+            Span::styled("[", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc", Style::default().fg(Color::White)),
+            Span::styled("] Stop ", Style::default().fg(Color::DarkGray)),
+        ];
+        let left_w: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
+        let right_w: usize = right_spans.iter().map(|s| s.content.chars().count()).sum();
+        let gap = (footer_area.width as usize).saturating_sub(left_w + right_w);
+        let mut spans = left_spans;
+        spans.push(Span::raw(" ".repeat(gap)));
+        spans.extend(right_spans);
+        f.render_widget(Paragraph::new(Line::from(spans)), footer_area);
     }
 
     fn render_message_popup(&self, f: &mut Frame, area: ratatui::layout::Rect) {
@@ -4621,70 +4444,46 @@ impl Dashboard {
     }
 
     fn render_transcript_popup(&mut self, f: &mut Frame, area: ratatui::layout::Rect) {
-        let popup_area = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Percentage(3),
-                Constraint::Percentage(94),
-                Constraint::Percentage(3),
-            ])
-            .split(area)[1];
-
-        let popup_area = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(2),
-                Constraint::Percentage(96),
-                Constraint::Percentage(2),
-            ])
-            .split(popup_area)[1];
-
-        f.render_widget(Clear, popup_area);
-
-        // Check if we have enrichment data
-        let has_enrichment = self.transcript_summary.is_some()
-            || self.transcript_topics.is_some()
-            || self.transcript_entities.is_some();
-
-        // Dynamic chat panel height for transcript view
+        // Dynamic chat panel height
         let has_chat_content = !self.chat.messages.is_empty()
             || !self.chat.pending_blocks.is_empty()
             || self.chat.is_generating;
 
-        let chat_panel_h: u16 = if has_chat_content {
-            let available = popup_area.height;
-            (available * 45 / 100).max(8)
+        let chat_h: u16 = if has_chat_content {
+            (area.height * 45 / 100).max(8)
         } else {
             (self.chat.suggestions.len() as u16 + 4).max(5).min(8)
         };
 
-        // Build constraints dynamically
-        let mut constraints: Vec<Constraint> = Vec::new();
-
-        if has_enrichment {
-            constraints.push(Constraint::Length(self.calculate_enrichment_height()));
-        }
-        constraints.push(Constraint::Min(5)); // Transcript (flexible)
-        constraints.push(Constraint::Length(chat_panel_h)); // Unified chat panel
-
-        let content_chunks = Layout::default()
+        let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints(constraints)
-            .split(popup_area);
+            .constraints([
+                Constraint::Length(2),      // header
+                Constraint::Min(5),         // content (enrichment + transcript preview)
+                Constraint::Length(2),      // blank + separator
+                Constraint::Length(chat_h), // chat panel
+                Constraint::Length(2),      // footer
+            ])
+            .split(area);
 
-        let mut chunk_idx = 0;
+        // ── Header ──────────────────────────────────────────────────────
+        self.render_transcript_header(f, chunks[0]);
 
-        if has_enrichment {
-            self.render_enrichment_section(f, content_chunks[chunk_idx]);
-            chunk_idx += 1;
-        }
+        // ── Content (enrichment + transcript preview) ───────────────────
+        self.render_transcript_body(f, chunks[1]);
 
-        // Transcript
-        self.render_transcript_content(f, content_chunks[chunk_idx]);
-        chunk_idx += 1;
+        // ── Separator (blank line + ─) ───────────────────────────────────
+        let sep = "\u{2500}".repeat(area.width as usize);
+        f.render_widget(
+            Paragraph::new(sep).style(Style::default().fg(Color::Indexed(237))),
+            Rect { x: chunks[2].x, y: chunks[2].y + 1, width: chunks[2].width, height: 1 },
+        );
 
-        // Unified chat panel
-        self.chat.render(f, content_chunks[chunk_idx]);
+        // ── Chat panel ──────────────────────────────────────────────────
+        self.chat.render(f, chunks[3]);
+
+        // ── Footer ──────────────────────────────────────────────────────
+        self.render_transcript_footer(f, chunks[4]);
 
         // Notification overlay (e.g. "Copied to clipboard")
         if let Some((ref msg, _)) = self.notification_message {
@@ -4694,10 +4493,10 @@ impl Dashboard {
             } else {
                 Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
             };
-            let notif_area = ratatui::layout::Rect {
-                x: popup_area.x,
-                y: popup_area.y + popup_area.height.saturating_sub(1),
-                width: popup_area.width,
+            let notif_area = Rect {
+                x: area.x,
+                y: area.y + area.height.saturating_sub(1),
+                width: area.width,
                 height: 1,
             };
             let para = Paragraph::new(msg.as_str())
@@ -4707,203 +4506,330 @@ impl Dashboard {
         }
     }
 
-    fn calculate_enrichment_height(&self) -> u16 {
-        let mut height: u16 = 2; // Border
+    fn render_transcript_header(&self, f: &mut Frame, area: Rect) {
+        // Row 0: "  Name · Xm · Mar 8, 12:30"
+        let recording = self.current_transcript_recording.as_ref();
+        let name = recording
+            .and_then(|r| r.display_name.as_deref())
+            .or(recording.map(|r| r.directory_name.as_str()))
+            .unwrap_or("Recording");
+        let dur_secs = recording.and_then(|r| r.duration_seconds).unwrap_or(0);
+        let dur_str = if dur_secs >= 3600 {
+            format!("{}h {}m", dur_secs / 3600, (dur_secs % 3600) / 60)
+        } else {
+            format!("{}m", dur_secs / 60)
+        };
+        let date_str = recording
+            .map(|r| r.created_at.format("%b %-d, %H:%M").to_string())
+            .unwrap_or_default();
 
-        if self.transcript_summary.is_some() {
-            height += 3; // Summary label + content + spacing
-        }
-        if self.transcript_topics.is_some() {
-            height += 2; // Topics line + spacing
-        }
-        if self.transcript_entities.is_some() {
-            height += 2; // Entities line + spacing
-        }
-        if self.transcript_key_points.as_ref().map_or(false, |kp| !kp.is_empty()) {
-            height += 3; // Key points label + first point + spacing
-        }
+        let header_line = Line::from(vec![
+            Span::raw("  "),
+            Span::styled(name, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" \u{00B7} {} \u{00B7} {}", dur_str, date_str), Style::default().fg(Color::DarkGray)),
+        ]);
+        f.render_widget(Paragraph::new(header_line), Rect { x: area.x, y: area.y, width: area.width, height: 1 });
 
-        height.min(12) // Cap at reasonable size
+        // Row 1: separator
+        let sep = "\u{2500}".repeat(area.width as usize);
+        f.render_widget(
+            Paragraph::new(sep).style(Style::default().fg(Color::Indexed(237))),
+            Rect { x: area.x, y: area.y + 1, width: area.width, height: 1 },
+        );
     }
 
-    fn render_enrichment_section(&self, f: &mut Frame, area: ratatui::layout::Rect) {
+    /// Build combined enrichment + transcript lines and render as a single scrollable Paragraph.
+    fn render_transcript_body(&self, f: &mut Frame, area: Rect) {
+        let content_width = area.width.saturating_sub(4) as usize; // 2 padding each side
         let mut lines: Vec<Line> = Vec::new();
 
-        // Summary
-        if let Some(summary) = &self.transcript_summary {
-            lines.push(Line::from(vec![
-                Span::styled("Summary: ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-                Span::styled(summary, Style::default().fg(Color::White)),
-            ]));
+        // ── Enrichment metadata (inline) ────────────────────────────────
+        let has_enrichment = self.transcript_summary.is_some()
+            || self.transcript_topics.is_some()
+            || self.transcript_entities.is_some();
+
+        if has_enrichment {
             lines.push(Line::from(""));
-        }
 
-        // Topics
-        if let Some(topics) = &self.transcript_topics {
-            if !topics.is_empty() {
-                let topic_spans: Vec<Span> = std::iter::once(
-                    Span::styled("Topics: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
-                )
-                .chain(topics.iter().enumerate().flat_map(|(i, topic)| {
-                    let mut spans = vec![Span::styled(
-                        format!("[{}]", topic),
-                        Style::default().fg(Color::Cyan),
-                    )];
-                    if i < topics.len() - 1 {
-                        spans.push(Span::raw(" "));
-                    }
-                    spans
-                }))
-                .collect();
-                lines.push(Line::from(topic_spans));
-            }
-        }
-
-        // Entities
-        if let Some(entities) = &self.transcript_entities {
-            if !entities.is_empty() {
-                let entity_spans: Vec<Span> = std::iter::once(
-                    Span::styled("Entities: ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))
-                )
-                .chain(entities.iter().enumerate().flat_map(|(i, (name, etype))| {
-                    let color = match etype.as_str() {
-                        "person" => Color::Green,
-                        "organization" => Color::Blue,
-                        _ => Color::Gray,
-                    };
-                    let mut spans = vec![Span::styled(name, Style::default().fg(color))];
-                    if i < entities.len() - 1 {
-                        spans.push(Span::raw(", "));
-                    }
-                    spans
-                }))
-                .collect();
-                lines.push(Line::from(entity_spans));
-            }
-        }
-
-        // Key points (just first one to save space)
-        if let Some(key_points) = &self.transcript_key_points {
-            if !key_points.is_empty() {
-                lines.push(Line::from(""));
+            // Summary
+            if let Some(summary) = &self.transcript_summary {
                 lines.push(Line::from(vec![
-                    Span::styled("Key: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                    Span::styled(&key_points[0], Style::default().fg(Color::White)),
+                    Span::raw("  "),
+                    Span::styled("Summary", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
                 ]));
+                // Wrap summary text
+                let wrapped = textwrap::wrap(summary, content_width);
+                for wl in &wrapped {
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(wl.to_string(), Style::default().fg(Color::Indexed(249))),
+                    ]));
+                }
+                lines.push(Line::from(""));
+            }
+
+            // Topics
+            if let Some(topics) = &self.transcript_topics {
+                if !topics.is_empty() {
+                    let joined = topics.join(" \u{00B7} ");
+                    Self::push_labeled_wrap(&mut lines, "Topics  ", &joined, content_width);
+                }
+            }
+
+            // People / Entities
+            if let Some(entities) = &self.transcript_entities {
+                if !entities.is_empty() {
+                    let people: Vec<&str> = entities.iter()
+                        .filter(|(_, t)| t == "person")
+                        .map(|(n, _)| n.as_str())
+                        .collect();
+                    let orgs: Vec<&str> = entities.iter()
+                        .filter(|(_, t)| t == "organization")
+                        .map(|(n, _)| n.as_str())
+                        .collect();
+                    let others: Vec<&str> = entities.iter()
+                        .filter(|(_, t)| t != "person" && t != "organization")
+                        .map(|(n, _)| n.as_str())
+                        .collect();
+
+                    if !people.is_empty() {
+                        Self::push_labeled_wrap(&mut lines, "People  ", &people.join(" \u{00B7} "), content_width);
+                    }
+                    if !orgs.is_empty() {
+                        Self::push_labeled_wrap(&mut lines, "Orgs    ", &orgs.join(" \u{00B7} "), content_width);
+                    }
+                    if !others.is_empty() {
+                        Self::push_labeled_wrap(&mut lines, "Entities ", &others.join(" \u{00B7} "), content_width);
+                    }
+                }
+            }
+
+            // Key takeaway (first point only)
+            if let Some(key_points) = &self.transcript_key_points {
+                if !key_points.is_empty() {
+                    lines.push(Line::from(""));
+                    let wrapped = textwrap::wrap(&key_points[0], content_width);
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled("Key takeaway", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+                    ]));
+                    for wl in &wrapped {
+                        lines.push(Line::from(vec![
+                            Span::raw("  "),
+                            Span::styled(wl.to_string(), Style::default().fg(Color::Indexed(249))),
+                        ]));
+                    }
+                }
+            }
+
+            // Separator between enrichment and transcript
+            lines.push(Line::from(""));
+            let sep = "\u{2500}".repeat(area.width as usize);
+            lines.push(Line::from(Span::styled(sep, Style::default().fg(Color::Indexed(237)))));
+        }
+
+        // ── Transcript preview (compact, max ~15 lines, faded tail) ────
+        lines.push(Line::from(""));
+        let max_preview = 15usize;
+        let mut preview_lines: Vec<Line> = Vec::new();
+        let transcript_lines_total = self.transcript_content.lines().count();
+        let mut source_lines_used = 0usize;
+        for text_line in self.transcript_content.lines() {
+            if preview_lines.len() >= max_preview {
+                break;
+            }
+            source_lines_used += 1;
+            if text_line.is_empty() {
+                preview_lines.push(Line::from(""));
+            } else {
+                let wrapped = textwrap::wrap(text_line, content_width);
+                for wl in &wrapped {
+                    if preview_lines.len() >= max_preview {
+                        break;
+                    }
+                    preview_lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(wl.to_string(), Style::default().fg(Color::White)),
+                    ]));
+                }
             }
         }
 
-        let enrichment = Paragraph::new(lines)
-            .style(Style::default().fg(Color::White))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Green))
-                    .title("Knowledge Extract")
-                    .title_style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-            )
-            .wrap(Wrap { trim: true });
+        // Truncated if we didn't consume all source lines, OR if wrapping
+        // filled the preview before we finished even the lines we did visit.
+        let remaining_source = transcript_lines_total.saturating_sub(source_lines_used);
+        let is_truncated = remaining_source > 0 || preview_lines.len() >= max_preview;
 
-        f.render_widget(enrichment, area);
-    }
+        // Fade out the last few lines + hint when transcript is truncated
+        if is_truncated {
+            let fade_count = 3usize;
+            let fade_colors: [Color; 3] = [
+                Color::Indexed(249),
+                Color::Indexed(245),
+                Color::Indexed(240),
+            ];
+            let total_preview = preview_lines.len();
+            if total_preview > fade_count {
+                for (i, color) in fade_colors.iter().enumerate() {
+                    let idx = total_preview - fade_count + i;
+                    if idx < total_preview {
+                        let text: String = preview_lines[idx].spans.iter().map(|s| s.content.to_string()).collect();
+                        preview_lines[idx] = Line::from(Span::styled(text, Style::default().fg(*color)));
+                    }
+                }
+            }
+        }
 
-    fn render_transcript_content(&self, f: &mut Frame, area: ratatui::layout::Rect) {
-        // Calculate available height and width for content (subtract borders)
-        let content_height = area.height.saturating_sub(2) as usize;
-        let content_width = area.width.saturating_sub(4) as usize;
+        let shown_count = preview_lines.len();
+        lines.extend(preview_lines);
 
-        // Handle text wrapping for very long lines
-        let wrapped_lines = self.wrap_text_to_lines(&self.transcript_content, content_width);
-        let total_lines = wrapped_lines.len();
+        // Hint line for truncated transcripts
+        if is_truncated {
+            lines.push(Line::from(""));
+            // Count total wrapped display lines for accurate "X more lines"
+            let total_display_lines: usize = self.transcript_content.lines().map(|l| {
+                if l.is_empty() { 1 } else { textwrap::wrap(l, content_width).len() }
+            }).sum();
+            let more = total_display_lines.saturating_sub(shown_count);
 
-        // Create scrollable content
-        let (visible_content, scroll_info) = if total_lines > content_height {
-            let max_scroll = total_lines.saturating_sub(content_height);
-            let actual_offset = std::cmp::min(self.transcript_scroll_offset, max_scroll);
-            let end = std::cmp::min(actual_offset + content_height, total_lines);
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!("{} more lines not shown \u{00B7} ", more),
+                    Style::default().fg(Color::Indexed(240)),
+                ),
+                Span::styled("[", Style::default().fg(Color::Indexed(240))),
+                Span::styled("Ctrl+Y", Style::default().fg(Color::Indexed(249))),
+                Span::styled("] copy full transcript", Style::default().fg(Color::Indexed(240))),
+            ]));
+        }
 
-            let visible_lines = wrapped_lines[actual_offset..end].join("\n");
-            let scroll_info = format!(
-                "Transcript [{}/{}] - up/down: scroll, C: copy, T: re-transcribe, ESC: close",
-                actual_offset + 1,
-                total_lines
-            );
-            (visible_lines, scroll_info)
-        } else {
-            (
-                self.transcript_content.clone(),
-                "Transcript - C: copy, T: re-transcribe, ESC: close".to_string(),
-            )
-        };
-
-        let para = Paragraph::new(visible_content)
-            .style(Style::default().fg(Color::White))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .style(Style::default().fg(Color::Cyan))
-                    .title(scroll_info),
-            )
-            .scroll((0, 0));
-
+        let para = Paragraph::new(lines);
         f.render_widget(para, area);
     }
 
+    fn render_transcript_footer(&self, f: &mut Frame, area: Rect) {
+        // Separator
+        let sep = "\u{2500}".repeat(area.width as usize);
+        f.render_widget(
+            Paragraph::new(sep).style(Style::default().fg(Color::Indexed(237))),
+            Rect { x: area.x, y: area.y, width: area.width, height: 1 },
+        );
+
+        let footer_area = if area.height > 1 {
+            Rect { x: area.x, y: area.y + 1, width: area.width, height: area.height - 1 }
+        } else {
+            area
+        };
+
+        // Left: ▸ scriba · vX.Y.Z
+        let version = env!("CARGO_PKG_VERSION");
+        let left_spans = vec![
+            Span::styled(" \u{25B8} ", Style::default().fg(ACCENT)),
+            Span::styled(format!("scriba \u{00B7} v{}", version), Style::default().fg(Color::DarkGray)),
+        ];
+
+        // Right: [Ctrl+Y] Copy  [Ctrl+T] Re-transcribe  [Esc] Back
+        let right_spans = vec![
+            Span::styled("[", Style::default().fg(Color::DarkGray)),
+            Span::styled("Ctrl+Y", Style::default().fg(Color::White)),
+            Span::styled("] Copy  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(Color::DarkGray)),
+            Span::styled("Ctrl+T", Style::default().fg(Color::White)),
+            Span::styled("] Re-transcribe  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc", Style::default().fg(Color::White)),
+            Span::styled("] Back ", Style::default().fg(Color::DarkGray)),
+        ];
+
+        let left_width: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
+        let right_width: usize = right_spans.iter().map(|s| s.content.chars().count()).sum();
+        let gap = (footer_area.width as usize).saturating_sub(left_width + right_width);
+
+        let mut spans = left_spans;
+        spans.push(Span::raw(" ".repeat(gap)));
+        spans.extend(right_spans);
+
+        f.render_widget(Paragraph::new(Line::from(spans)), footer_area);
+    }
+
+    /// Push a "Label  value text..." line that wraps, with continuation lines indented to align.
+    fn push_labeled_wrap(lines: &mut Vec<Line<'_>>, label: &str, value: &str, max_width: usize) {
+        let prefix_len = 2 + label.len(); // "  " + label
+        let value_width = max_width.saturating_sub(prefix_len);
+        if value_width == 0 {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(label.to_string(), Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+                Span::styled(value.to_string(), Style::default().fg(Color::Indexed(249))),
+            ]));
+            return;
+        }
+        let wrapped = textwrap::wrap(value, value_width);
+        for (i, wl) in wrapped.iter().enumerate() {
+            if i == 0 {
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(label.to_string(), Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+                    Span::styled(wl.to_string(), Style::default().fg(Color::Indexed(249))),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::raw(" ".repeat(prefix_len)),
+                    Span::styled(wl.to_string(), Style::default().fg(Color::Indexed(249))),
+                ]));
+            }
+        }
+    }
+
     fn render_delete_confirmation_popup(&self, f: &mut Frame, area: ratatui::layout::Rect) {
-        let popup_area = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Percentage(35),
-                Constraint::Length(7),
-                Constraint::Percentage(35),
-            ])
-            .split(area)[1];
-        let popup_area = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(20),
-                Constraint::Percentage(60),
-                Constraint::Percentage(20),
-            ])
-            .split(popup_area)[1];
-
-        f.render_widget(Clear, popup_area);
-
         let recording_name = if let Some(recording) = &self.delete_candidate {
             recording
                 .display_name
                 .as_ref()
                 .unwrap_or(&recording.directory_name)
-                .as_str()
+                .clone()
         } else {
-            "?"
+            "?".to_string()
         };
 
-        let content = vec![
-            Line::from(""),
+        let sel = self.delete_confirm_selection;
+        let sel_bg = Color::Indexed(236);
+        let labels = ["Yes, delete", "No, keep it"];
+        let label_width = labels.iter().map(|l| l.chars().count() + 2).max().unwrap_or(0);
+
+        let mut lines: Vec<Line> = vec![
             Line::from(vec![
                 Span::styled("Delete recording: ", Style::default().fg(Color::White)),
-                Span::styled(recording_name, Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                Span::styled(&recording_name, Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
                 Span::styled("?", Style::default().fg(Color::White)),
             ]),
             Line::from(""),
-            Line::from(vec![
-                Span::styled("  [Y] Yes  ", Style::default().fg(Color::Red)),
-                Span::styled("  [N] No  ", Style::default().fg(Color::Green)),
-            ]),
         ];
+        for (i, label) in labels.iter().enumerate() {
+            if sel == i {
+                let pad = " ".repeat(label_width.saturating_sub(label.chars().count() + 2));
+                lines.push(Line::from(vec![
+                    Span::styled("\u{25B8} ", Style::default().fg(ACCENT).bg(sel_bg)),
+                    Span::styled(format!("{}{}", label, pad), Style::default().fg(Color::White).bg(sel_bg)),
+                ]));
+            } else {
+                lines.push(Line::from(Span::styled(format!("  {}", label), Style::default().fg(Color::DarkGray))));
+            }
+        }
 
-        let paragraph = Paragraph::new(content)
-            .alignment(Alignment::Center)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Confirm Delete")
-                    .title_style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
-                    .border_style(Style::default().fg(Color::Red)),
-            );
+        let max_w = lines.iter().map(|l| l.width() as u16).max().unwrap_or(0).max(30);
+        let content_width = max_w.min(area.width);
+        let left_pad = (area.width.saturating_sub(content_width)) / 2;
+        let line_count = lines.len();
+        let top_pad = (area.height as usize).saturating_sub(line_count) / 2;
+        let mut centered: Vec<Line> = Vec::with_capacity(top_pad + line_count);
+        for _ in 0..top_pad { centered.push(Line::from("")); }
+        centered.extend(lines);
 
-        f.render_widget(paragraph, popup_area);
+        f.render_widget(Clear, area);
+        let body = Rect { x: area.x + left_pad, width: content_width, ..area };
+        f.render_widget(Paragraph::new(centered).alignment(Alignment::Left), body);
     }
 
     fn render_search_input(&self, f: &mut Frame, area: ratatui::layout::Rect) {
@@ -4932,7 +4858,7 @@ impl Dashboard {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .style(Style::default().fg(Color::Cyan))
+                    .style(Style::default().fg(ACCENT))
                     .title("Search Recordings"),
             );
 
@@ -4952,6 +4878,7 @@ impl Dashboard {
         self.progress_frame = 0;
         self.show_message = true;
         self.recording_mode = Some(RecordingMode::RecordAndTranscribe);
+        self.recording_start_instant = Some(std::time::Instant::now());
 
         // Generate filename and start recording task (no name prompt, consistent with A command)
         let recording_name = generate_recording_name(None);
@@ -5056,20 +4983,6 @@ impl Dashboard {
         });
 
         Ok(())
-    }
-
-    fn format_duration(&self, seconds: i64) -> String {
-        let hours = seconds / 3600;
-        let minutes = (seconds % 3600) / 60;
-        let secs = seconds % 60;
-
-        if hours > 0 {
-            format!("{}h {}m", hours, minutes)
-        } else if minutes > 0 {
-            format!("{}m {}s", minutes, secs)
-        } else {
-            format!("{}s", secs)
-        }
     }
 
     async fn create_stereo_temp_file(
@@ -5563,10 +5476,10 @@ impl Dashboard {
                     .title(title)
                     .title_style(
                         Style::default()
-                            .fg(Color::Cyan)
+                            .fg(ACCENT)
                             .add_modifier(Modifier::BOLD),
                     )
-                    .border_style(Style::default().fg(Color::Cyan)),
+                    .border_style(Style::default().fg(ACCENT)),
             )
             .wrap(Wrap { trim: true });
 
@@ -5638,24 +5551,97 @@ impl Dashboard {
         }
     }
 
+    fn generate_greeting(&mut self) {
+        use crate::tui::chat::HomeRecording;
+
+        // Owner first name
+        let first_name = self.owner_name.split_whitespace().next().unwrap_or("").to_string();
+
+        // Count today's recordings and total duration
+        let today = chrono::Local::now().date_naive();
+        let today_recordings: Vec<&Recording> = self.recordings.iter().filter(|r| {
+            r.created_at.with_timezone(&chrono::Local).date_naive() == today
+        }).collect();
+        let today_count = today_recordings.len();
+
+        // Greeting text
+        self.greeting_text = if first_name.is_empty() {
+            "Welcome back.".to_string()
+        } else {
+            format!("Welcome back, {}.", first_name)
+        };
+
+        // Subtitle
+        self.greeting_subtitle = if today_count == 0 {
+            "No recordings today yet.".to_string()
+        } else if today_count == 1 {
+            "You had 1 recording today.".to_string()
+        } else {
+            format!("You had {} recordings today.", today_count)
+        };
+
+        // Build home recordings (most recent first, cap at 5)
+        let mut home_recs: Vec<HomeRecording> = today_recordings.iter().take(5).map(|r| {
+            let name = r.display_name.as_ref()
+                .unwrap_or(&r.directory_name)
+                .clone();
+            let duration_mins = r.duration_seconds.unwrap_or(0) / 60;
+            let summary_line = r.summary.as_ref().and_then(|s| {
+                let first = s.split(&['.', '!', '?'][..]).next().unwrap_or("").trim();
+                if first.is_empty() { None } else { Some(format!("{}.", first)) }
+            });
+            let recording_id = r.id.unwrap_or(0);
+            HomeRecording { recording_id, name, duration_mins, summary_line }
+        }).collect();
+        // If no duration info, show at least 1m
+        for rec in &mut home_recs {
+            if rec.duration_mins == 0 {
+                rec.duration_mins = 1;
+            }
+        }
+
+        // Copy into chat state
+        self.chat.greeting_text = self.greeting_text.clone();
+        self.chat.greeting_subtitle = self.greeting_subtitle.clone();
+        self.chat.home_recordings = home_recs;
+        self.chat.selected_action = 0;
+
+        self.chat.placeholder = "Ask anything...".to_string();
+    }
+
     fn init_global_chat(&mut self) {
         // Load world context for owner name
         let world = WorldContext::load().ok()
             .and_then(|wc| WorldData::from_json(&wc.content).ok())
             .unwrap_or_default();
 
-        let owner_name = if world.owner.name.is_empty() {
-            "User".to_string()
+        self.owner_name = if world.owner.name.is_empty() {
+            // Fall back to system username, capitalize first letter
+            let sys_user = std::env::var("USER").unwrap_or_default();
+            if sys_user.is_empty() {
+                String::new()
+            } else {
+                let mut chars = sys_user.chars();
+                match chars.next() {
+                    Some(c) => c.to_uppercase().to_string() + chars.as_str(),
+                    None => String::new(),
+                }
+            }
         } else {
             world.owner.name.clone()
         };
 
         // All providers use agent prompt (tools handle data fetching)
-        self.chat.system_prompt = chat_prompts::build_agent_global_prompt(&owner_name);
+        self.chat.system_prompt = chat_prompts::build_agent_global_prompt(&self.owner_name);
 
         self.chat.context = ChatContext::Global;
         self.chat.suggestions = self.generate_suggestions();
         self.chat.show_suggestions = self.chat.messages.is_empty();
+        self.chat.show_home_screen = self.chat.messages.is_empty();
+        self.chat.borderless = true;
+        self.chat.focus = ChatFocus::ChatInput;
+
+        self.generate_greeting();
     }
 
     fn init_recording_chat(&mut self, recording: &Recording) {
@@ -5700,6 +5686,8 @@ impl Dashboard {
         self.current_transcript_recording = Some(recording.clone());
         self.chat.suggestions = self.generate_suggestions();
         self.chat.show_suggestions = true;
+        self.chat.borderless = true;
+        self.chat.show_home_screen = false;
     }
 
     fn restore_global_chat(&mut self) {
@@ -5713,7 +5701,15 @@ impl Dashboard {
         self.current_transcript_recording = None;
         self.chat.suggestions = self.generate_suggestions();
         self.chat.show_suggestions = self.chat.messages.is_empty();
-        self.chat.focus = ChatFocus::Table;
+        self.chat.show_home_screen = self.chat.messages.is_empty();
+        // Restore home-screen chat state when returning to Main
+        if self.current_view == DashboardView::Main {
+            self.chat.borderless = true;
+            self.chat.focus = ChatFocus::ChatInput;
+        } else {
+            self.chat.borderless = false;
+            self.chat.focus = ChatFocus::Table;
+        }
     }
 
     fn send_chat_message(&mut self) {
@@ -5732,6 +5728,7 @@ impl Dashboard {
             let msg = self.chat.input_buffer.clone();
             self.chat.input_buffer.clear();
             self.chat.show_suggestions = false;
+            self.chat.show_home_screen = false;
             msg
         } else {
             return;
@@ -5766,21 +5763,85 @@ impl Dashboard {
         }));
     }
 
+    /// Execute the selected action from the home screen quick-action menu.
+    fn execute_home_action(&mut self) {
+        let idx = self.chat.selected_action.min(
+            self.chat.home_recordings.len().saturating_sub(1),
+        );
+        let rec = self.chat.home_recordings[idx].clone();
+        self.chat.action_menu_open = false;
+
+        match self.chat.action_menu_selection {
+            0 => {
+                // View transcript — find the recording and open transcript popup
+                if let Some(recording) = self.recordings.iter()
+                    .find(|r| r.id == Some(rec.recording_id))
+                    .cloned()
+                {
+                    if recording.has_transcript {
+                        if let Ok(content) = self.load_transcript_content(&recording) {
+                            self.transcript_content = content;
+                            self.show_transcript = true;
+                            self.load_enrichment_data(&recording);
+                            self.init_recording_chat(&recording);
+                        }
+                    }
+                }
+            }
+            1 | 2 => {
+                // Fresh chat for this recording
+                self.chat.messages.clear();
+                self.chat.pending_blocks.clear();
+                self.chat.current_status = None;
+                self.chat.scroll_offset = 0;
+                self.chat.auto_scroll = true;
+                self.chat.invalidate_cache();
+                self.chat.show_home_screen = false;
+                self.chat.show_suggestions = false;
+                self.global_chat_messages.clear();
+
+                if self.chat.action_menu_selection == 1 {
+                    // Summarize — send immediately
+                    self.chat.input_buffer = format!("Summarize my {} recording (recording id={}).", rec.name, rec.recording_id);
+                    self.send_chat_message();
+                } else {
+                    // Ask about it — fill input, let user edit
+                    self.chat.input_buffer = format!("What happened in my {}? (recording id={})", rec.name, rec.recording_id);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn handle_chat_key(&mut self, key_code: KeyCode) -> bool {
         match key_code {
             KeyCode::Tab => {
-                // Toggle focus
-                self.chat.focus = match self.chat.focus {
-                    ChatFocus::Table => ChatFocus::ChatInput,
-                    ChatFocus::ChatInput => ChatFocus::Table,
-                };
+                if self.current_view == DashboardView::Main {
+                    // Main → Browse
+                    self.current_view = DashboardView::Browse;
+                } else {
+                    // Transcript view: toggle focus
+                    self.chat.focus = match self.chat.focus {
+                        ChatFocus::Table => ChatFocus::ChatInput,
+                        ChatFocus::ChatInput => ChatFocus::Table,
+                    };
+                }
                 true
             }
             _ if self.chat.focus == ChatFocus::ChatInput => {
                 match key_code {
                     KeyCode::Enter => {
-                        if self.chat.is_generating {
-                            // Queue the message — will auto-send when generation completes
+                        let on_home = self.chat.show_home_screen
+                            && self.chat.input_buffer.is_empty()
+                            && !self.chat.home_recordings.is_empty();
+                        if on_home && !self.chat.action_menu_open {
+                            // Open action menu for selected recording
+                            self.chat.action_menu_open = true;
+                            self.chat.action_menu_selection = 0;
+                        } else if on_home && self.chat.action_menu_open {
+                            // Execute selected action
+                            self.execute_home_action();
+                        } else if self.chat.is_generating {
                             if !self.chat.input_buffer.is_empty() {
                                 self.chat.pending_message = Some(self.chat.input_buffer.clone());
                                 self.chat.input_buffer.clear();
@@ -5790,60 +5851,90 @@ impl Dashboard {
                         }
                     }
                     KeyCode::Esc => {
-                        if !self.chat.input_buffer.is_empty() {
+                        if self.chat.action_menu_open {
+                            self.chat.action_menu_open = false;
+                        } else if !self.chat.input_buffer.is_empty() {
                             self.chat.input_buffer.clear();
-                        } else {
+                        } else if self.current_view == DashboardView::Main
+                            && !self.chat.show_home_screen
+                            && !self.chat.is_generating
+                        {
+                            // Return to home screen from chat
+                            self.chat.messages.clear();
+                            self.chat.pending_blocks.clear();
+                            self.chat.current_status = None;
+                            self.chat.scroll_offset = 0;
+                            self.chat.show_home_screen = true;
+                            self.chat.show_suggestions = true;
+                            self.chat.selected_suggestion = 0;
+                            self.chat.selected_action = 0;
+                            self.chat.action_menu_open = false;
+                            self.chat.auto_scroll = true;
+                            self.chat.invalidate_cache();
+                            self.generate_greeting();
+                        }
+                        else if self.current_view != DashboardView::Main {
                             self.chat.focus = ChatFocus::Table;
                         }
+                        // On home screen with nothing to dismiss — do nothing
                     }
                     KeyCode::Backspace => {
                         self.chat.input_buffer.pop();
                     }
                     KeyCode::Up => {
-                        if self.chat.show_suggestions && !self.chat.suggestions.is_empty() {
+                        if self.chat.action_menu_open {
+                            if self.chat.action_menu_selection > 0 {
+                                self.chat.action_menu_selection -= 1;
+                            }
+                        } else if self.chat.show_home_screen
+                            && self.chat.input_buffer.is_empty()
+                            && !self.chat.home_recordings.is_empty()
+                        {
+                            if self.chat.selected_action > 0 {
+                                self.chat.selected_action -= 1;
+                            }
+                        } else if self.chat.show_suggestions && !self.chat.suggestions.is_empty() {
                             if self.chat.selected_suggestion > 0 {
                                 self.chat.selected_suggestion -= 1;
                             }
                         } else {
-                            // Disengage auto-scroll when user scrolls up
                             if self.chat.auto_scroll {
-                                // Snap scroll_offset to current bottom before disengaging
-                                self.chat.scroll_offset = usize::MAX; // will be clamped in render
+                                self.chat.scroll_offset = usize::MAX;
                             }
                             self.chat.auto_scroll = false;
                             self.chat.scroll_offset = self.chat.scroll_offset.saturating_sub(1);
                         }
                     }
                     KeyCode::Down => {
-                        if self.chat.show_suggestions && !self.chat.suggestions.is_empty() {
-                            let max_idx = self.chat.suggestions.len(); // last = free-form
+                        if self.chat.action_menu_open {
+                            if self.chat.action_menu_selection < 2 {
+                                self.chat.action_menu_selection += 1;
+                            }
+                        } else if self.chat.show_home_screen
+                            && self.chat.input_buffer.is_empty()
+                            && !self.chat.home_recordings.is_empty()
+                        {
+                            let max_idx = self.chat.home_recordings.len().saturating_sub(1);
+                            if self.chat.selected_action < max_idx {
+                                self.chat.selected_action += 1;
+                            }
+                        } else if self.chat.show_suggestions && !self.chat.suggestions.is_empty() {
+                            let max_idx = self.chat.suggestions.len();
                             if self.chat.selected_suggestion < max_idx {
                                 self.chat.selected_suggestion += 1;
                             }
                         } else if !self.chat.auto_scroll {
                             self.chat.scroll_offset += 1;
-                            // Re-engage auto-scroll if we've scrolled to the bottom
-                            // (the render will clamp, so just check a generous threshold)
-                            self.chat.auto_scroll = true; // will be re-checked — if user scrolls up again, it disengages
+                            self.chat.auto_scroll = true;
                         }
                     }
                     KeyCode::Char(c) => {
                         self.chat.input_buffer.push(c);
                         self.chat.show_suggestions = false;
+                        self.chat.action_menu_open = false;
                     }
                     _ => {}
                 }
-                true
-            }
-            // Auto-focus: printable chars when table is focused go to chat
-            KeyCode::Char(c) if self.chat.focus == ChatFocus::Table
-                && !self.show_transcript
-                && !self.search_mode
-                && c.is_alphanumeric()
-                && !matches!(c, 'q' | 'h' | 'H' | 's' | 'S' | 'r' | 'R' | 'a' | 'A' | 't' | 'T' | 'w' | 'W' | 'd' | 'p' | 'P' | '/' | '[' | ']') => {
-                self.chat.focus = ChatFocus::ChatInput;
-                self.chat.input_buffer.push(c);
-                self.chat.show_suggestions = false;
                 true
             }
             _ => false,
@@ -6014,47 +6105,8 @@ impl Dashboard {
         }
     }
 
-    // ── Rendering ──────────────────────────────────────────────────────────
-
-    fn render_compressed_footer(&self, f: &mut Frame, area: ratatui::layout::Rect) {
-        // Show notification if present (auto-dismissing)
-        if let Some((ref msg, _)) = self.notification_message {
-            let is_error = msg.contains("failed") || msg.contains("Failed");
-            let style = if is_error {
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
-            };
-            let para = Paragraph::new(msg.as_str())
-                .style(style)
-                .alignment(Alignment::Center);
-            f.render_widget(para, area);
-            return;
-        }
-
-        let voice_status = if self.voice_mode_active { " | Voice" } else { "" };
-        let queue_len = self.transcription_queue.len();
-        let transcribing = if self.active_transcription.is_some() {
-            if queue_len > 0 {
-                format!(" | Transcribing... (+{} queued)", queue_len)
-            } else {
-                " | Transcribing...".to_string()
-            }
-        } else {
-            String::new()
-        };
-        let controls = format!(
-            "TAB: Focus | ↑↓: Nav | /: Search | R: Record | A: Add | W: World | S: Settings | H: Help | Q: Quit{}{}",
-            transcribing, voice_status
-        );
-        let para = Paragraph::new(controls)
-            .style(Style::default().fg(Color::DarkGray))
-            .alignment(Alignment::Center);
-        f.render_widget(para, area);
-    }
-
     // ─────────────────────────────────────────────────────────────────────────
-    // Onboarding: Scriba the Owl
+    // Onboarding
     // ─────────────────────────────────────────────────────────────────────────
 
     async fn handle_onboarding_keys(&mut self, key_code: KeyCode) -> Result<DashboardAction> {
@@ -6076,69 +6128,111 @@ impl Dashboard {
             }
             OnboardingStep::Intro => {
                 if !ob.text_complete {
-                    ob.complete_text();
+                    ob.visible_chars = ob.full_text.chars().count();
+                    ob.text_complete = true;
                 } else if matches!(key_code, KeyCode::Enter) {
                     ob.step = OnboardingStep::ModeSelection;
                     ob.anim_frame = 0;
-                    ob.set_step_text(
-                        "First, how should I think?\n\n\
-                         I can use a cloud AI (smarter, needs API key)\n\
-                         or run locally on your machine (private, needs Ollama).\n\n\
-                         [1] Cloud Provider (recommended)\n\
-                         [2] Privacy Mode (local Ollama)"
-                    );
+                    ob.set_step_text("I use AI to extract names, topics, and summaries\nfrom your recordings. How should I do it?", false);
                 }
             }
             OnboardingStep::ModeSelection => {
-                if !ob.text_complete {
-                    ob.complete_text();
-                } else {
-                    match key_code {
-                        KeyCode::Char('1') => {
-                            ob.selected_mode = 0;
+                match key_code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        ob.selected_mode = 0;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        ob.selected_mode = 1;
+                    }
+                    KeyCode::Enter => {
+                        if ob.selected_mode == 0 {
                             ob.step = OnboardingStep::ProviderSelection;
                             ob.anim_frame = 0;
-                            ob.set_step_text(
-                                "Great choice! Which cloud provider?\n\n\
-                                 [1] Anthropic (Claude) -- Best for nuanced understanding\n\
-                                 [2] OpenAI (GPT) -- Widely used, reliable\n\
-                                 [3] Google (Gemini) -- Fast and cost-effective"
-                            );
-                        }
-                        KeyCode::Char('2') => {
+                            ob.set_step_text("Which cloud provider?", false);
+                        } else {
                             ob.selected_mode = 1;
-                            // Set local mode in config and skip to AskName
+                            // Set local mode defaults in config
                             self.config.enrichment.mode = EnrichmentMode::Local {
                                 ollama_endpoint: "http://localhost:11434".to_string(),
                                 ollama_model: "mistral:latest".to_string(),
                             };
                             let _ = self.config.save();
-                            ob.step = OnboardingStep::AskName;
+
+                            // Start system checks
+                            ob.step = OnboardingStep::SystemCheck;
                             ob.anim_frame = 0;
-                            ob.set_step_text(
-                                "Privacy mode it is! Make sure Ollama is running.\n\n\
-                                 So, who am I working for?\n\nWhat's your name?"
-                            );
+                            ob.set_step_text("Checking your setup...", false);
+                            ob.system_checks = vec![
+                                ("FFmpeg".to_string(), CheckStatus::Pending),
+                                ("Ollama".to_string(), CheckStatus::Pending),
+                                ("Ollama server".to_string(), CheckStatus::Pending),
+                            ];
+                            ob.system_check_done = false;
+                            ob.system_check_selection = 0;
+                            ob.ollama_reachable = false;
+
+                            let (tx, rx) = mpsc::unbounded_channel();
+                            ob.system_check_rx = Some(rx);
+                            ob.system_check_task = Some(tokio::spawn(async move {
+                                // Check 1: FFmpeg
+                                let _ = tx.send((0, false, String::new())); // mark running
+                                let ffmpeg_ok = crate::core::transcription::find_ffmpeg().is_ok();
+                                let _ = tx.send((0, ffmpeg_ok, if ffmpeg_ok { String::new() } else {
+                                    "Install with: brew install ffmpeg".to_string()
+                                }));
+
+                                // Check 2: Ollama binary
+                                let _ = tx.send((1, false, String::new())); // mark running
+                                let ollama_bin = tokio::process::Command::new("which")
+                                    .arg("ollama")
+                                    .output()
+                                    .await
+                                    .map(|o| o.status.success())
+                                    .unwrap_or(false);
+                                let _ = tx.send((1, ollama_bin, if ollama_bin { String::new() } else {
+                                    "Install with: brew install ollama".to_string()
+                                }));
+
+                                if !ollama_bin {
+                                    // Skip server check if binary not found
+                                    let _ = tx.send((2, false, "Install Ollama first".to_string()));
+                                    return;
+                                }
+
+                                // Check 3: Ollama server responding
+                                let _ = tx.send((2, false, String::new())); // mark running
+                                let client = reqwest::Client::builder()
+                                    .timeout(std::time::Duration::from_secs(5))
+                                    .build()
+                                    .unwrap();
+                                let server_ok = client
+                                    .get("http://localhost:11434/api/tags")
+                                    .send()
+                                    .await
+                                    .map(|r| r.status().is_success())
+                                    .unwrap_or(false);
+                                let _ = tx.send((2, server_ok, if server_ok { String::new() } else {
+                                    "Start with: ollama serve".to_string()
+                                }));
+                            }));
                         }
-                        _ => {}
                     }
+                    _ => {}
                 }
             }
             OnboardingStep::ProviderSelection => {
-                if !ob.text_complete {
-                    ob.complete_text();
-                } else {
-                    let provider = match key_code {
-                        KeyCode::Char('1') => Some(CloudProvider::Anthropic),
-                        KeyCode::Char('2') => Some(CloudProvider::OpenAI),
-                        KeyCode::Char('3') => Some(CloudProvider::Google),
-                        _ => None,
-                    };
-                    if let Some(p) = provider {
-                        ob.selected_provider = match &p {
-                            CloudProvider::Anthropic => 0,
-                            CloudProvider::OpenAI => 1,
-                            CloudProvider::Google => 2,
+                match key_code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        ob.selected_provider = ob.selected_provider.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        ob.selected_provider = (ob.selected_provider + 1).min(2);
+                    }
+                    KeyCode::Enter => {
+                        let p = match ob.selected_provider {
+                            0 => CloudProvider::Anthropic,
+                            1 => CloudProvider::OpenAI,
+                            _ => CloudProvider::Google,
                         };
                         self.config.enrichment.mode = EnrichmentMode::Cloud {
                             provider: p.clone(),
@@ -6148,83 +6242,399 @@ impl Dashboard {
                         ob.step = OnboardingStep::ApiKeyEntry;
                         ob.anim_frame = 0;
                         ob.set_step_text(&format!(
-                            "Excellent! Now I need your {} API key.\n\n\
-                             Paste it below (it won't be shown):",
+                            "Enter your {} API key.\n\n\
+                             Paste it below:",
                             p.display_name()
-                        ));
+                        ), false);
                     }
+                    _ => {}
                 }
             }
             OnboardingStep::ApiKeyEntry => {
-                if !ob.text_complete {
-                    ob.complete_text();
-                } else {
-                    match key_code {
-                        KeyCode::Enter => {
-                            if !ob.api_key_input.trim().is_empty() {
-                                let key = ob.api_key_input.trim().to_string();
-                                if let EnrichmentMode::Cloud { api_key, .. } = &mut self.config.enrichment.mode {
-                                    *api_key = key.clone();
-                                }
-                                let _ = self.config.save();
-
-                                // Start validation
-                                ob.step = OnboardingStep::ApiKeyValidation;
-                                ob.anim_frame = 0;
-                                ob.api_key_valid = None;
-                                ob.set_step_text("Testing your API key...");
-
-                                let config = self.config.enrichment.clone();
-                                ob.validation_task = Some(tokio::spawn(async move {
-                                    let provider = crate::enrichment::create_provider(&config);
-                                    match provider.health_check().await {
-                                        Ok(()) => Ok(true),
-                                        Err(_) => Ok(false),
-                                    }
-                                }));
+                match key_code {
+                    KeyCode::Enter => {
+                        if !ob.api_key_input.trim().is_empty() {
+                            let key = ob.api_key_input.trim().to_string();
+                            if let EnrichmentMode::Cloud { api_key, .. } = &mut self.config.enrichment.mode {
+                                *api_key = key.clone();
                             }
+                            let _ = self.config.save();
+
+                            // Start validation
+                            ob.step = OnboardingStep::ApiKeyValidation;
+                            ob.anim_frame = 0;
+                            ob.api_key_valid = None;
+                            ob.set_step_text("Testing your API key...", false);
+
+                            let config = self.config.enrichment.clone();
+                            ob.validation_task = Some(tokio::spawn(async move {
+                                let provider = crate::enrichment::create_provider(&config);
+                                match provider.health_check().await {
+                                    Ok(()) => Ok(true),
+                                    Err(_) => Ok(false),
+                                }
+                            }));
                         }
-                        KeyCode::Char(c) => {
-                            ob.api_key_input.push(c);
-                        }
-                        KeyCode::Backspace => {
-                            ob.api_key_input.pop();
-                        }
-                        _ => {}
                     }
+                    KeyCode::Char(c) => {
+                        ob.api_key_input.push(c);
+                    }
+                    KeyCode::Backspace => {
+                        ob.api_key_input.pop();
+                    }
+                    _ => {}
                 }
             }
             OnboardingStep::ApiKeyValidation => {
                 // Validation result is resolved by the tick handler.
                 // Here we only handle retry/skip choices after validation fails.
                 if ob.api_key_valid == Some(false) {
-                    // Handle retry/skip
                     match key_code {
-                        KeyCode::Char('1') => {
-                            ob.step = OnboardingStep::ApiKeyEntry;
-                            ob.api_key_input.clear();
-                            ob.anim_frame = 0;
-                            let provider_name = self.config.enrichment.provider_display_name().to_string();
-                            ob.set_step_text(&format!(
-                                "Let's try again. Paste your {} API key:",
-                                provider_name
-                            ));
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            ob.validation_fail_selection = 0;
                         }
-                        KeyCode::Char('2') => {
-                            ob.step = OnboardingStep::AskName;
-                            ob.anim_frame = 0;
-                            ob.set_step_text(
-                                "No worries! You can set the key later in Settings.\n\n\
-                                 So, who am I working for?\n\nWhat's your name?"
-                            );
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            ob.validation_fail_selection = 1;
+                        }
+                        KeyCode::Enter => {
+                            if ob.validation_fail_selection == 0 {
+                                ob.step = OnboardingStep::ApiKeyEntry;
+                                ob.api_key_input.clear();
+                                ob.anim_frame = 0;
+                                let provider_name = self.config.enrichment.provider_display_name().to_string();
+                                ob.set_step_text(&format!(
+                                    "Let's try again. Paste your {} API key:",
+                                    provider_name
+                                ), false);
+                            } else {
+                                ob.step = OnboardingStep::AskName;
+                                ob.anim_frame = 0;
+                                ob.set_step_text(
+                                    "No problem. You can set the key later in Settings.\n\n\
+                                     What's your name?",
+                                    true,
+                                );
+                            }
                         }
                         _ => {}
                     }
                 }
             }
+            OnboardingStep::SystemCheck => {
+                if ob.system_check_done {
+                    match key_code {
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            ob.system_check_selection = 0;
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            ob.system_check_selection = 1;
+                        }
+                        KeyCode::Enter => {
+                            if ob.system_check_selection == 0 {
+                                // "Check again" — re-run all checks
+                                ob.system_check_done = false;
+                                ob.system_check_selection = 0;
+                                ob.ollama_reachable = false;
+                                ob.set_step_text("Checking your setup...", false);
+                                ob.system_checks = vec![
+                                    ("FFmpeg".to_string(), CheckStatus::Pending),
+                                    ("Ollama".to_string(), CheckStatus::Pending),
+                                    ("Ollama server".to_string(), CheckStatus::Pending),
+                                ];
+
+                                let (tx, rx) = mpsc::unbounded_channel();
+                                ob.system_check_rx = Some(rx);
+                                ob.system_check_task = Some(tokio::spawn(async move {
+                                    let _ = tx.send((0, false, String::new()));
+                                    let ffmpeg_ok = crate::core::transcription::find_ffmpeg().is_ok();
+                                    let _ = tx.send((0, ffmpeg_ok, if ffmpeg_ok { String::new() } else {
+                                        "Install with: brew install ffmpeg".to_string()
+                                    }));
+
+                                    let _ = tx.send((1, false, String::new()));
+                                    let ollama_bin = tokio::process::Command::new("which")
+                                        .arg("ollama")
+                                        .output()
+                                        .await
+                                        .map(|o| o.status.success())
+                                        .unwrap_or(false);
+                                    let _ = tx.send((1, ollama_bin, if ollama_bin { String::new() } else {
+                                        "Install with: brew install ollama".to_string()
+                                    }));
+
+                                    if !ollama_bin {
+                                        let _ = tx.send((2, false, "Install Ollama first".to_string()));
+                                        return;
+                                    }
+
+                                    let _ = tx.send((2, false, String::new()));
+                                    let client = reqwest::Client::builder()
+                                        .timeout(std::time::Duration::from_secs(5))
+                                        .build()
+                                        .unwrap();
+                                    let server_ok = client
+                                        .get("http://localhost:11434/api/tags")
+                                        .send()
+                                        .await
+                                        .map(|r| r.status().is_success())
+                                        .unwrap_or(false);
+                                    let _ = tx.send((2, server_ok, if server_ok { String::new() } else {
+                                        "Start with: ollama serve".to_string()
+                                    }));
+                                }));
+                            } else {
+                                // "Continue anyway" — advance to ModelSetup
+                                ob.step = OnboardingStep::ModelSetup;
+                                ob.anim_frame = 0;
+                                ob.setup_phase = 0;
+                                ob.set_step_text("Choose your transcription model", false);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            OnboardingStep::ModelSetup => {
+                match ob.setup_phase {
+                    0 => {
+                        // Whisper model selection
+                        match key_code {
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                ob.whisper_model_selection = ob.whisper_model_selection.saturating_sub(1);
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                ob.whisper_model_selection = (ob.whisper_model_selection + 1).min(WHISPER_MODELS.len() - 1);
+                            }
+                            KeyCode::Enter => {
+                                if ob.ollama_reachable {
+                                    ob.setup_phase = 1;
+                                    ob.set_step_text("Choose your enrichment model", false);
+                                    // Fetch available models if not already done
+                                    if !ob.ollama_models_fetched {
+                                        ob.ollama_models_fetched = true;
+                                        let endpoint = if let EnrichmentMode::Local { ollama_endpoint, .. } = &self.config.enrichment.mode {
+                                            ollama_endpoint.clone()
+                                        } else {
+                                            "http://localhost:11434".to_string()
+                                        };
+                                        let (tx, rx) = mpsc::channel(1);
+                                        self.ollama_models_rx = Some(rx);
+                                        tokio::spawn(async move {
+                                            let result = OllamaClient::fetch_models(&endpoint).await;
+                                            let _ = tx.send(result.map_err(|e| e.to_string())).await;
+                                        });
+                                    }
+                                } else {
+                                    // Skip Ollama model selection, go to confirm
+                                    ob.setup_phase = 2;
+                                    ob.system_check_selection = 0;
+                                    ob.set_step_text("Ready to set up:", false);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    1 => {
+                        // Ollama model selection
+                        let model_count = ob.ollama_available_models.len().max(1);
+                        match key_code {
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                ob.ollama_model_selection = ob.ollama_model_selection.saturating_sub(1);
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                ob.ollama_model_selection = (ob.ollama_model_selection + 1).min(model_count - 1);
+                            }
+                            KeyCode::Enter => {
+                                // Set the selected model in config
+                                if let Some(model_name) = ob.ollama_available_models.get(ob.ollama_model_selection) {
+                                    let model_with_tag = if model_name.contains(':') {
+                                        model_name.clone()
+                                    } else {
+                                        format!("{}:latest", model_name)
+                                    };
+                                    if let EnrichmentMode::Local { ollama_model, .. } = &mut self.config.enrichment.mode {
+                                        *ollama_model = model_with_tag;
+                                    }
+                                    let _ = self.config.save();
+                                }
+                                ob.setup_phase = 2;
+                                ob.set_step_text("Ready to set up:", false);
+                            }
+                            _ => {}
+                        }
+                    }
+                    2 => {
+                        // Download confirmation: "Download now" / "Skip for now"
+                        match key_code {
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                ob.system_check_selection = 0;
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                ob.system_check_selection = 1;
+                            }
+                            KeyCode::Enter => {
+                                if ob.system_check_selection == 0 {
+                                    // "Download now"
+                                    ob.setup_phase = 3;
+                                    ob.set_step_text("Setting up your models...", false);
+
+                                    // Build download items
+                                    let whisper_size = WHISPER_MODELS[ob.whisper_model_selection].0;
+                                    let whisper_label = WHISPER_MODELS[ob.whisper_model_selection].1.to_string();
+                                    let whisper_already = crate::core::transcription::check_whisper_model(whisper_size);
+
+                                    let mut items: Vec<(String, DownloadStatus)> = Vec::new();
+                                    items.push((
+                                        format!("Whisper {}", whisper_label.replace(" (Recommended)", "")),
+                                        if whisper_already { DownloadStatus::Done } else { DownloadStatus::Pending },
+                                    ));
+
+                                    let ollama_model = if let EnrichmentMode::Local { ollama_model, .. } = &self.config.enrichment.mode {
+                                        ollama_model.clone()
+                                    } else {
+                                        "mistral:latest".to_string()
+                                    };
+
+                                    let need_ollama_pull = ob.ollama_reachable;
+                                    if need_ollama_pull {
+                                        items.push((
+                                            format!("Pulling {}", ollama_model.split(':').next().unwrap_or(&ollama_model)),
+                                            DownloadStatus::Pending,
+                                        ));
+                                    }
+                                    ob.download_items = items;
+
+                                    // Start downloads
+                                    let (tx, rx) = mpsc::unbounded_channel();
+                                    ob.download_rx = Some(rx);
+
+                                    let endpoint = if let EnrichmentMode::Local { ollama_endpoint, .. } = &self.config.enrichment.mode {
+                                        ollama_endpoint.clone()
+                                    } else {
+                                        "http://localhost:11434".to_string()
+                                    };
+                                    let ollama_model_clone = ollama_model.clone();
+
+                                    ob.download_task = Some(tokio::spawn(async move {
+                                        // Download Whisper model
+                                        if !whisper_already {
+                                            let (wtx, mut wrx) = mpsc::unbounded_channel();
+                                            let tx_w = tx.clone();
+                                            let whisper_handle = tokio::spawn(async move {
+                                                let result = crate::core::transcription::download_whisper_with_progress(whisper_size, wtx).await;
+                                                if let Err(_) = result {
+                                                    let _ = tx_w.send(DownloadProgress {
+                                                        index: 0,
+                                                        status: DownloadStatus::Failed("Download failed".to_string()),
+                                                    });
+                                                }
+                                            });
+
+                                            // Forward whisper progress
+                                            let tx_wf = tx.clone();
+                                            tokio::spawn(async move {
+                                                while let Some(pct) = wrx.recv().await {
+                                                    if pct >= 100 {
+                                                        let _ = tx_wf.send(DownloadProgress { index: 0, status: DownloadStatus::Done });
+                                                    } else {
+                                                        let _ = tx_wf.send(DownloadProgress { index: 0, status: DownloadStatus::InProgress(pct) });
+                                                    }
+                                                }
+                                            });
+
+                                            let _ = whisper_handle.await;
+                                        }
+
+                                        // Pull Ollama model
+                                        if need_ollama_pull {
+                                            let (otx, mut orx) = mpsc::unbounded_channel();
+                                            let tx_o = tx.clone();
+                                            let endpoint_clone = endpoint.clone();
+                                            let model_clone = ollama_model_clone.clone();
+                                            let ollama_handle = tokio::spawn(async move {
+                                                let result = crate::enrichment::pull_model_with_progress(&endpoint_clone, &model_clone, otx).await;
+                                                if let Err(_) = result {
+                                                    let _ = tx_o.send(DownloadProgress {
+                                                        index: 1,
+                                                        status: DownloadStatus::Failed("Pull failed".to_string()),
+                                                    });
+                                                }
+                                            });
+
+                                            // Forward ollama progress
+                                            let tx_of = tx.clone();
+                                            tokio::spawn(async move {
+                                                while let Some((_status, pct)) = orx.recv().await {
+                                                    if let Some(p) = pct {
+                                                        if p >= 100 {
+                                                            let _ = tx_of.send(DownloadProgress { index: 1, status: DownloadStatus::Done });
+                                                        } else {
+                                                            let _ = tx_of.send(DownloadProgress { index: 1, status: DownloadStatus::InProgress(p) });
+                                                        }
+                                                    }
+                                                }
+                                            });
+
+                                            let _ = ollama_handle.await;
+                                        }
+                                    }));
+                                } else {
+                                    // "Skip for now"
+                                    // Save chosen whisper model to config
+                                    let whisper_size = WHISPER_MODELS[ob.whisper_model_selection].0;
+                                    self.config.transcription = TranscriptionMode::Local { model_size: whisper_size };
+                                    let _ = self.config.save();
+
+                                    ob.step = OnboardingStep::AskName;
+                                    ob.anim_frame = 0;
+                                    ob.set_step_text(
+                                        "No problem. Models will download on first use.\n\n\
+                                         What's your name?",
+                                        true,
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    3 => {
+                        // Downloading phase — check for completion or failure
+                        let all_done = ob.download_items.iter().all(|(_, s)| matches!(s, DownloadStatus::Done));
+                        let any_failed = ob.download_items.iter().any(|(_, s)| matches!(s, DownloadStatus::Failed(_)));
+                        if all_done || any_failed {
+                            match key_code {
+                                KeyCode::Enter => {
+                                    // Save whisper model to config
+                                    let whisper_size = WHISPER_MODELS[ob.whisper_model_selection].0;
+                                    self.config.transcription = TranscriptionMode::Local { model_size: whisper_size };
+                                    let _ = self.config.save();
+
+                                    ob.step = OnboardingStep::AskName;
+                                    ob.anim_frame = 0;
+                                    if all_done {
+                                        ob.set_step_text(
+                                            "All set!\n\nWhat's your name?",
+                                            true,
+                                        );
+                                    } else {
+                                        ob.set_step_text(
+                                            "Some downloads had issues. You can retry later.\n\n\
+                                             What's your name?",
+                                            true,
+                                        );
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
             OnboardingStep::AskName => {
                 if !ob.text_complete {
-                    ob.complete_text();
+                    ob.visible_chars = ob.full_text.chars().count();
+                    ob.text_complete = true;
                 } else {
                     match key_code {
                         KeyCode::Enter => {
@@ -6233,13 +6643,13 @@ impl Dashboard {
                                 ob.anim_frame = 0;
                                 let name = ob.user_name.clone();
                                 ob.set_step_text(&format!(
-                                    "{}! Great name. Love it.\n\n\
-                                     Now tell me about yourself --\n\
+                                    "Nice to meet you, {}.\n\n\
+                                     Tell me about yourself \u{2014}\n\
                                      What do you do? What's your company?\n\
                                      Who do you work with?\n\n\
-                                     Just write naturally, I'll figure it out.",
+                                     Just write naturally.",
                                     name
-                                ));
+                                ), true);
                             }
                         }
                         KeyCode::Char(c) => {
@@ -6254,19 +6664,16 @@ impl Dashboard {
             }
             OnboardingStep::AskRole => {
                 if !ob.text_complete {
-                    ob.complete_text();
+                    ob.visible_chars = ob.full_text.chars().count();
+                    ob.text_complete = true;
                 } else {
                     match key_code {
                         KeyCode::Enter => {
                             if !ob.user_role.trim().is_empty() {
-                                ob.step = OnboardingStep::AskAliases;
+                                ob.step = OnboardingStep::Processing;
                                 ob.anim_frame = 0;
-                                ob.set_step_text(
-                                    "Noted! One last thing --\n\n\
-                                     Any nicknames, company name variations, or\n\
-                                     words that get mangled in transcripts?\n\n\
-                                     (Press ENTER to skip)"
-                                );
+                                ob.set_step_text("Setting up your world...", false);
+                                self.start_onboarding_processing();
                             }
                         }
                         KeyCode::Char(c) => {
@@ -6279,50 +6686,32 @@ impl Dashboard {
                     }
                 }
             }
-            OnboardingStep::AskAliases => {
-                if !ob.text_complete {
-                    ob.complete_text();
-                } else {
-                    match key_code {
-                        KeyCode::Enter => {
-                            // Enter with empty is OK (skip aliases)
-                            ob.step = OnboardingStep::Processing;
-                            ob.anim_frame = 0;
-                            ob.set_step_text("Let me digest all of that...");
-                            self.start_onboarding_processing();
-                        }
-                        KeyCode::Char(c) => {
-                            ob.user_aliases.push(c);
-                        }
-                        KeyCode::Backspace => {
-                            ob.user_aliases.pop();
-                        }
-                        _ => {}
-                    }
-                }
-            }
             OnboardingStep::Processing => {
-                // If Ollama failed and text is complete, Enter advances
+                // If provider failed and text is complete, Enter advances
                 if ob.text_complete && ob.processing_task.is_none() && !ob.ollama_available {
                     if matches!(key_code, KeyCode::Enter) {
                         ob.step = OnboardingStep::Done;
                         ob.anim_frame = 0;
                         ob.set_step_text(
-                            "Your world is ready!\n\n\
-                             I'll remember all of this. Every recording\n\
-                             you make, I'll enrich with what I know about\n\
-                             you and your world.\n\n\
-                             Time to fly!"
+                            "Your world is ready.\n\n\
+                             Every recording you make will be enriched\n\
+                             with what I know about you and your world.\n\n\
+                             Let's go.",
+                            true,
                         );
                     }
                 }
             }
             OnboardingStep::Confirmation => {
-                if !ob.text_complete {
-                    ob.complete_text();
-                } else {
-                    match key_code {
-                        KeyCode::Char('y') | KeyCode::Char('Y') => {
+                match key_code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        ob.confirm_selection = 0;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        ob.confirm_selection = 1;
+                    }
+                    KeyCode::Enter => {
+                        if ob.confirm_selection == 0 {
                             ob.step = OnboardingStep::Done;
                             ob.anim_frame = 0;
                             ob.set_step_text(
@@ -6330,28 +6719,30 @@ impl Dashboard {
                                  I'll remember all of this. Every recording\n\
                                  you make, I'll enrich with what I know about\n\
                                  you and your world.\n\n\
-                                 Time to fly!"
+                                 Time to fly!",
+                                true,
                             );
-                        }
-                        KeyCode::Char('n') | KeyCode::Char('N') => {
+                        } else {
                             // Go back to AskName with values preserved
                             ob.step = OnboardingStep::AskName;
                             ob.anim_frame = 0;
-                            ob.set_step_text(
-                                "So, who am I working for?\n\nWhat's your name?"
-                            );
-                            ob.complete_text(); // Show instantly
+                            ob.set_step_text("What's your name?", true);
                             // Delete the world.md that was created during processing
                             let _ = std::fs::remove_file(WorldContext::file_path());
                         }
-                        _ => {}
                     }
+                    _ => {}
                 }
             }
             OnboardingStep::Done => {
-                // Keys can speed up transition
                 if !ob.text_complete {
-                    ob.complete_text();
+                    // Skip typewriter
+                    ob.visible_chars = ob.full_text.chars().count();
+                    ob.text_complete = true;
+                } else if !ob.transitioning && matches!(key_code, KeyCode::Enter) {
+                    // Start fade-out transition
+                    ob.transitioning = true;
+                    ob.transition_frame = 0;
                 }
             }
         }
@@ -6368,37 +6759,62 @@ impl Dashboard {
         // Build seed content from user inputs
         let mut seed = format!("My name is {}. ", ob.user_name.trim());
         seed.push_str(ob.user_role.trim());
-        if !ob.user_aliases.trim().is_empty() {
-            seed.push_str(&format!(
-                "\nCommon misspellings or aliases: {}",
-                ob.user_aliases.trim()
-            ));
-        }
 
         let config = self.config.clone();
 
         ob.processing_task = Some(tokio::spawn(async move {
             let mut db = Database::new()?;
-            let result = initialize_world_from_seed(&mut db, &config, &seed).await?;
-            if result.is_some() {
-                Ok((result, None))
+
+            // For local mode, retry up to 3 times with a short delay
+            // (Ollama may need a moment after a fresh model pull)
+            let max_attempts = if config.enrichment.is_local() { 3 } else { 1 };
+            let mut result = None;
+            for attempt in 0..max_attempts {
+                if attempt > 0 {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                match initialize_world_from_seed(&mut db, &config, &seed).await? {
+                    Some(data) => {
+                        result = Some(data);
+                        break;
+                    }
+                    None => {}
+                }
+            }
+
+            if let Some(data) = result {
+                Ok((Some(data), None))
             } else {
                 // Provider unavailable — diagnose why
                 let hint = if config.enrichment.is_local() {
                     let endpoint = config.enrichment.ollama_endpoint();
                     let model = config.enrichment.ollama_model();
                     let client = OllamaClient::new(&endpoint, &model);
-                    client.diagnose().await.hint()
+                    let status = client.diagnose().await;
+                    match status.hint() {
+                        Some(h) => Some(h),
+                        None => {
+                            // Diagnose says Ready but LLM call still failed
+                            Some(format!(
+                                "Ollama is running but the LLM call failed.\n\
+                                 Model: {}\n\n\
+                                 Try running a test query:\n\
+                                   ollama run {} \"hello\"",
+                                model, model.split(':').next().unwrap_or(&model)
+                            ))
+                        }
+                    }
                 } else {
                     let provider_name = config.enrichment.provider_display_name().to_string();
                     if config.enrichment.resolve_api_key().is_none() {
                         Some(format!(
-                            "No API key set for {}.\n\nSet it with:\n  scriba config set-enrichment-key <your-key>",
+                            "No API key set for {}.",
                             provider_name
                         ))
                     } else {
                         Some(format!(
-                            "{} is not reachable.\n\nCheck your API key and network connection.",
+                            "{} is not reachable.\n\
+                             Check your API key and network connection.",
                             provider_name
                         ))
                     }
@@ -6414,527 +6830,690 @@ impl Dashboard {
             None => return,
         };
 
-        // Magic transition overlay
+        // Exit dim fade
         if ob.transitioning {
-            self.render_magic_transition(f, area, ob.transition_frame);
+            self.render_dim_fade(f, area, ob);
             return;
         }
 
-        // Full-screen onboarding box
-        let outer_block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(ratatui::widgets::BorderType::Double)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title(Span::styled(
-                " SCRIBA ",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ))
-            .title_alignment(Alignment::Center);
-        f.render_widget(outer_block, area);
-
-        // Inner area (inside border)
-        let inner = ratatui::layout::Rect {
-            x: area.x + 2,
-            y: area.y + 1,
-            width: area.width.saturating_sub(4),
-            height: area.height.saturating_sub(2),
-        };
-
-        // Layout: Owl + Speech Bubble + Input + Step Dots + Footer
-        let content_width = 56u16.min(inner.width);
-        let h_offset = (inner.width.saturating_sub(content_width)) / 2;
-        let centered = ratatui::layout::Rect {
-            x: inner.x + h_offset,
-            y: inner.y,
-            width: content_width,
-            height: inner.height,
-        };
-
-        match ob.step {
-            OnboardingStep::Entrance => {
-                self.render_owl_entrance(f, centered, ob);
+        // Entrance: block-art SCRIBA logo, 3-stage fade (~2.5s, 25 frames)
+        if ob.step == OnboardingStep::Entrance {
+            let frame = ob.anim_frame.min(24);
+            if frame < 6 {
+                // Blank
+                return;
             }
-            _ => {
-                // Vertical layout within centered area
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(4),  // Owl
-                        Constraint::Length(1),  // Spacer
-                        Constraint::Min(6),     // Speech bubble
-                        Constraint::Length(3),  // Footer
-                    ])
-                    .split(centered);
-
-                // Render owl
-                self.render_owl(f, chunks[0], ob);
-
-                // Render speech bubble + input
-                self.render_speech_bubble(f, chunks[2], ob);
-
-                // Render step dots + footer hint
-                self.render_onboarding_footer(f, chunks[3], ob);
-            }
-        }
-    }
-
-    fn render_owl_entrance(&self, f: &mut Frame, area: ratatui::layout::Rect, ob: &OnboardingState) {
-        // 40-frame entrance (~4s): sparkle trail → owl flies in → lands with flourish
-        let frame = ob.anim_frame.min(39);
-        let total_width = area.width as usize;
-        let center = total_width / 2;
-        let owl_y = area.y + area.height / 2;
-
-        // Phase 1 (frames 0-10): Sparkles gather on the right side, hinting something is coming
-        if frame <= 10 {
-            let density = (frame as f64 + 1.0) / 12.0;
-            let seed = frame * 4219;
-            let mut lines: Vec<Line> = Vec::new();
-            for y in 0..area.height {
-                let mut spans: Vec<Span> = Vec::new();
-                for x in 0..area.width {
-                    let hash = ((x as usize).wrapping_mul(37).wrapping_add(y as usize).wrapping_mul(13).wrapping_add(seed)) % 100;
-                    // Only sparkle in the right third of the screen
-                    let in_right_zone = (x as usize) > (total_width * 2 / 3);
-                    let threshold = (density * 100.0) as usize;
-                    if in_right_zone && hash < threshold {
-                        let ch = SPARKLE_CHARS[hash % 4]; // skip space
-                        let color = match hash % 3 {
-                            0 => Color::Yellow,
-                            1 => Color::Cyan,
-                            _ => Color::White,
-                        };
-                        spans.push(Span::styled(ch.to_string(), Style::default().fg(color)));
-                    } else {
-                        spans.push(Span::raw(" "));
-                    }
-                }
-                lines.push(Line::from(spans));
-            }
-            let p = Paragraph::new(lines);
-            f.render_widget(p, area);
-            return;
-        }
-
-        // Phase 2 (frames 11-32): Owl flies across with sparkle trail
-        if frame <= 32 {
-            let fly_progress = (frame - 11) as f64 / 21.0;
-            // Ease-out cubic for graceful deceleration
-            let eased = 1.0 - (1.0 - fly_progress).powi(3);
-            let start = total_width.saturating_sub(4);
-            let x_pos = start - ((start - center) as f64 * eased) as usize;
-            let x_pos = x_pos.min(total_width.saturating_sub(7));
-
-            // Vertical bob: slight sine wave during flight
-            let bob = ((fly_progress * std::f64::consts::PI * 3.0).sin() * 1.5) as i16;
-            let y_pos = (owl_y as i16 + bob).max(area.y as i16) as u16;
-
-            // Draw sparkle trail behind the owl
-            let trail_len = 8usize;
-            let seed = frame * 2311;
-            for t in 1..=trail_len {
-                let trail_x = x_pos + t * 2;
-                if trail_x < total_width {
-                    let age = t as f64 / trail_len as f64;
-                    let ch = if age < 0.3 { '*' } else if age < 0.6 { '+' } else { '.' };
-                    let color = if age < 0.4 { Color::Yellow } else { Color::DarkGray };
-                    // Slight vertical scatter for trail
-                    let scatter = ((seed + t) % 3) as i16 - 1;
-                    let ty = (y_pos as i16 + scatter).max(area.y as i16).min((area.y + area.height - 1) as i16) as u16;
-                    if trail_x < area.width as usize {
-                        let trail_area = ratatui::layout::Rect {
-                            x: area.x + trail_x as u16,
-                            y: ty,
-                            width: 1,
-                            height: 1,
-                        };
-                        let p = Paragraph::new(ch.to_string())
-                            .style(Style::default().fg(color));
-                        f.render_widget(p, trail_area);
-                    }
-                }
-            }
-
-            // Draw the owl
-            let owl_text = if fly_progress < 0.5 {
-                OWL_FLYING
-            } else if fly_progress < 0.85 {
-                OWL_APPROACH
+            let logo_lines = [
+                "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557} \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557} \u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557}  \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557} ",
+                "\u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2550}\u{2550}\u{255D}\u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2550}\u{2550}\u{255D}\u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2588}\u{2588}\u{2557}",
+                "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2551}     \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2554}\u{255D}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2554}\u{255D}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2551}",
+                "\u{255A}\u{2550}\u{2550}\u{2550}\u{2550}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551}     \u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2588}\u{2588}\u{2551}",
+                "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2551}\u{255A}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2551}  \u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2554}\u{255D}\u{2588}\u{2588}\u{2551}  \u{2588}\u{2588}\u{2551}",
+                "\u{255A}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{255D} \u{255A}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{255D}\u{255A}\u{2550}\u{255D}  \u{255A}\u{2550}\u{255D}\u{255A}\u{2550}\u{255D}\u{255A}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{255D} \u{255A}\u{2550}\u{255D}  \u{255A}\u{2550}\u{255D}",
+            ];
+            let color = if frame <= 12 {
+                Color::Indexed(235) // very dim
+            } else if frame <= 18 {
+                Color::Indexed(237) // dim
             } else {
-                OWL_APPROACH
+                Color::Indexed(240) // medium
             };
-
-            let owl_area = ratatui::layout::Rect {
-                x: area.x + x_pos as u16,
-                y: y_pos,
-                width: (owl_text.len() as u16).min(area.width.saturating_sub(x_pos as u16)),
-                height: 1,
-            };
-            let p = Paragraph::new(owl_text)
-                .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
-            f.render_widget(p, owl_area);
+            let logo_width: u16 = 43;
+            let logo_height: u16 = logo_lines.len() as u16;
+            let cx = area.x + area.width.saturating_sub(logo_width) / 2;
+            let cy = area.y + area.height.saturating_sub(logo_height) / 2;
+            let style = Style::default().fg(color);
+            for (i, line) in logo_lines.iter().enumerate() {
+                let line_area = Rect { x: cx, y: cy + i as u16, width: logo_width, height: 1 };
+                f.render_widget(Paragraph::new(*line).style(style), line_area);
+            }
             return;
         }
 
-        // Phase 3 (frames 33-39): Landed — owl settles with a little sparkle burst
-        let settle_frame = frame - 33;
+        // Full-screen borderless layout: header + body + dots + footer
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),  // Header
+                Constraint::Min(6),    // Body
+                Constraint::Length(1),  // Step dots
+                Constraint::Length(2),  // Footer
+            ])
+            .split(area);
 
-        // Sparkle burst around the landing spot (fades over frames)
-        if settle_frame < 5 {
-            let burst_density = (5 - settle_frame) as f64 / 8.0;
-            let seed = frame * 1571;
-            let burst_radius = 6u16;
-            let cx = (area.x + center as u16).saturating_sub(1);
-            let cy = owl_y;
-            for dy in 0..burst_radius {
-                for dx in 0..(burst_radius * 2) {
-                    let bx = cx.saturating_sub(burst_radius) + dx;
-                    let by = cy.saturating_sub(burst_radius / 2) + dy;
-                    if bx >= area.x && bx < area.x + area.width && by >= area.y && by < area.y + area.height {
-                        let hash = ((bx as usize).wrapping_mul(29).wrapping_add(by as usize).wrapping_mul(19).wrapping_add(seed)) % 100;
-                        let threshold = (burst_density * 100.0) as usize;
-                        if hash < threshold {
-                            let ch = SPARKLE_CHARS[hash % 4];
-                            let color = match hash % 3 { 0 => Color::Yellow, 1 => Color::Cyan, _ => Color::White };
-                            let spark_area = ratatui::layout::Rect { x: bx, y: by, width: 1, height: 1 };
-                            let p = Paragraph::new(ch.to_string()).style(Style::default().fg(color));
-                            f.render_widget(p, spark_area);
+        // ── Header ──────────────────────────────────────────────────
+        let header_title = match ob.step {
+            OnboardingStep::Entrance | OnboardingStep::Intro => "Welcome",
+            OnboardingStep::ModeSelection => "Setup",
+            OnboardingStep::ProviderSelection => "Setup \u{00B7} Provider",
+            OnboardingStep::ApiKeyEntry | OnboardingStep::ApiKeyValidation => "Setup \u{00B7} API Key",
+            OnboardingStep::SystemCheck => "Setup \u{00B7} System Check",
+            OnboardingStep::ModelSetup => "Setup \u{00B7} Models",
+            OnboardingStep::AskName | OnboardingStep::AskRole => "Setup \u{00B7} About You",
+            OnboardingStep::Processing => "Setup \u{00B7} Processing",
+            OnboardingStep::Confirmation => "Setup \u{00B7} Confirm",
+            OnboardingStep::Done => "Ready",
+        };
+        let header_line = Line::from(vec![
+            Span::raw("  "),
+            Span::styled(header_title, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        ]);
+        f.render_widget(Paragraph::new(header_line), Rect { x: chunks[0].x, y: chunks[0].y, width: chunks[0].width, height: 1 });
+        let sep = "\u{2500}".repeat(chunks[0].width as usize);
+        f.render_widget(
+            Paragraph::new(sep).style(Style::default().fg(Color::Indexed(237))),
+            Rect { x: chunks[0].x, y: chunks[0].y + 1, width: chunks[0].width, height: 1 },
+        );
+
+        // ── Body ────────────────────────────────────────────────────
+        let body = chunks[1];
+        let visible = ob.visible_text();
+
+        // Build body content lines
+        let mut lines: Vec<Line> = Vec::new();
+
+        // Braille spinner for processing with task running
+        let is_processing_active = ob.step == OnboardingStep::Processing && ob.processing_task.is_some();
+        let is_validating = ob.step == OnboardingStep::ApiKeyValidation && ob.validation_task.is_some();
+        let is_done = ob.step == OnboardingStep::Done;
+
+        // Step-specific rendering
+        if ob.step == OnboardingStep::ModeSelection {
+            // Line selector for mode
+            for text_line in visible.split('\n') {
+                lines.push(Line::from(Span::styled(text_line, Style::default().fg(Color::White))));
+            }
+            lines.push(Line::from(""));
+
+            let sel = ob.selected_mode;
+            let sel_bg = Color::Indexed(236);
+
+            let mode_blocks: [(&str, &[&str]); 2] = [
+                ("Cloud Provider", &["Uses Anthropic, OpenAI or Google.", "Best quality. Needs an API key."]),
+                ("Privacy Mode (local)", &["Runs entirely on your machine.", "Fully private \u{2014} no data leaves", "your computer."]),
+            ];
+            // Find max visible width across all blocks for uniform padding
+            let block_width = mode_blocks.iter().flat_map(|(title, descs)| {
+                std::iter::once(title.chars().count() + 2) // "▸ " prefix
+                    .chain(descs.iter().map(|d| d.chars().count() + 2)) // "  " prefix
+            }).max().unwrap_or(0);
+
+            for (i, (title, descs)) in mode_blocks.iter().enumerate() {
+                if i > 0 { lines.push(Line::from("")); }
+                if sel == i {
+                    let title_text = format!("{}{}", title, " ".repeat(block_width.saturating_sub(title.chars().count() + 2)));
+                    lines.push(Line::from(vec![
+                        Span::styled("\u{25B8} ", Style::default().fg(ACCENT).bg(sel_bg)),
+                        Span::styled(title_text, Style::default().fg(Color::White).bg(sel_bg)),
+                    ]));
+                    let ds = Style::default().fg(Color::Indexed(245)).bg(sel_bg);
+                    for d in *descs {
+                        let padded = format!("  {}{}", d, " ".repeat(block_width.saturating_sub(d.chars().count() + 2)));
+                        lines.push(Line::from(Span::styled(padded, ds)));
+                    }
+                } else {
+                    lines.push(Line::from(Span::styled(format!("  {}", title), Style::default().fg(Color::DarkGray))));
+                    let ds = Style::default().fg(Color::DarkGray);
+                    for d in *descs {
+                        lines.push(Line::from(Span::styled(format!("  {}", d), ds)));
+                    }
+                }
+            }
+        } else if ob.step == OnboardingStep::ProviderSelection {
+            // Line selector for provider
+            for text_line in visible.split('\n') {
+                lines.push(Line::from(Span::styled(text_line, Style::default().fg(Color::White))));
+            }
+            lines.push(Line::from(""));
+
+            let providers = [
+                ("Anthropic (Claude)", "Best for nuanced understanding"),
+                ("OpenAI (GPT)", "Widely used, reliable"),
+                ("Google (Gemini)", "Fast and cost-effective"),
+            ];
+            let sel_bg = Color::Indexed(236);
+            // Find max width across all provider entries for uniform padding
+            let block_width = providers.iter().flat_map(|(name, desc)| {
+                std::iter::once(name.chars().count() + 2) // "▸ " prefix
+                    .chain(std::iter::once(desc.chars().count() + 2)) // "  " prefix
+            }).max().unwrap_or(0);
+
+            for (i, (name, desc)) in providers.iter().enumerate() {
+                if i > 0 {
+                    lines.push(Line::from(""));
+                }
+                if ob.selected_provider == i {
+                    let name_pad = " ".repeat(block_width.saturating_sub(name.chars().count() + 2));
+                    lines.push(Line::from(vec![
+                        Span::styled("\u{25B8} ", Style::default().fg(ACCENT).bg(sel_bg)),
+                        Span::styled(format!("{}{}", name, name_pad), Style::default().fg(Color::White).bg(sel_bg)),
+                    ]));
+                    let desc_pad = " ".repeat(block_width.saturating_sub(desc.chars().count() + 2));
+                    lines.push(Line::from(Span::styled(format!("  {}{}", desc, desc_pad), Style::default().fg(Color::Indexed(245)).bg(sel_bg))));
+                } else {
+                    lines.push(Line::from(Span::styled(format!("  {}", name), Style::default().fg(Color::DarkGray))));
+                    lines.push(Line::from(Span::styled(format!("  {}", desc), Style::default().fg(Color::DarkGray))));
+                }
+            }
+        } else if ob.step == OnboardingStep::SystemCheck {
+            // System check checklist with spinners/results
+            for text_line in visible.split('\n') {
+                lines.push(Line::from(Span::styled(text_line, Style::default().fg(Color::White))));
+            }
+            lines.push(Line::from(""));
+
+            let braille = ['\u{28F7}', '\u{28EF}', '\u{28DF}', '\u{28BF}', '\u{287F}', '\u{28FE}', '\u{28FD}', '\u{28FB}'];
+            for (name, status) in &ob.system_checks {
+                let (icon, style) = match status {
+                    CheckStatus::Pending => ("  ".to_string(), Style::default().fg(Color::DarkGray)),
+                    CheckStatus::Running => (
+                        format!("{} ", braille[ob.anim_frame % braille.len()]),
+                        Style::default().fg(ACCENT),
+                    ),
+                    CheckStatus::Passed => ("\u{2713} ".to_string(), Style::default().fg(Color::Green)),
+                    CheckStatus::Failed(_) => ("\u{2717} ".to_string(), Style::default().fg(Color::Red)),
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(icon, style),
+                    Span::styled(name.as_str(), Style::default().fg(Color::White)),
+                ]));
+            }
+
+            // If done with failures, show instructions for the first failing check
+            if ob.system_check_done {
+                let first_fail = ob.system_checks.iter().find_map(|(name, s)| {
+                    if let CheckStatus::Failed(hint) = s {
+                        Some((name.clone(), hint.clone()))
+                    } else {
+                        None
+                    }
+                });
+
+                if let Some((_name, hint)) = first_fail {
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled(
+                        "Almost there!",
+                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                    )));
+                    lines.push(Line::from(""));
+                    for hint_line in hint.split('\n') {
+                        lines.push(Line::from(Span::styled(
+                            format!("  {}", hint_line),
+                            Style::default().fg(Color::Indexed(245)),
+                        )));
+                    }
+                    lines.push(Line::from(""));
+
+                    // Arrow selector: Check again / Continue anyway
+                    let sel_bg = Color::Indexed(236);
+                    let options = ["Check again", "Continue anyway"];
+                    let opt_width = options.iter().map(|l| l.chars().count() + 2).max().unwrap_or(0);
+                    for (i, label) in options.iter().enumerate() {
+                        if ob.system_check_selection == i {
+                            let pad = " ".repeat(opt_width.saturating_sub(label.chars().count() + 2));
+                            lines.push(Line::from(vec![
+                                Span::styled("\u{25B8} ", Style::default().fg(ACCENT).bg(sel_bg)),
+                                Span::styled(format!("{}{}", label, pad), Style::default().fg(Color::White).bg(sel_bg)),
+                            ]));
+                        } else {
+                            lines.push(Line::from(Span::styled(format!("  {}", label), Style::default().fg(Color::DarkGray))));
                         }
                     }
                 }
             }
-        }
+        } else if ob.step == OnboardingStep::ModelSetup {
+            // Phase-dependent rendering
+            for text_line in visible.split('\n') {
+                lines.push(Line::from(Span::styled(text_line, Style::default().fg(Color::White))));
+            }
+            lines.push(Line::from(""));
 
-        // The landed owl
-        let owl_area = ratatui::layout::Rect {
-            x: area.x + center.saturating_sub(4) as u16,
-            y: owl_y.saturating_sub(1),
-            width: 12.min(area.width),
-            height: 3,
-        };
-        let p = Paragraph::new(OWL_LANDED)
-            .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
-        f.render_widget(p, owl_area);
-    }
+            let sel_bg = Color::Indexed(236);
 
-    fn render_owl(&self, f: &mut Frame, area: ratatui::layout::Rect, ob: &OnboardingState) {
-        let owl_text = match ob.step {
-            OnboardingStep::ApiKeyValidation if ob.validation_task.is_some() => {
-                // Thinking animation while validating API key
-                OWL_THINKING[(ob.anim_frame / 3) % 8]
+            match ob.setup_phase {
+                0 => {
+                    // Whisper model selector
+                    let block_width = WHISPER_MODELS.iter()
+                        .map(|(_, name, size)| name.chars().count() + size.chars().count() + 6)
+                        .max().unwrap_or(0);
+
+                    for (i, (_, name, size)) in WHISPER_MODELS.iter().enumerate() {
+                        let label = format!("{}    {}", name, size);
+                        if ob.whisper_model_selection == i {
+                            let pad = " ".repeat(block_width.saturating_sub(label.chars().count() + 2));
+                            lines.push(Line::from(vec![
+                                Span::styled("\u{25B8} ", Style::default().fg(ACCENT).bg(sel_bg)),
+                                Span::styled(format!("{}{}", label, pad), Style::default().fg(Color::White).bg(sel_bg)),
+                            ]));
+                        } else {
+                            lines.push(Line::from(Span::styled(format!("  {}", label), Style::default().fg(Color::DarkGray))));
+                        }
+                    }
+                }
+                1 => {
+                    // Ollama model selector
+                    if ob.ollama_available_models.is_empty() {
+                        let braille = ['\u{28F7}', '\u{28EF}', '\u{28DF}', '\u{28BF}', '\u{287F}', '\u{28FE}', '\u{28FD}', '\u{28FB}'];
+                        lines.push(Line::from(vec![
+                            Span::styled(format!("{} ", braille[ob.anim_frame % braille.len()]), Style::default().fg(ACCENT)),
+                            Span::styled("Loading models...", Style::default().fg(Color::DarkGray)),
+                        ]));
+                    } else {
+                        for (i, model_name) in ob.ollama_available_models.iter().enumerate() {
+                            let display = model_name.clone();
+                            if ob.ollama_model_selection == i {
+                                let pad = " ".repeat(30usize.saturating_sub(display.chars().count() + 2));
+                                lines.push(Line::from(vec![
+                                    Span::styled("\u{25B8} ", Style::default().fg(ACCENT).bg(sel_bg)),
+                                    Span::styled(format!("{}{}", display, pad), Style::default().fg(Color::White).bg(sel_bg)),
+                                ]));
+                            } else {
+                                lines.push(Line::from(Span::styled(format!("  {}", display), Style::default().fg(Color::DarkGray))));
+                            }
+                        }
+                    }
+                }
+                2 => {
+                    // Download confirmation
+                    let whisper_name = WHISPER_MODELS[ob.whisper_model_selection].1
+                        .replace(" (Recommended)", "");
+                    let whisper_size = WHISPER_MODELS[ob.whisper_model_selection].2;
+                    lines.push(Line::from(vec![
+                        Span::styled("  Whisper ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(whisper_name, Style::default().fg(Color::White)),
+                        Span::styled(format!("    {}", whisper_size), Style::default().fg(Color::Indexed(245))),
+                    ]));
+
+                    if ob.ollama_reachable {
+                        let model = if let EnrichmentMode::Local { ollama_model, .. } = &self.config.enrichment.mode {
+                            ollama_model.split(':').next().unwrap_or(ollama_model).to_string()
+                        } else {
+                            "mistral".to_string()
+                        };
+                        let model_line = Line::from(vec![
+                            Span::styled("  ", Style::default().fg(Color::DarkGray)),
+                            Span::styled(model, Style::default().fg(Color::White)),
+                            Span::styled("    pull from Ollama", Style::default().fg(Color::Indexed(245))),
+                        ]);
+                        lines.push(model_line);
+                    }
+                    lines.push(Line::from(""));
+
+                    let options = ["Download now", "Skip for now"];
+                    let opt_width = options.iter().map(|l| l.chars().count() + 2).max().unwrap_or(0);
+                    for (i, label) in options.iter().enumerate() {
+                        if ob.system_check_selection == i {
+                            let pad = " ".repeat(opt_width.saturating_sub(label.chars().count() + 2));
+                            lines.push(Line::from(vec![
+                                Span::styled("\u{25B8} ", Style::default().fg(ACCENT).bg(sel_bg)),
+                                Span::styled(format!("{}{}", label, pad), Style::default().fg(Color::White).bg(sel_bg)),
+                            ]));
+                        } else {
+                            lines.push(Line::from(Span::styled(format!("  {}", label), Style::default().fg(Color::DarkGray))));
+                        }
+                    }
+                }
+                3 => {
+                    // Downloading with progress
+                    let braille = ['\u{28F7}', '\u{28EF}', '\u{28DF}', '\u{28BF}', '\u{287F}', '\u{28FE}', '\u{28FD}', '\u{28FB}'];
+                    for (name, status) in &ob.download_items {
+                        let (icon, detail) = match status {
+                            DownloadStatus::Pending => (
+                                "  ".to_string(),
+                                String::new(),
+                            ),
+                            DownloadStatus::InProgress(pct) => (
+                                format!("{} ", braille[ob.anim_frame % braille.len()]),
+                                format!(" {}%", pct),
+                            ),
+                            DownloadStatus::Done => (
+                                "\u{2713} ".to_string(),
+                                String::new(),
+                            ),
+                            DownloadStatus::Failed(msg) => (
+                                "\u{2717} ".to_string(),
+                                format!(" — {}", msg),
+                            ),
+                        };
+
+                        let icon_style = match status {
+                            DownloadStatus::Done => Style::default().fg(Color::Green),
+                            DownloadStatus::Failed(_) => Style::default().fg(Color::Red),
+                            DownloadStatus::InProgress(_) => Style::default().fg(ACCENT),
+                            _ => Style::default().fg(Color::DarkGray),
+                        };
+
+                        lines.push(Line::from(vec![
+                            Span::styled(icon, icon_style),
+                            Span::styled(name.as_str(), Style::default().fg(Color::White)),
+                            Span::styled(detail, Style::default().fg(Color::Indexed(245))),
+                        ]));
+                    }
+
+                    // Show "Continue" or "Retry" when done
+                    let all_done = ob.download_items.iter().all(|(_, s)| matches!(s, DownloadStatus::Done));
+                    let any_failed = ob.download_items.iter().any(|(_, s)| matches!(s, DownloadStatus::Failed(_)));
+                    if all_done || any_failed {
+                        lines.push(Line::from(""));
+                        let label = if all_done { "Continue" } else { "Continue anyway" };
+                        lines.push(Line::from(Span::styled(
+                            format!("  [Enter] {}", label),
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
+                }
+                _ => {}
             }
-            OnboardingStep::Processing if ob.processing_task.is_some() => {
-                // Slow: one frame change every ~300ms
-                OWL_THINKING[(ob.anim_frame / 3) % 8]
+        } else if ob.step == OnboardingStep::ApiKeyValidation && ob.api_key_valid == Some(false) {
+            // Validation failed — arrow selector for retry/skip
+            for text_line in visible.split('\n') {
+                lines.push(Line::from(Span::styled(text_line, Style::default().fg(Color::White))));
             }
-            OnboardingStep::Done if !ob.transitioning => {
-                // Slow celebration: one frame change every ~250ms
-                OWL_CELEBRATE[(ob.anim_frame / 2) % 4]
-            }
-            _ => {
-                // Idle with blink every ~30 frames
-                if ob.anim_frame % 30 < 2 {
-                    OWL_IDLE[1] // blink
+            lines.push(Line::from(""));
+
+            let sel_bg = Color::Indexed(236);
+            let fail_labels = ["Try a different key", "Skip for now (set it later)"];
+            let fail_width = fail_labels.iter().map(|l| l.chars().count() + 2).max().unwrap_or(0);
+            for (i, label) in fail_labels.iter().enumerate() {
+                if ob.validation_fail_selection == i {
+                    let pad = " ".repeat(fail_width.saturating_sub(label.chars().count() + 2));
+                    lines.push(Line::from(vec![
+                        Span::styled("\u{25B8} ", Style::default().fg(ACCENT).bg(sel_bg)),
+                        Span::styled(format!("{}{}", label, pad), Style::default().fg(Color::White).bg(sel_bg)),
+                    ]));
                 } else {
-                    OWL_IDLE[0] // normal
+                    lines.push(Line::from(Span::styled(format!("  {}", label), Style::default().fg(Color::DarkGray))));
                 }
             }
-        };
-
-        // Center the owl
-        let owl_lines: Vec<&str> = owl_text.split('\n').collect();
-        let owl_width = owl_lines.iter().map(|l| l.len()).max().unwrap_or(0) as u16;
-        let x_offset = (area.width.saturating_sub(owl_width)) / 2;
-
-        let owl_area = ratatui::layout::Rect {
-            x: area.x + x_offset,
-            y: area.y,
-            width: owl_width + 4,
-            height: (owl_lines.len() as u16).min(area.height),
-        };
-
-        let p = Paragraph::new(owl_text)
-            .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
-        f.render_widget(p, owl_area);
-    }
-
-    fn render_speech_bubble(&self, f: &mut Frame, area: ratatui::layout::Rect, ob: &OnboardingState) {
-        let visible = ob.visible_text();
-
-        // Build content lines
-        let mut lines: Vec<Line> = visible
-            .split('\n')
-            .map(|l| Line::from(Span::styled(l, Style::default().fg(Color::Green))))
-            .collect();
-
-        // Add input field for input steps
-        let show_input = ob.text_complete && matches!(
-            ob.step,
-            OnboardingStep::ApiKeyEntry | OnboardingStep::AskName | OnboardingStep::AskRole | OnboardingStep::AskAliases
-        );
-
-        // Add confirmation choices
-        let show_choices = ob.text_complete && ob.step == OnboardingStep::Confirmation;
-
-        if show_choices {
+        } else if ob.step == OnboardingStep::Confirmation {
+            // Structured label/value layout
+            for text_line in visible.split('\n') {
+                lines.push(Line::from(Span::styled(text_line, Style::default().fg(Color::White))));
+            }
             lines.push(Line::from(""));
-            lines.push(Line::from(vec![
-                Span::styled("  [Y] Hoo yes!  ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-                Span::styled("  [N] Let me fix that", Style::default().fg(Color::Yellow)),
-            ]));
-        }
 
-        // Determine how much height for speech vs input
-        let speech_height = if show_input {
-            area.height.saturating_sub(4) // Leave room for input box
+            let label_style = Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD);
+            let value_style = Style::default().fg(Color::White);
+            let fields: [(&str, &str); 4] = [
+                ("Name   ", &ob.confirm_owner),
+                ("Role   ", &ob.confirm_role),
+                ("Org    ", &ob.confirm_org),
+                ("Known  ", &ob.confirm_people),
+            ];
+            for (label, value) in &fields {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {}", label), label_style),
+                    Span::styled(*value, value_style),
+                ]));
+            }
+
+            lines.push(Line::from(""));
+
+            // Line selector: Looks good / Let me fix that
+            let sel_bg = Color::Indexed(236);
+            let confirm_labels = ["Looks good", "Let me fix that"];
+            let confirm_width = confirm_labels.iter().map(|l| l.chars().count() + 2).max().unwrap_or(0);
+            for (i, label) in confirm_labels.iter().enumerate() {
+                if ob.confirm_selection == i {
+                    let pad = " ".repeat(confirm_width.saturating_sub(label.chars().count() + 2));
+                    lines.push(Line::from(vec![
+                        Span::styled("\u{25B8} ", Style::default().fg(ACCENT).bg(sel_bg)),
+                        Span::styled(format!("{}{}", label, pad), Style::default().fg(Color::White).bg(sel_bg)),
+                    ]));
+                } else {
+                    lines.push(Line::from(Span::styled(format!("  {}", label), Style::default().fg(Color::DarkGray))));
+                }
+            }
         } else {
-            area.height
-        };
+            // Default text rendering for all other steps
+            for text_line in visible.split('\n') {
+                if is_processing_active || is_validating {
+                    let braille = ['\u{28F7}', '\u{28EF}', '\u{28DF}', '\u{28BF}', '\u{287F}', '\u{28FE}', '\u{28FD}', '\u{28FB}'];
+                    let spinner = braille[ob.anim_frame % braille.len()];
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{} ", spinner), Style::default().fg(ACCENT)),
+                        Span::styled(text_line, Style::default().fg(Color::White)),
+                    ]));
+                } else if is_done {
+                    lines.push(Line::from(vec![
+                        Span::styled("\u{2713} ", Style::default().fg(ACCENT)),
+                        Span::styled(text_line, Style::default().fg(Color::White)),
+                    ]));
+                } else {
+                    lines.push(Line::from(Span::styled(text_line, Style::default().fg(Color::White))));
+                }
+            }
 
-        // Speech bubble
-        let speech_area = ratatui::layout::Rect {
-            x: area.x,
-            y: area.y,
-            width: area.width,
-            height: speech_height,
-        };
+            // Input field for input steps (only after text reveal is complete)
+            let show_input = ob.text_complete && matches!(
+                ob.step,
+                OnboardingStep::ApiKeyEntry | OnboardingStep::AskName | OnboardingStep::AskRole
+            );
 
-        let bubble = Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan))
-                    .title(Span::styled(
-                        " SCRIBA ",
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                    )),
-            )
-            .wrap(Wrap { trim: false });
-        f.render_widget(bubble, speech_area);
+            if show_input {
+                let input_value = match ob.step {
+                    OnboardingStep::ApiKeyEntry => &ob.api_key_input,
+                    OnboardingStep::AskName => &ob.user_name,
+                    OnboardingStep::AskRole => &ob.user_role,
+                    _ => &ob.user_name,
+                };
 
-        // Input field
-        if show_input {
-            let input_value = match ob.step {
-                OnboardingStep::ApiKeyEntry => &ob.api_key_input,
-                OnboardingStep::AskName => &ob.user_name,
-                OnboardingStep::AskRole => &ob.user_role,
-                OnboardingStep::AskAliases => &ob.user_aliases,
-                _ => &ob.user_name,
-            };
+                // Mask API key input
+                let display_value = if ob.step == OnboardingStep::ApiKeyEntry && !input_value.is_empty() {
+                    let vis = input_value.chars().take(4).collect::<String>();
+                    let hidden = "*".repeat(input_value.len().saturating_sub(4));
+                    format!("{}{}", vis, hidden)
+                } else {
+                    input_value.to_string()
+                };
 
-            let input_area = ratatui::layout::Rect {
-                x: area.x,
-                y: area.y + speech_height,
-                width: area.width,
-                height: 3,
-            };
-
-            // Mask API key input: show first 4 chars + dots
-            let display_value = if ob.step == OnboardingStep::ApiKeyEntry && !input_value.is_empty() {
-                let visible = input_value.chars().take(4).collect::<String>();
-                let hidden = "*".repeat(input_value.len().saturating_sub(4));
-                format!("{}{}", visible, hidden)
-            } else {
-                input_value.to_string()
-            };
-
-            let input_title = if ob.step == OnboardingStep::ApiKeyEntry {
-                " API Key "
-            } else {
-                " Your answer "
-            };
-
-            let input_text = format!("{}_", display_value);
-            let input = Paragraph::new(input_text)
-                .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Yellow))
-                        .title(Span::styled(
-                            input_title,
-                            Style::default().fg(Color::Yellow),
-                        )),
-                );
-            f.render_widget(input, input_area);
+                lines.push(Line::from(""));
+                lines.push(Line::from(vec![
+                    Span::styled("\u{25B8} ", Style::default().fg(ACCENT)),
+                    Span::styled(format!("{}_", display_value), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+                ]));
+            }
         }
-    }
 
-    fn render_onboarding_footer(&self, f: &mut Frame, area: ratatui::layout::Rect, ob: &OnboardingState) {
-        // Step indicator dots — 9 logical steps
-        let steps = [
-            OnboardingStep::Intro,
-            OnboardingStep::ModeSelection,
-            OnboardingStep::ProviderSelection,
-            OnboardingStep::ApiKeyEntry,
-            OnboardingStep::AskName,
-            OnboardingStep::AskRole,
-            OnboardingStep::AskAliases,
-            OnboardingStep::Processing,
-            OnboardingStep::Confirmation,
-            OnboardingStep::Done,
-        ];
+        // Vertical centering: prepend empty lines
+        let line_count = lines.len();
+        let top_pad = (body.height as usize).saturating_sub(line_count) / 2;
+        let mut centered_lines: Vec<Line> = Vec::with_capacity(top_pad + line_count);
+        for _ in 0..top_pad {
+            centered_lines.push(Line::from(""));
+        }
+        centered_lines.extend(lines);
 
+        let max_line_width = centered_lines.iter().map(|l| l.width() as u16).max().unwrap_or(0);
+        let content_width = max_line_width.max(30).min(body.width); // floor 30, cap at body
+        let left_pad = (body.width.saturating_sub(content_width)) / 2;
+        let centered_body = Rect {
+            x: body.x + left_pad,
+            width: content_width,
+            ..body
+        };
+        let body_para = Paragraph::new(centered_lines)
+            .alignment(Alignment::Left)
+            .wrap(Wrap { trim: false });
+        f.render_widget(body_para, centered_body);
+
+        // ── Step dots ───────────────────────────────────────────────
+        // Both privacy and cloud flows have 9 steps:
+        // Privacy: Intro(0) → Mode(1) → SystemCheck(2) → ModelSetup(3) → Name(4) → Role(5) → Processing(6) → Confirm(7) → Done(8)
+        // Cloud:   Intro(0) → Mode(1) → Provider(2) → ApiKey(3) → Name(4) → Role(5) → Processing(6) → Confirm(7) → Done(8)
+        let step_count = 9;
         let current_idx = match ob.step {
-            OnboardingStep::Entrance => 0,
-            OnboardingStep::Intro => 0,
+            OnboardingStep::Entrance | OnboardingStep::Intro => 0,
             OnboardingStep::ModeSelection => 1,
-            OnboardingStep::ProviderSelection => 2,
-            OnboardingStep::ApiKeyEntry | OnboardingStep::ApiKeyValidation => 3,
+            OnboardingStep::ProviderSelection | OnboardingStep::SystemCheck => 2,
+            OnboardingStep::ApiKeyEntry | OnboardingStep::ApiKeyValidation | OnboardingStep::ModelSetup => 3,
             OnboardingStep::AskName => 4,
             OnboardingStep::AskRole => 5,
-            OnboardingStep::AskAliases => 6,
-            OnboardingStep::Processing => 7,
-            OnboardingStep::Confirmation => 8,
-            OnboardingStep::Done => 9,
+            OnboardingStep::Processing => 6,
+            OnboardingStep::Confirmation => 7,
+            OnboardingStep::Done => 8,
         };
 
         let mut dots: Vec<Span> = Vec::new();
-        for (i, _) in steps.iter().enumerate() {
-            if i == current_idx {
-                dots.push(Span::styled(" @ ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)));
+        for i in 0..step_count {
+            let (ch, color) = if i == current_idx {
+                ("\u{25CF}", ACCENT)
             } else if i < current_idx {
-                dots.push(Span::styled(" O ", Style::default().fg(Color::Cyan)));
+                ("\u{25CF}", Color::DarkGray)
             } else {
-                dots.push(Span::styled(" . ", Style::default().fg(Color::DarkGray)));
-            }
+                ("\u{25CB}", Color::Indexed(237))
+            };
+            dots.push(Span::styled(format!(" {} ", ch), Style::default().fg(color)));
         }
+        let dots_line = Paragraph::new(Line::from(dots)).alignment(Alignment::Center);
+        f.render_widget(dots_line, chunks[2]);
 
-        let hint = match ob.step {
-            OnboardingStep::Intro => {
-                if ob.text_complete { "ENTER: Continue" } else { "ENTER: Skip text" }
-            }
-            OnboardingStep::ModeSelection => {
-                if ob.text_complete { "[1] Cloud  [2] Local" } else { "ENTER: Skip text" }
-            }
-            OnboardingStep::ProviderSelection => {
-                if ob.text_complete { "[1] Anthropic  [2] OpenAI  [3] Google" } else { "ENTER: Skip text" }
-            }
-            OnboardingStep::ApiKeyEntry => {
-                "Paste your API key, ENTER to validate"
-            }
+        // ── Footer ──────────────────────────────────────────────────
+        let footer_area = chunks[3];
+        let footer_sep = "\u{2500}".repeat(footer_area.width as usize);
+        f.render_widget(
+            Paragraph::new(footer_sep).style(Style::default().fg(Color::Indexed(237))),
+            Rect { x: footer_area.x, y: footer_area.y, width: footer_area.width, height: 1 },
+        );
+
+        let footer_content = if footer_area.height > 1 {
+            Rect { x: footer_area.x, y: footer_area.y + 1, width: footer_area.width, height: footer_area.height - 1 }
+        } else {
+            footer_area
+        };
+
+        let version = env!("CARGO_PKG_VERSION");
+        let left_spans = vec![
+            Span::styled(" \u{25B8} ", Style::default().fg(ACCENT)),
+            Span::styled(format!("scriba \u{00B7} v{}", version), Style::default().fg(Color::DarkGray)),
+        ];
+
+        let right_hint = match ob.step {
+            OnboardingStep::Intro => "[Enter] Continue",
+            OnboardingStep::ModeSelection | OnboardingStep::ProviderSelection
+            | OnboardingStep::Confirmation => "[Up/Down] Select  [Enter] Confirm",
+            OnboardingStep::ApiKeyEntry => "[Enter] Validate",
             OnboardingStep::ApiKeyValidation => {
                 if ob.validation_task.is_some() { "Validating..." }
-                else if ob.api_key_valid == Some(false) { "[1] Retry  [2] Skip" }
+                else if ob.api_key_valid == Some(false) { "[Up/Down] Select  [Enter] Confirm" }
                 else { "" }
             }
-            OnboardingStep::AskName | OnboardingStep::AskRole => {
-                "Type your answer, ENTER to continue"
+            OnboardingStep::SystemCheck => {
+                if ob.system_check_done { "[Up/Down] Select  [Enter] Confirm" }
+                else { "Checking..." }
             }
-            OnboardingStep::AskAliases => {
-                "Type aliases, ENTER to continue (or skip)"
+            OnboardingStep::ModelSetup => {
+                match ob.setup_phase {
+                    0 | 1 => "[Up/Down] Select  [Enter] Confirm",
+                    2 => "[Up/Down] Select  [Enter] Confirm",
+                    3 => {
+                        let all_done = ob.download_items.iter().all(|(_, s)| matches!(s, DownloadStatus::Done));
+                        let any_failed = ob.download_items.iter().any(|(_, s)| matches!(s, DownloadStatus::Failed(_)));
+                        if all_done || any_failed { "[Enter] Continue" } else { "Downloading..." }
+                    }
+                    _ => "",
+                }
             }
+            OnboardingStep::AskName | OnboardingStep::AskRole => "[Enter] Continue",
             OnboardingStep::Processing => {
                 if ob.processing_task.is_some() { "" }
-                else if !ob.ollama_available { "ENTER: Continue" }
+                else if !ob.ollama_available { "[Enter] Continue" }
                 else { "" }
             }
-            OnboardingStep::Confirmation => {
-                if ob.text_complete { "[Y] / [N]" } else { "" }
+            OnboardingStep::Done => {
+                if ob.text_complete && !ob.transitioning { "[Enter] Let's go" } else { "" }
             }
-            OnboardingStep::Done => "",
             _ => "",
         };
 
-        let mut footer_lines = vec![
-            Line::from(dots),
-        ];
-        if !hint.is_empty() {
-            footer_lines.push(Line::from(vec![
-                Span::styled("ESC: Skip  |  ", Style::default().fg(Color::DarkGray)),
-                Span::styled(hint, Style::default().fg(Color::DarkGray)),
-            ]));
-        } else {
-            footer_lines.push(Line::from(Span::styled(
-                "ESC: Skip",
-                Style::default().fg(Color::DarkGray),
-            )));
+        let mut right_spans: Vec<Span> = Vec::new();
+        if ob.step != OnboardingStep::Done {
+            right_spans.extend([
+                Span::styled("[", Style::default().fg(Color::DarkGray)),
+                Span::styled("Esc", Style::default().fg(Color::White)),
+                Span::styled("] Skip", Style::default().fg(Color::DarkGray)),
+            ]);
         }
+        if !right_hint.is_empty() {
+            right_spans.push(Span::styled("  ", Style::default()));
+            right_spans.push(Span::styled(right_hint, Style::default().fg(Color::DarkGray)));
+        }
+        right_spans.push(Span::raw(" "));
 
-        let footer = Paragraph::new(footer_lines)
-            .alignment(Alignment::Center);
-        f.render_widget(footer, area);
+        let left_width: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
+        let right_width: usize = right_spans.iter().map(|s| s.content.chars().count()).sum();
+        let gap = (footer_content.width as usize).saturating_sub(left_width + right_width);
+
+        let mut spans = left_spans;
+        spans.push(Span::raw(" ".repeat(gap)));
+        spans.extend(right_spans);
+
+        f.render_widget(Paragraph::new(Line::from(spans)), footer_content);
     }
 
-    fn render_magic_transition(&self, f: &mut Frame, area: ratatui::layout::Rect, frame: usize) {
-        if frame <= 10 {
-            // Sparkle scatter phase (builds up over ~1s)
-            let density = match frame {
-                0..=2 => 0.1,
-                3..=4 => 0.2,
-                5..=6 => 0.35,
-                7..=8 => 0.55,
-                _ => 0.8,
-            };
+    fn render_dim_fade(&self, f: &mut Frame, area: ratatui::layout::Rect, ob: &OnboardingState) {
+        // 10-frame fade-out (~1s)
+        let frame = ob.transition_frame.min(10);
+        let color = match frame {
+            0 => Color::Indexed(252),
+            1 => Color::Indexed(249),
+            2 => Color::Indexed(245),
+            3 => Color::Indexed(242),
+            4 => Color::Indexed(240),
+            5 => Color::Indexed(238),
+            6 => Color::Indexed(237),
+            7 => Color::Indexed(236),
+            8 => Color::Indexed(235),
+            _ => return, // blank
+        };
 
-            let mut lines: Vec<Line> = Vec::new();
-            let seed = frame * 7919;
-            for y in 0..area.height {
-                let mut spans: Vec<Span> = Vec::new();
-                for x in 0..area.width {
-                    let hash = ((x as usize).wrapping_mul(31).wrapping_add(y as usize).wrapping_mul(17).wrapping_add(seed)) % 100;
-                    let threshold = (density * 100.0) as usize;
-                    if hash < threshold {
-                        let ch_idx = (hash + frame) % SPARKLE_CHARS.len();
-                        let ch = SPARKLE_CHARS[ch_idx];
-                        let color = match (hash + frame) % 3 {
-                            0 => Color::Cyan,
-                            1 => Color::Yellow,
-                            _ => Color::White,
-                        };
-                        spans.push(Span::styled(
-                            ch.to_string(),
-                            Style::default().fg(color),
-                        ));
-                    } else {
-                        spans.push(Span::raw(" "));
-                    }
-                }
-                lines.push(Line::from(spans));
-            }
-            let p = Paragraph::new(lines);
-            f.render_widget(p, area);
-        } else if frame <= 14 {
-            // Flash frame — bright cyan
-            let flash_char = if frame <= 12 { "*" } else { "." };
-            let mut lines: Vec<Line> = Vec::new();
-            for _ in 0..area.height {
-                let line_str: String = std::iter::repeat(flash_char).take(area.width as usize).collect();
-                lines.push(Line::from(Span::styled(
-                    line_str,
-                    Style::default().fg(Color::Cyan),
-                )));
-            }
-            let p = Paragraph::new(lines);
-            f.render_widget(p, area);
-        } else {
-            // Fade to empty — sparse sparkles fading out (~1.5s)
-            let density = match frame {
-                15..=17 => 0.2,
-                18..=20 => 0.12,
-                21..=23 => 0.06,
-                24..=26 => 0.02,
-                _ => 0.0,
-            };
+        // Use same layout as normal render to keep text in the body region
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),  // Header
+                Constraint::Min(6),    // Body
+                Constraint::Length(1),  // Step dots
+                Constraint::Length(2),  // Footer
+            ])
+            .split(area);
+        let body = chunks[1];
 
-            let mut lines: Vec<Line> = Vec::new();
-            let seed = frame * 3571;
-            for y in 0..area.height {
-                let mut spans: Vec<Span> = Vec::new();
-                for x in 0..area.width {
-                    let hash = ((x as usize).wrapping_mul(31).wrapping_add(y as usize).wrapping_mul(17).wrapping_add(seed)) % 100;
-                    let threshold = (density * 100.0) as usize;
-                    if hash < threshold {
-                        spans.push(Span::styled(".", Style::default().fg(Color::DarkGray)));
-                    } else {
-                        spans.push(Span::raw(" "));
-                    }
-                }
-                lines.push(Line::from(spans));
+        // Re-render body text with dimming color
+        let visible = ob.visible_text();
+        let mut lines: Vec<Line> = Vec::new();
+        let is_done = ob.step == OnboardingStep::Done;
+        for text_line in visible.split('\n') {
+            if is_done {
+                lines.push(Line::from(vec![
+                    Span::styled("\u{2713} ", Style::default().fg(color)),
+                    Span::styled(text_line, Style::default().fg(color)),
+                ]));
+            } else {
+                lines.push(Line::from(Span::styled(text_line, Style::default().fg(color))));
             }
-            let p = Paragraph::new(lines);
-            f.render_widget(p, area);
         }
+
+        // Vertical centering
+        let line_count = lines.len();
+        let top_pad = (body.height as usize).saturating_sub(line_count) / 2;
+        let mut centered_lines: Vec<Line> = Vec::with_capacity(top_pad + line_count);
+        for _ in 0..top_pad { centered_lines.push(Line::from("")); }
+        centered_lines.extend(lines);
+
+        // Horizontal centering
+        let max_line_width = centered_lines.iter().map(|l| l.width() as u16).max().unwrap_or(0);
+        let content_width = max_line_width.max(30).min(body.width);
+        let left_pad = (body.width.saturating_sub(content_width)) / 2;
+        let centered_body = Rect {
+            x: body.x + left_pad,
+            width: content_width,
+            ..body
+        };
+        let p = Paragraph::new(centered_lines)
+            .alignment(Alignment::Left)
+            .wrap(Wrap { trim: false });
+        f.render_widget(p, centered_body);
     }
 }
 

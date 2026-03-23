@@ -11,6 +11,9 @@ use tokio::sync::mpsc;
 
 use crate::enrichment::chat_prompts;
 
+/// Accent color used throughout the UI (lavender/indigo #af87ff)
+pub const ACCENT: Color = Color::Indexed(141);
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Chat types
 // ─────────────────────────────────────────────────────────────────────────────
@@ -79,6 +82,14 @@ impl ChatMessage {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct HomeRecording {
+    pub recording_id: i64,
+    pub name: String,
+    pub duration_mins: i64,
+    pub summary_line: Option<String>,
+}
+
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum ChatFocus {
     Table,
@@ -116,6 +127,25 @@ pub struct ChatState {
 
     // Focus
     pub focus: ChatFocus,
+
+    // Home screen greeting (set from Dashboard)
+    pub greeting_text: String,
+    pub greeting_subtitle: String,
+
+    // Borderless mode (no Block borders when true)
+    pub borderless: bool,
+
+    // Home screen timeline
+    pub home_recordings: Vec<HomeRecording>,
+    pub selected_action: usize,
+    pub show_home_screen: bool,
+
+    // Quick action menu (shown on Enter for a home recording)
+    pub action_menu_open: bool,
+    pub action_menu_selection: usize, // 0=transcript, 1=summarize, 2=ask
+
+    // Placeholder hint shown in input box when empty
+    pub placeholder: String,
 
     // Spinner frame
     pub spinner_frame: usize,
@@ -166,7 +196,16 @@ impl ChatState {
             show_suggestions: true,
             selected_suggestion: 0,
             system_prompt: String::new(),
-            focus: ChatFocus::Table,
+            focus: ChatFocus::ChatInput,
+            greeting_text: String::new(),
+            greeting_subtitle: String::new(),
+            borderless: false,
+            home_recordings: Vec::new(),
+            selected_action: 0,
+            show_home_screen: true,
+            action_menu_open: false,
+            action_menu_selection: 0,
+            placeholder: String::new(),
             spinner_frame: 0,
             auto_scroll: true,
             pending_message: None,
@@ -187,6 +226,11 @@ impl ChatState {
             cached_msg_count: 0,
             cached_width: 0,
         }
+    }
+
+    /// Invalidate the render cache (e.g. after clearing messages).
+    pub fn invalidate_cache(&mut self) {
+        self.cached_msg_count = 0;
     }
 
     pub fn context_usage_fraction(&self) -> f64 {
@@ -390,26 +434,39 @@ impl ChatState {
         }
 
         let is_focused = self.focus == ChatFocus::ChatInput;
-        let border_color = if is_focused { Color::Cyan } else { Color::DarkGray };
+        let border_color = if is_focused { ACCENT } else { Color::DarkGray };
 
         let title = match &self.context {
             ChatContext::Global => "Ask Scriba",
             ChatContext::Recording { .. } => "Ask about this recording",
         };
 
-        let inner_height = area.height.saturating_sub(2) as usize;
+        let border_overhead = if self.borderless { 0u16 } else { 2u16 };
+        let inner_height = area.height.saturating_sub(border_overhead) as usize;
         let has_conversation = !self.messages.is_empty() || self.is_generating;
-        let content_width = area.width.saturating_sub(4) as usize;
+        let padding = if self.borderless { 2usize } else { 4usize };
+        let content_width = area.width.saturating_sub(padding as u16) as usize;
 
-        let input_line_count = if !self.input_buffer.is_empty() {
-            let cursor_ch = if is_focused { "▎" } else { "" };
-            let display = format!("{}{}", self.input_buffer, cursor_ch);
-            let wrap_width = content_width.saturating_sub(4);
-            if wrap_width > 0 { textwrap::wrap(&display, wrap_width).len() } else { 1 }
+        // Home screen timeline (replaces old suggestions in borderless mode)
+        let show_home = self.show_home_screen
+            && self.borderless
+            && self.messages.is_empty()
+            && self.pending_blocks.is_empty()
+            && !self.is_generating;
+
+        // On home screen the input is rendered inline — no bottom reservation needed
+        let reserved = if show_home {
+            0
         } else {
-            1
+            let input_line_count = if !self.input_buffer.is_empty() {
+                let display = format!("{}\u{2588}", self.input_buffer);
+                let wrap_width = content_width.saturating_sub(4);
+                if wrap_width > 0 { textwrap::wrap(&display, wrap_width).len() } else { 1 }
+            } else {
+                1
+            };
+            if has_conversation { 1 + input_line_count } else { input_line_count }
         };
-        let reserved = if has_conversation { 1 + input_line_count } else { input_line_count };
         let chat_height = inner_height.saturating_sub(reserved);
 
         let mut final_lines: Vec<Line> = Vec::with_capacity(inner_height);
@@ -429,18 +486,223 @@ impl ChatState {
             _ => None,
         };
 
-        if show_suggestions {
+        if show_home {
+            // ── Home screen: ASCII logo + timeline + recording tree ──────
             let mut all_lines: Vec<Line> = Vec::new();
             let mut content_texts: Vec<String> = Vec::new();
+            let margin = "   ";
+            let dim = Style::default().fg(Color::DarkGray);
+
+            // Block art logo (centered, lavender accent)
+            let logo_lines = [
+                "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557} \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557} \u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557}  \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557} ",
+                "\u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2550}\u{2550}\u{255D}\u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2550}\u{2550}\u{255D}\u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2588}\u{2588}\u{2557}",
+                "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2551}     \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2554}\u{255D}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2554}\u{255D}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2551}",
+                "\u{255A}\u{2550}\u{2550}\u{2550}\u{2550}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551}     \u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2588}\u{2588}\u{2551}",
+                "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2551}\u{255A}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2551}  \u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2554}\u{255D}\u{2588}\u{2588}\u{2551}  \u{2588}\u{2588}\u{2551}",
+                "\u{255A}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{255D} \u{255A}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{255D}\u{255A}\u{2550}\u{255D}  \u{255A}\u{2550}\u{255D}\u{255A}\u{2550}\u{255D}\u{255A}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{255D} \u{255A}\u{2550}\u{255D}  \u{255A}\u{2550}\u{255D}",
+            ];
+            let logo_width = 43;
+            let logo_pad = content_width.saturating_sub(logo_width) / 2;
+            let logo_padding = " ".repeat(logo_pad);
+            let logo_style = Style::default().fg(Color::Indexed(60)); // muted indigo, subtle
+            for logo_line in &logo_lines {
+                let text = format!("{}{}", logo_padding, logo_line);
+                content_texts.push(text.clone());
+                all_lines.push(Line::from(Span::styled(text, logo_style)));
+            }
+
+            // Blank line
+            all_lines.push(Line::from(""));
+            content_texts.push(String::new());
+
+            // Timeline entry 1: System initialization
+            let init_text = format!("{}\u{25CB}  System initialization complete.", margin);
+            content_texts.push(init_text.clone());
+            all_lines.push(Line::from(Span::styled(init_text, dim)));
+
+            // Blank line
+            all_lines.push(Line::from(""));
+            content_texts.push(String::new());
+
+            // Timeline entry 2: Welcome greeting
+            let greeting = format!("{}\u{25CB}  {}", margin, self.greeting_text);
+            content_texts.push(greeting.clone());
+            all_lines.push(Line::from(Span::styled(
+                greeting,
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            )));
+
+            // Subtitle
+            if !self.greeting_subtitle.is_empty() {
+                let sub = format!("{}   {}", margin, self.greeting_subtitle);
+                content_texts.push(sub.clone());
+                all_lines.push(Line::from(Span::styled(sub, dim)));
+            }
+
+            // Recording tree — constrain to chat box width
+            let rec_count = self.home_recordings.len();
+            let action_labels = ["View transcript", "Summarize", "Ask about it"];
+            let tree_max = content_width.saturating_sub(2); // match chat box width
+            for (i, rec) in self.home_recordings.iter().enumerate() {
+                let is_last = i == rec_count - 1;
+                let connector = if is_last { "\u{2514}\u{2500}\u{2500}" } else { "\u{251C}\u{2500}\u{2500}" };
+                let is_selected = i == self.selected_action;
+
+                // Recording name line — truncate name to fit
+                let prefix = format!("{}   {} ", margin, connector);
+                let suffix = format!(" ({}m)", rec.duration_mins);
+                let max_name = tree_max.saturating_sub(prefix.chars().count() + suffix.chars().count());
+                let name: String = if rec.name.chars().count() > max_name {
+                    rec.name.chars().take(max_name.saturating_sub(1)).collect::<String>() + "\u{2026}"
+                } else {
+                    rec.name.clone()
+                };
+                let rec_line = format!("{}{}{}", prefix, name, suffix);
+                content_texts.push(rec_line.clone());
+                let rec_style = if is_selected {
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                all_lines.push(Line::from(Span::styled(rec_line, rec_style)));
+
+                // Summary line if present — truncate to fit
+                let vert = if is_last { " " } else { "\u{2502}" };
+                if let Some(ref summary) = rec.summary_line {
+                    let sum_prefix = format!("{}   {}   ", margin, vert);
+                    let max_sum = tree_max.saturating_sub(sum_prefix.chars().count());
+                    let truncated: String = if summary.chars().count() > max_sum {
+                        summary.chars().take(max_sum.saturating_sub(1)).collect::<String>() + "\u{2026}"
+                    } else {
+                        summary.clone()
+                    };
+                    let sum_line = format!("{}{}", sum_prefix, truncated);
+                    content_texts.push(sum_line.clone());
+                    all_lines.push(Line::from(Span::styled(sum_line, dim)));
+                }
+
+                // Quick action menu (inline, under the selected recording)
+                if is_selected && self.action_menu_open {
+                    for (ai, label) in action_labels.iter().enumerate() {
+                        let bullet = if ai == self.action_menu_selection { "\u{25B8}" } else { " " };
+                        let menu_line = format!("{}   {}    {} {}", margin, vert, bullet, label);
+                        content_texts.push(menu_line.clone());
+                        let menu_style = if ai == self.action_menu_selection {
+                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::DarkGray)
+                        };
+                        all_lines.push(Line::from(Span::styled(menu_line, menu_style)));
+                    }
+                }
+            }
+
+            // ── Chat input area (grey background, no borders) ─────────────
+            let box_height = 7; // total lines for the input area
+            let bg = Color::DarkGray; // matches the summary text color tone
+            let box_width = content_width.saturating_sub(2);
+            let inner_width = box_width.saturating_sub(6); // prompt + side padding
+
+            // Blank line before input area
+            all_lines.push(Line::from(""));
+            content_texts.push(String::new());
+
+            // Build input content lines
+            let cursor_visible = is_focused && (self.spinner_frame % 5 < 3);
+            let cursor_char = if cursor_visible { "\u{2588}" } else { " " };
+            let bg_style = Style::default().bg(bg);
+
+            let mut input_lines: Vec<Line> = Vec::new();
+            let mut input_texts: Vec<String> = Vec::new();
+
+            // Top padding line (empty, with background)
+            let full_bg = " ".repeat(box_width);
+            input_texts.push(full_bg.clone());
+            input_lines.push(Line::from(Span::styled(format!(" {}", full_bg), bg_style)));
+
+            // Target total width per line: 1 + box_width (leading space + fill)
+            let pad_left = "   "; // 3-char left padding inside box
+            let pad_len = pad_left.len(); // 3
+            if !self.input_buffer.is_empty() {
+                let display = format!("{}{}", self.input_buffer, cursor_char);
+                let wrap_w = inner_width + 2; // reclaim prompt space
+                let wrapped = textwrap::wrap(&display, wrap_w);
+                for w in &wrapped {
+                    let w_len = w.chars().count();
+                    // " " (1) + pad (3) + text + fill = 1 + box_width
+                    let right_fill = (1 + box_width).saturating_sub(1 + pad_len + w_len);
+                    let text = format!("{}{}{}", pad_left, w, " ".repeat(right_fill));
+                    input_texts.push(text.clone());
+                    input_lines.push(Line::from(vec![
+                        Span::styled(" ", bg_style),
+                        Span::styled(pad_left.to_string(), bg_style),
+                        Span::styled(w.to_string(), Style::default().fg(Color::White).bg(bg)),
+                        Span::styled(" ".repeat(right_fill), bg_style),
+                    ]));
+                }
+            } else {
+                // Empty input: cursor + placeholder hint (or just cursor)
+                let hint = if !self.placeholder.is_empty() { self.placeholder.as_str() } else { "" };
+                let hint_len = hint.chars().count();
+                let total_content = 1 + hint_len; // cursor + hint
+                let right_fill = (1 + box_width).saturating_sub(1 + pad_len + total_content);
+                let text = format!("{}{}{}{}", pad_left, cursor_char, hint, " ".repeat(right_fill));
+                input_texts.push(text.clone());
+                input_lines.push(Line::from(vec![
+                    Span::styled(" ", bg_style),
+                    Span::styled(pad_left.to_string(), bg_style),
+                    Span::styled(cursor_char.to_string(), Style::default().fg(Color::White).bg(bg)),
+                    Span::styled(hint.to_string(), Style::default().fg(Color::Indexed(246)).bg(bg)),
+                    Span::styled(" ".repeat(right_fill), bg_style),
+                ]));
+            }
+
+            // Add input lines, then fill remaining height with empty bg rows
+            let used = input_lines.len();
+            for l in input_lines {
+                all_lines.push(l);
+            }
+            content_texts.extend(input_texts);
+            for _ in used..box_height {
+                let bg_fill = " ".repeat(box_width);
+                content_texts.push(bg_fill.clone());
+                all_lines.push(Line::from(Span::styled(format!(" {}", bg_fill), bg_style)));
+            }
+
+            // ── Vertical centering (bias upper third) ────────────────────
+            let total_content = all_lines.len();
+            self.content_texts = content_texts;
+            self.total_content_lines = total_content;
+            // Use inner_height (not chat_height) since we included the input inline
+            let avail = inner_height;
+            let top_pad = if total_content < avail {
+                (avail - total_content) / 3
+            } else {
+                0
+            };
+            for _ in 0..top_pad {
+                final_lines.push(Line::from(""));
+            }
+            let remaining = avail.saturating_sub(top_pad);
+            for line in all_lines.into_iter().take(remaining) {
+                final_lines.push(line);
+            }
+            let used = top_pad + remaining.min(total_content);
+            for _ in used..avail {
+                final_lines.push(Line::from(""));
+            }
+        } else if show_suggestions && !self.show_home_screen {
+            // ── Chat suggestions (recording view or non-home) ────────────
+            let mut all_lines: Vec<Line> = Vec::new();
+            let mut content_texts: Vec<String> = Vec::new();
+
             let total_options = self.suggestions.len() + 1;
             for (i, s) in self.suggestions.iter().enumerate() {
-                let text = if i == self.selected_suggestion {
-                    format!("  > {}", s)
-                } else {
-                    format!("    {}", s)
-                };
+                let bullet = if i == self.selected_suggestion { "\u{25B8}" } else { " " };
+                let text = format!("  {} {}", bullet, s);
                 let style = if i == self.selected_suggestion {
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::DarkGray)
                 };
@@ -448,18 +710,15 @@ impl ChatState {
                 all_lines.push(Line::from(Span::styled(text, style)));
             }
             let free_form_idx = total_options - 1;
-            let text = if self.selected_suggestion == free_form_idx {
-                "  > Ask Scriba anything..."
-            } else {
-                "    Ask Scriba anything..."
-            };
+            let bullet = if self.selected_suggestion == free_form_idx { "\u{25B8}" } else { " " };
+            let text = format!("  {} Ask Scriba anything...", bullet);
             let style = if self.selected_suggestion == free_form_idx {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::DarkGray)
             };
-            content_texts.push(text.to_string());
-            all_lines.push(Line::from(Span::styled(text.to_string(), style)));
+            content_texts.push(text.clone());
+            all_lines.push(Line::from(Span::styled(text, style)));
 
             self.content_texts = content_texts;
             let total_content = all_lines.len();
@@ -508,27 +767,15 @@ impl ChatState {
                                 let wrapped = textwrap::wrap(line, wrap_width);
                                 if wrapped.is_empty() {
                                     cached_texts.push("  ".to_string());
-                                    cached_lines.push(Line::from(Span::styled(
-                                        "  ".to_string(),
-                                        Style::default().fg(Color::Cyan),
-                                    )));
+                                    cached_lines.push(Line::from("  ".to_string()));
                                 } else {
-                                    for (j, w) in wrapped.iter().enumerate() {
-                                        if j == 0 {
-                                            let text = format!("  \u{25B8} {}", w);
-                                            cached_texts.push(text.clone());
-                                            cached_lines.push(Line::from(Span::styled(
-                                                text,
-                                                Style::default().fg(Color::Cyan),
-                                            )));
-                                        } else {
-                                            let text = format!("    {}", w);
-                                            cached_texts.push(text.clone());
-                                            cached_lines.push(Line::from(Span::styled(
-                                                text,
-                                                Style::default().fg(Color::Cyan),
-                                            )));
-                                        }
+                                    for w in wrapped.iter() {
+                                        let text = format!(" \u{2502} {}", w);
+                                        cached_texts.push(text.clone());
+                                        cached_lines.push(Line::from(vec![
+                                            Span::styled(" \u{2502} ", Style::default().fg(Color::Indexed(60))),
+                                            Span::styled(w.to_string(), Style::default().fg(Color::Indexed(249))),
+                                        ]));
                                     }
                                 }
                             }
@@ -658,12 +905,12 @@ impl ChatState {
                         }
                         spans.push(Span::styled(
                             tc.name.clone(),
-                            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
                         ));
                         if !tc.input_summary.is_empty() {
                             spans.push(Span::styled(
                                 format!("({})", tc.input_summary),
-                                Style::default().fg(Color::White),
+                                Style::default().fg(Color::DarkGray),
                             ));
                         }
                         if tc.is_complete && !tc.output_summary.is_empty() {
@@ -759,60 +1006,61 @@ impl ChatState {
             }
         }
 
-        // ── Separator + Usage bar + Input line ─────────────────────────────
-        if has_conversation {
-            let sep_width = content_width.min(area.width.saturating_sub(4) as usize);
-            let sep = "─".repeat(sep_width);
-            final_lines.push(Line::from(Span::styled(
-                format!("  {}", sep),
-                Style::default().fg(Color::DarkGray),
-            )));
-        }
+        // ── Separator + Input line (skip for home screen — it's rendered inline) ──
+        if !show_home {
+            if has_conversation {
+                let sep_width = content_width.min(area.width.saturating_sub(4) as usize);
+                let sep = "\u{2500}".repeat(sep_width);
+                final_lines.push(Line::from(Span::styled(
+                    format!("  {}", sep),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
 
-        let cursor = if is_focused { "▎" } else { "" };
-        let has_pending = self.pending_message.is_some();
-        if has_pending && self.input_buffer.is_empty() {
-            let queued_msg = self.pending_message.as_deref().unwrap_or("");
-            final_lines.push(Line::from(vec![
-                Span::styled("  ▸ ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                Span::styled(
-                    format!("{} ", queued_msg),
-                    Style::default().fg(Color::Yellow),
-                ),
-                Span::styled("(queued)", Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)),
-            ]));
-        } else if !self.input_buffer.is_empty() {
-            let display = format!("{}{}", self.input_buffer, cursor);
-            let wrap_width = content_width.saturating_sub(4);
-            let wrapped = textwrap::wrap(&display, wrap_width);
-            for (j, w) in wrapped.iter().enumerate() {
-                if j == 0 {
+            // Blinking block cursor: visible for 3 frames, hidden for 2 (~500ms cycle at 10fps)
+            let cursor_visible = is_focused && (self.spinner_frame % 5 < 3);
+            let cursor_char = if cursor_visible { "\u{2588}" } else { " " };
+
+            let has_pending = self.pending_message.is_some();
+            if has_pending && self.input_buffer.is_empty() {
+                let queued_msg = self.pending_message.as_deref().unwrap_or("");
+                final_lines.push(Line::from(vec![
+                    Span::styled(" \u{2502} ", Style::default().fg(Color::Indexed(60))),
+                    Span::styled(
+                        format!("{} ", queued_msg),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::styled("(queued)", Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)),
+                ]));
+            } else if !self.input_buffer.is_empty() {
+                let display = format!("{}{}", self.input_buffer, cursor_char);
+                let wrap_width = content_width.saturating_sub(5);
+                let wrapped = textwrap::wrap(&display, wrap_width);
+                for w in wrapped.iter() {
                     final_lines.push(Line::from(vec![
-                        Span::styled("  ▸ ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                        Span::styled(" \u{2502} ", Style::default().fg(Color::Indexed(60))),
                         Span::styled(w.to_string(), Style::default().fg(Color::White)),
                     ]));
-                } else {
-                    final_lines.push(Line::from(Span::styled(
-                        format!("    {}", w),
-                        Style::default().fg(Color::White),
-                    )));
                 }
-            }
+            } else {
+                final_lines.push(Line::from(vec![
+                    Span::styled(" \u{2502} ", Style::default().fg(Color::Indexed(60))),
+                    Span::styled(cursor_char.to_string(), Style::default().fg(Color::White)),
+                ]));
+            };
+        }
+
+        let mut chat_block = if self.borderless {
+            Block::default()
         } else {
-            let prompt_color = if is_focused { Color::Cyan } else { Color::DarkGray };
-            final_lines.push(Line::from(Span::styled(
-                format!("  ▸ {}", cursor),
-                Style::default().fg(prompt_color),
-            )));
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border_color))
+                .title(title)
+                .title_style(Style::default().fg(if is_focused { ACCENT } else { Color::DarkGray }))
         };
 
-        let mut chat_block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(border_color))
-            .title(title)
-            .title_style(Style::default().fg(if is_focused { Color::Cyan } else { Color::DarkGray }));
-
-        if self.context_input_tokens > 0 {
+        if !self.borderless && self.context_input_tokens > 0 {
             let fraction = self.context_usage_fraction().min(1.0);
             let pct = (fraction * 100.0) as u32;
             let bar_len: usize = 10;
@@ -848,7 +1096,7 @@ impl ChatState {
                 .track_symbol(Some("│"))
                 .begin_symbol(None)
                 .end_symbol(None)
-                .thumb_style(Style::default().fg(Color::Cyan))
+                .thumb_style(Style::default().fg(Color::Indexed(245)))
                 .track_style(Style::default().fg(Color::Indexed(237)));
             let scroll_y = if self.auto_scroll || total_content <= chat_height {
                 total_content.saturating_sub(chat_height)
@@ -858,11 +1106,12 @@ impl ChatState {
             };
             let mut scrollbar_state = ScrollbarState::new(total_content)
                 .position(scroll_y);
+            let sb_inset = if self.borderless { 0 } else { 1 };
             let scrollbar_area = Rect {
                 x: area.x,
-                y: area.y + 1,
+                y: area.y + sb_inset,
                 width: area.width,
-                height: area.height.saturating_sub(2),
+                height: area.height.saturating_sub(sb_inset * 2),
             };
             f.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
         }
@@ -884,13 +1133,13 @@ fn render_tool_call_cached(
         Span::styled("  \u{2713} ", Style::default().fg(Color::Green)),
         Span::styled(
             tc.name.clone(),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
         ),
     ];
     if !tc.input_summary.is_empty() {
         spans.push(Span::styled(
             format!("({})", tc.input_summary),
-            Style::default().fg(Color::White),
+            Style::default().fg(Color::DarkGray),
         ));
     }
     if !tc.output_summary.is_empty() {
