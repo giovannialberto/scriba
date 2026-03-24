@@ -485,7 +485,7 @@ impl Dashboard {
 
         let header_line = Line::from(vec![
             Span::raw("  "),
-            Span::styled("Scriba's World", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled("World", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
             Span::styled(counts_suffix, Style::default().fg(Color::DarkGray)),
         ]);
         f.render_widget(Paragraph::new(header_line), Rect { x: main_chunks[0].x, y: main_chunks[0].y, width: main_chunks[0].width, height: 1 });

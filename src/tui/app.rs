@@ -117,7 +117,7 @@ pub struct Dashboard {
     // Onboarding state
     pub(super) onboarding: Option<OnboardingState>,
 
-    // Voice mode ("Scriba Forever") state
+    // Voice mode state
     pub(super) voice_command_rx: Option<mpsc::Receiver<VoiceCommand>>,
     pub(super) voice_detector_handle: Option<VoiceDetectorHandle>,
     pub(super) voice_mode_active: bool,
@@ -132,6 +132,9 @@ pub struct Dashboard {
     pub(super) greeting_text: String,
     pub(super) greeting_subtitle: String,
     pub(super) owner_name: String,
+
+    // Easter egg
+    pub(super) owl_easter_egg_frame: Option<usize>,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -254,6 +257,9 @@ impl Dashboard {
             greeting_text: String::new(),
             greeting_subtitle: String::new(),
             owner_name: String::new(),
+
+            // Easter egg
+            owl_easter_egg_frame: None,
         })
     }
 
@@ -513,6 +519,14 @@ impl Dashboard {
                         *frames -= 1;
                     }
                 }
+
+                // Easter egg animation tick
+                if let Some(ref mut frame) = self.owl_easter_egg_frame {
+                    *frame += 1;
+                    if *frame > 150 {
+                        self.owl_easter_egg_frame = None;
+                    }
+                }
             }
 
             // Onboarding tick logic (runs every frame for typewriter + async polling)
@@ -528,11 +542,11 @@ impl Dashboard {
                             ob.step = OnboardingStep::Intro;
                             ob.set_step_text(
                                 "Welcome to Scriba.\n\n\
-                                 I listen to your recordings, transcribe them,\n\
-                                 and remember everything \u{2014} names, places, topics.\n\
-                                 Think of me as your personal note-taker\n\
+                                 Scriba records, transcribes, and remembers\n\
+                                 everything \u{2014} names, places, topics.\n\
+                                 Your personal audio assistant\n\
                                  with a very good memory.\n\n\
-                                 Let me get to know you first.",
+                                 Let's get you set up.",
                                 true,
                             );
                         }
@@ -857,6 +871,12 @@ impl Dashboard {
             return Ok(DashboardAction::Continue);
         }
 
+        // Dismiss easter egg on any keypress
+        if self.owl_easter_egg_frame.is_some() {
+            self.owl_easter_egg_frame = None;
+            return Ok(DashboardAction::Continue);
+        }
+
         // Onboarding key handling
         if self.current_view == DashboardView::Onboarding {
             return self.handle_onboarding_keys(key_code).await;
@@ -984,6 +1004,10 @@ impl Dashboard {
                 KeyCode::Char('r') => {
                     return Ok(DashboardAction::RecordAndTranscribe);
                 }
+                KeyCode::Char('o') => {
+                    self.owl_easter_egg_frame = Some(0);
+                    return Ok(DashboardAction::Continue);
+                }
                 _ => {}
             }
         }
@@ -1033,6 +1057,11 @@ impl Dashboard {
             DashboardView::Settings => self.render_settings(f, f.size()),
             DashboardView::Entities => self.render_entities_view(f, f.size()),
             DashboardView::Onboarding => self.render_onboarding(f, f.size()),
+        }
+
+        // Easter egg overlay (renders on top of everything)
+        if let Some(frame) = self.owl_easter_egg_frame {
+            self.render_owl_easter_egg(f, f.size(), frame);
         }
     }
 
@@ -1241,7 +1270,7 @@ impl Dashboard {
         f.render_widget(help_paragraph, popup_area);
     }
 
-    // -- Voice Mode ("Scriba Forever") --
+    // -- Voice Mode --
 
     pub(super) async fn toggle_voice_mode(&mut self) {
         if self.voice_mode_active {
@@ -1992,6 +2021,109 @@ impl Dashboard {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn render_owl_easter_egg(&self, f: &mut Frame, area: ratatui::layout::Rect, frame: usize) {
+        // The owl is back, and it's UNHINGED. Full-screen takeover.
+        let owl_sprites: &[&[&str]] = &[
+            // Frame set 0: eyes wide, wings spread
+            &[
+                r"                                          ",
+                r"        ,_,      ,_,                      ",
+                r"       (O,O)    (O,O)     HOOT HOOT!!     ",
+                r"      /{   }\  /{   }\                    ",
+                r#"       -"-"-    -"-"-     I NEVER LEFT!!  "#,
+            ],
+            // Frame set 1: crazy eyes, wings up
+            &[
+                r"                                          ",
+                r"       \(@,@)/ \(@,@)/                    ",
+                r"        /{_}\   /{_}\   YOU THOUGHT YOU   ",
+                r#"        -"-"-   -"-"-   COULD GET RID     "#,
+                r"                        OF ME?! HOOOO!!   ",
+            ],
+            // Frame set 2: spinning
+            &[
+                r"                                          ",
+                r"          /(O,O)\     /(O,O)\             ",
+                r"           |\_/|       |\_/|              ",
+                r#"           -"-"-       -"-"-              "#,
+                r"        *AGGRESSIVELY HOOTING*            ",
+            ],
+            // Frame set 3: maximum chaos
+            &[
+                r"                                          ",
+                r"    \(O,O)/  (o,o)  \(@,@)/  /(O,O)\     ",
+                r#"     |][|   {{`"'}}    |><|    |}{|       "#,
+                r#"     -"-"-  -"-"-   -"-"-   -"-"-        "#,
+                r"   THE OWLS ARE NOT WHAT THEY SEEM!!!     ",
+            ],
+            // Frame set 4: single menacing owl
+            &[
+                r"                                          ",
+                r"              ,___,                        ",
+                r"             (O   O)   hoo hoo hoo...     ",
+                r"              /)_(\                        ",
+                r"             ' - - `   i see everything   ",
+                r"                                          ",
+                r"          ...hoo remembers everything...  ",
+            ],
+        ];
+
+        let sprite_idx = (frame / 30) % owl_sprites.len();
+        let sprite = owl_sprites[sprite_idx];
+
+        // Flash background between colors for extra chaos
+        let bg = match (frame / 8) % 4 {
+            0 => Color::Black,
+            1 => Color::Indexed(17),  // dark blue
+            2 => Color::Black,
+            _ => Color::Indexed(52),  // dark red
+        };
+        let fg = match (frame / 5) % 5 {
+            0 => Color::Yellow,
+            1 => Color::Magenta,
+            2 => Color::Cyan,
+            3 => Color::Red,
+            _ => Color::Green,
+        };
+
+        // Fill background
+        f.render_widget(Clear, area);
+        let bg_fill = " ".repeat(area.width as usize);
+        for y in area.y..area.y + area.height {
+            f.render_widget(
+                Paragraph::new(bg_fill.clone()).style(Style::default().bg(bg)),
+                Rect { x: area.x, y, width: area.width, height: 1 },
+            );
+        }
+
+        // Center and render the owl
+        let sprite_height = sprite.len() as u16;
+        let sprite_width = sprite.iter().map(|l| l.len()).max().unwrap_or(0) as u16;
+        let cx = area.x + area.width.saturating_sub(sprite_width) / 2;
+        let cy = area.y + area.height.saturating_sub(sprite_height) / 2;
+
+        for (i, line) in sprite.iter().enumerate() {
+            let y = cy + i as u16;
+            if y < area.y + area.height {
+                f.render_widget(
+                    Paragraph::new(*line).style(Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD)),
+                    Rect { x: cx, y, width: sprite_width.min(area.width), height: 1 },
+                );
+            }
+        }
+
+        // Countdown bar at bottom
+        let remaining = 150_usize.saturating_sub(frame);
+        let bar_width = (remaining as u16 * area.width) / 150;
+        if bar_width > 0 {
+            let bar = "\u{2588}".repeat(bar_width as usize);
+            f.render_widget(
+                Paragraph::new(bar).style(Style::default().fg(Color::DarkGray)),
+                Rect { x: area.x, y: area.y + area.height - 1, width: area.width, height: 1 },
+            );
         }
     }
 }
