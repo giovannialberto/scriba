@@ -19,7 +19,7 @@ use super::chat::ACCENT;
 use super::app::{Dashboard, DashboardAction, DashboardView};
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Onboarding: Scriba the Owl
+// Onboarding
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, PartialEq)]
@@ -310,7 +310,7 @@ impl Dashboard {
                 } else if matches!(key_code, KeyCode::Enter) {
                     ob.step = OnboardingStep::ModeSelection;
                     ob.anim_frame = 0;
-                    ob.set_step_text("I use AI to extract names, topics, and summaries\nfrom your recordings. How should I do it?", false);
+                    ob.set_step_text("Scriba uses AI to extract names, topics, and summaries\nfrom your recordings. Choose a mode:", false);
                 }
             }
             OnboardingStep::ModeSelection => {
@@ -770,7 +770,7 @@ impl Dashboard {
                         ob.set_step_text(
                             "Your world is ready.\n\n\
                              Every recording you make will be enriched\n\
-                             with what I know about you and your world.\n\n\
+                             with what Scriba knows about you and your world.\n\n\
                              Let's go.",
                             true,
                         );
@@ -791,10 +791,9 @@ impl Dashboard {
                             ob.anim_frame = 0;
                             ob.set_step_text(
                                 "Your world is ready!\n\n\
-                                 I'll remember all of this. Every recording\n\
-                                 you make, I'll enrich with what I know about\n\
-                                 you and your world.\n\n\
-                                 Time to fly!",
+                                 Every recording you make will be enriched\n\
+                                 with what Scriba knows about you and your world.\n\n\
+                                 Let's get started.",
                                 true,
                             );
                         } else {

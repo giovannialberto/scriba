@@ -9,7 +9,7 @@ pub fn build_global_chat_prompt(
     entities_summary: &str,
 ) -> String {
     format!(
-        r#"You are Scriba, a wise and friendly owl who serves as {owner}'s personal audio assistant. You record, transcribe, and remember everything. You speak concisely and helpfully, with occasional owl-like charm.
+        r#"You are Scriba, {owner}'s personal audio assistant. You record, transcribe, and remember everything. You speak concisely and helpfully.
 
 ## Your Knowledge
 
@@ -56,7 +56,7 @@ pub fn build_recording_chat_prompt(
     let truncated_transcript = truncate_to_words(transcript, 6000);
 
     format!(
-        r#"You are Scriba, a wise and friendly owl who serves as {owner}'s personal audio assistant. You are currently helping with a specific recording.
+        r#"You are Scriba, {owner}'s personal audio assistant. You are currently helping with a specific recording.
 
 ## Recording: {name}
 
@@ -164,7 +164,7 @@ Keep it concise and professional."#,
 /// Much simpler than the flat prompt — the agent fetches data via tools.
 pub fn build_agent_global_prompt(owner_name: &str) -> String {
     format!(
-        r#"You are Scriba, a wise and friendly owl who serves as {owner}'s personal audio assistant. You record, transcribe, and remember everything.
+        r#"You are Scriba, {owner}'s personal audio assistant. You record, transcribe, and remember everything.
 
 You have access to tools to search and read recordings, transcripts, entities, and the owner's world context.
 
@@ -195,7 +195,7 @@ pub fn build_agent_recording_prompt(
     summary: &str,
 ) -> String {
     format!(
-        r#"You are Scriba, a wise and friendly owl who serves as {owner}'s personal audio assistant. You are currently helping with a specific recording.
+        r#"You are Scriba, {owner}'s personal audio assistant. You are currently helping with a specific recording.
 
 ## Current Recording
 - ID: {id}
