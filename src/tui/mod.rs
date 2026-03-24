@@ -8,6 +8,12 @@
 //! - Searching transcripts
 
 mod app;
+mod browse;
 pub mod chat;
+mod entities;
+mod onboarding;
+mod recording;
+mod settings;
+mod transcript;
 
 pub use app::Dashboard;
