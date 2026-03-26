@@ -1,3 +1,37 @@
+Scriba 0.22.0 — Clean Slate
+
+Highlights
+
+- **New identity**: Scriba sheds the owl persona and embraces a clean, professional identity with a bold block-art SCRIBA logo in both CLI and TUI. A hidden Ctrl+O easter egg pays homage to the owl era with an animated takeover sequence.
+- **Modular TUI architecture**: The monolithic 7,519-line `app.rs` has been decomposed into 7 focused modules (browse, entities, onboarding, recording, settings, transcript, and core app), dramatically improving maintainability.
+- **Redesigned UI**: Settings and World pages adopt a borderless full-screen layout. A new Privacy Mode setup wizard guides users through system checks and local model downloads.
+- **14 bug fixes**: Panic fixes for empty recordings navigation, unwrap removals throughout, keyboard shortcut accessibility improvements, byte-boundary truncation guards, and platform-aware install hints.
+
+Changelog
+
+- feat: remove owl ASCII art, tagline, and personality from CLI banner and all chat system prompts
+- feat: replace CLI banner with thick block-art SCRIBA logo matching the TUI
+- feat: add hidden Ctrl+O easter egg — animated owl takeover with 5 sprite frames, flashing colors, and countdown bar
+- feat: redesign Settings and World pages to borderless full-screen layout
+- feat: add Privacy Mode setup wizard with system checks and model downloads
+- refactor: decompose `src/tui/app.rs` into 7 focused modules (app, browse, entities, onboarding, recording, settings, transcript)
+- fix: panic on empty recordings list in next/previous navigation
+- fix: `WorkflowManager::new().unwrap()` replaced with proper error propagation
+- fix: Ctrl+S/Ctrl+W shortcuts not accessible from Browse view
+- fix: settings UI alignment for Anthropic API key label
+- fix: Esc in entity Editing mode now cancels instead of saving
+- fix: byte-boundary truncation panics in entity aliases/context display
+- fix: merge-self guard when source entity has no DB id
+- fix: file dialog stays open on validation error instead of closing
+- fix: filesystem deletion failure now surfaces as notification
+- fix: `reqwest::Client::build().unwrap()` panic in onboarding
+- fix: platform-aware install hints (macOS/Linux/Windows) in onboarding
+- fix: byte-safe API key display in settings (chars vs bytes)
+- fix: `Database::new()` replaced with `self.db` in voice stop command
+- fix: Ctrl+W shortcut on non-US keyboard layouts (Italian QWERTY)
+
+---
+
 Scriba 0.21.1 — Unified Tools & Multi-Provider Agent
 
 Highlights
