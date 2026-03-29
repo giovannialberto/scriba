@@ -88,6 +88,7 @@ pub struct Dashboard {
     pub(super) file_path_input: String,
     pub(super) file_name_input: String,
     pub(super) file_dialog_stage: FileDialogStage, // Current stage of file import process
+    pub(super) file_dialog_error: Option<String>,  // Inline error for current step
 
     // Entity view state
     pub(super) entities: Vec<Entity>,
@@ -213,6 +214,7 @@ impl Dashboard {
             file_path_input: String::new(),
             file_name_input: String::new(),
             file_dialog_stage: FileDialogStage::FilePath,
+            file_dialog_error: None,
 
             // Entity view state
             entities: Vec::new(),
@@ -1226,9 +1228,9 @@ impl Dashboard {
             Line::from("  Type in the chat box to ask questions about your recordings"),
             Line::from(""),
             Line::from("Browse:"),
-            Line::from("  \u{2191}/\u{2193}        - Navigate recordings"),
-            Line::from("  PgUp/PgDn  - Change pages"),
+            Line::from("  \u{2191}/\u{2193}        - Navigate recordings (auto-pages)"),
             Line::from("  Enter      - View transcript"),
+            Line::from("  T          - Transcribe selected"),
             Line::from("  P          - Play recording"),
             Line::from("  D          - Delete recording"),
             Line::from("  /          - Search recordings"),

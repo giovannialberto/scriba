@@ -6,7 +6,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap},
+    widgets::{Block, Cell, Clear, Paragraph, Row, Table, Wrap},
     Frame,
 };
 
@@ -117,34 +117,29 @@ impl Dashboard {
                     KeyCode::Esc => {
                         self.entity_mode = EntityMode::Browse;
                     }
-                    KeyCode::Tab | KeyCode::Down => {
+                    KeyCode::Down => {
                         self.entity_add_field = match self.entity_add_field {
                             EntityEditField::Name => EntityEditField::Type,
                             EntityEditField::Type => EntityEditField::Context,
                             EntityEditField::Context => EntityEditField::Name,
                         };
                     }
-                    KeyCode::BackTab | KeyCode::Up => {
+                    KeyCode::Up => {
                         self.entity_add_field = match self.entity_add_field {
                             EntityEditField::Name => EntityEditField::Context,
                             EntityEditField::Type => EntityEditField::Name,
                             EntityEditField::Context => EntityEditField::Type,
                         };
                     }
+                    KeyCode::Tab if self.entity_add_field == EntityEditField::Type => {
+                        let current_idx = ENTITY_TYPES.iter().position(|t| *t == self.entity_add_type).unwrap_or(0);
+                        self.entity_add_type = ENTITY_TYPES[(current_idx + 1) % ENTITY_TYPES.len()].to_string();
+                    }
                     KeyCode::Enter => {
-                        if self.entity_add_field == EntityEditField::Type {
-                            // Cycle type on Enter
-                            let current_idx = ENTITY_TYPES.iter().position(|t| *t == self.entity_add_type).unwrap_or(0);
-                            self.entity_add_type = ENTITY_TYPES[(current_idx + 1) % ENTITY_TYPES.len()].to_string();
-                        } else if !self.entity_add_name.trim().is_empty() {
-                            // Save if name is not empty
+                        if !self.entity_add_name.trim().is_empty() {
                             self.save_entity_add()?;
                             self.entity_mode = EntityMode::Browse;
                         }
-                    }
-                    KeyCode::Char(' ') if self.entity_add_field == EntityEditField::Type => {
-                        let current_idx = ENTITY_TYPES.iter().position(|t| *t == self.entity_add_type).unwrap_or(0);
-                        self.entity_add_type = ENTITY_TYPES[(current_idx + 1) % ENTITY_TYPES.len()].to_string();
                     }
                     KeyCode::Backspace => {
                         match self.entity_add_field {
@@ -170,38 +165,28 @@ impl Dashboard {
                         self.selected_entity = None;
                         self.entity_mode = EntityMode::Browse;
                     }
-                    KeyCode::Tab | KeyCode::Down => {
+                    KeyCode::Down => {
                         self.entity_edit_field = match self.entity_edit_field {
                             EntityEditField::Name => EntityEditField::Type,
                             EntityEditField::Type => EntityEditField::Context,
                             EntityEditField::Context => EntityEditField::Name,
                         };
                     }
-                    KeyCode::BackTab | KeyCode::Up => {
+                    KeyCode::Up => {
                         self.entity_edit_field = match self.entity_edit_field {
                             EntityEditField::Name => EntityEditField::Context,
                             EntityEditField::Type => EntityEditField::Name,
                             EntityEditField::Context => EntityEditField::Type,
                         };
                     }
+                    KeyCode::Tab if self.entity_edit_field == EntityEditField::Type => {
+                        self.cycle_entity_type();
+                    }
                     KeyCode::Enter => {
-                        if self.entity_edit_field == EntityEditField::Type {
-                            self.cycle_entity_type();
-                        } else if self.entity_edit_field == EntityEditField::Context {
-                            // Save and exit from the last field
+                        if !self.entity_edit_name.trim().is_empty() {
                             self.save_entity_edit()?;
                             self.entity_mode = EntityMode::Browse;
-                        } else {
-                            // Move to next field
-                            self.entity_edit_field = match self.entity_edit_field {
-                                EntityEditField::Name => EntityEditField::Type,
-                                EntityEditField::Type => EntityEditField::Context,
-                                EntityEditField::Context => EntityEditField::Name,
-                            };
                         }
-                    }
-                    KeyCode::Char(' ') if self.entity_edit_field == EntityEditField::Type => {
-                        self.cycle_entity_type();
                     }
                     KeyCode::Char(c) => {
                         match self.entity_edit_field {
@@ -663,14 +648,17 @@ impl Dashboard {
             ],
             EntityMode::Adding | EntityMode::Editing => vec![
                 Span::styled("[", Style::default().fg(Color::DarkGray)),
-                Span::styled("Tab", Style::default().fg(Color::White)),
-                Span::styled("] Next field  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("↑↓", Style::default().fg(Color::White)),
+                Span::styled("] Navigate  ", Style::default().fg(Color::DarkGray)),
                 Span::styled("[", Style::default().fg(Color::DarkGray)),
-                Span::styled("Space", Style::default().fg(Color::White)),
+                Span::styled("Tab", Style::default().fg(Color::White)),
                 Span::styled("] Cycle type  ", Style::default().fg(Color::DarkGray)),
                 Span::styled("[", Style::default().fg(Color::DarkGray)),
+                Span::styled("Enter", Style::default().fg(Color::White)),
+                Span::styled("] Save  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[", Style::default().fg(Color::DarkGray)),
                 Span::styled("Esc", Style::default().fg(Color::White)),
-                Span::styled("] Done ", Style::default().fg(Color::DarkGray)),
+                Span::styled("] Cancel ", Style::default().fg(Color::DarkGray)),
             ],
         };
 
@@ -701,297 +689,226 @@ impl Dashboard {
     }
 
     pub(super) fn render_entity_detail_popup(&self, f: &mut Frame, area: ratatui::layout::Rect) {
-        let popup_area = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Percentage(10),
-                Constraint::Percentage(80),
-                Constraint::Percentage(10),
-            ])
-            .split(area)[1];
-
-        let popup_area = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(10),
-                Constraint::Percentage(80),
-                Constraint::Percentage(10),
-            ])
-            .split(popup_area)[1];
-
-        f.render_widget(Clear, popup_area);
-
         if let Some(entity) = &self.selected_entity {
             let aliases = entity.aliases_list().join(", ");
-            let aliases_display = if aliases.is_empty() {
-                "-".to_string()
-            } else {
-                aliases
-            };
+            let aliases_display = if aliases.is_empty() { "-".to_string() } else { aliases };
+            let context_display = entity.context.as_ref().cloned().unwrap_or_else(|| "-".to_string());
 
-            let context_display = entity
-                .context
-                .as_ref()
-                .cloned()
-                .unwrap_or_else(|| "(no context)".to_string());
-
-            let type_label = match entity.entity_type.as_str() {
-                "person" => "person",
-                "organization" => "org",
-                _ => "other",
-            };
-
-            let content = vec![
+            let mut lines: Vec<Line> = vec![
                 Line::from(vec![
-                    Span::styled(
-                        format!("[{}] ", type_label),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                    Span::styled(
-                        &entity.canonical_name,
-                        Style::default()
-                            .fg(ACCENT)
-                            .add_modifier(Modifier::BOLD),
-                    ),
+                    Span::styled(format!("[{}]  ", entity.entity_type), Style::default().fg(Color::DarkGray)),
+                    Span::styled(&entity.canonical_name, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
                 ]),
                 Line::from(""),
                 Line::from(vec![
-                    Span::styled("Type: ", Style::default().fg(Color::Green)),
-                    Span::styled(
-                        &entity.entity_type,
-                        Style::default().fg(Color::White),
-                    ),
+                    Span::styled("mentions  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(entity.mention_count.to_string(), Style::default().fg(Color::White)),
                 ]),
                 Line::from(vec![
-                    Span::styled("ID: ", Style::default().fg(Color::Green)),
-                    Span::styled(
-                        entity.id.unwrap_or(0).to_string(),
-                        Style::default().fg(Color::White),
-                    ),
+                    Span::styled("aliases   ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(aliases_display, Style::default().fg(Color::White)),
                 ]),
-                Line::from(vec![
-                    Span::styled("Mentions: ", Style::default().fg(Color::Green)),
-                    Span::styled(
-                        entity.mention_count.to_string(),
-                        Style::default().fg(Color::Yellow),
-                    ),
-                ]),
+                Line::from(""),
+                Line::from(Span::styled("context", Style::default().fg(Color::DarkGray))),
+                Line::from(Span::styled(context_display, Style::default().fg(Color::White))),
                 Line::from(""),
                 Line::from(vec![
-                    Span::styled("Aliases: ", Style::default().fg(Color::Green)),
-                    Span::styled(
-                        aliases_display,
-                        Style::default().fg(Color::Gray),
-                    ),
+                    Span::styled("E", Style::default().fg(Color::White)),
+                    Span::styled(" edit  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("D", Style::default().fg(Color::White)),
+                    Span::styled(" delete  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("M", Style::default().fg(Color::White)),
+                    Span::styled(" merge  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("Esc", Style::default().fg(Color::White)),
+                    Span::styled(" close", Style::default().fg(Color::DarkGray)),
                 ]),
-                Line::from(""),
-                Line::from(vec![Span::styled(
-                    "Context:",
-                    Style::default().fg(Color::Green),
-                )]),
-                Line::from(vec![Span::styled(
-                    context_display,
-                    Style::default().fg(Color::White),
-                )]),
-                Line::from(""),
-                Line::from(""),
-                Line::from(vec![Span::styled(
-                    "Press ESC to close | E to edit | D to delete | M to merge",
-                    Style::default().fg(Color::Blue),
-                )]),
             ];
 
-            let detail_paragraph = Paragraph::new(content)
-                .style(Style::default().fg(Color::White))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(format!("Entity Details - {}", entity.canonical_name))
-                        .title_style(
-                            Style::default()
-                                .fg(ACCENT)
-                                .add_modifier(Modifier::BOLD),
-                        )
-                        .border_style(Style::default().fg(ACCENT)),
-                )
-                .wrap(Wrap { trim: true });
+            // Cap width so long context lines wrap rather than stretching to terminal edge
+            let max_w: u16 = lines.iter().map(|l| l.width() as u16).max().unwrap_or(0).max(36);
+            let content_width = max_w.min(60).min(area.width);
+            let left_pad = (area.width.saturating_sub(content_width)) / 2;
+            // top_pad uses a fixed line count — wrapping may add lines but that's fine;
+            // the content simply grows downward from a vertically centred starting point.
+            let line_count = lines.len() as u16;
+            let top_pad = (area.height.saturating_sub(line_count)) / 2;
+            let mut centered: Vec<Line> = Vec::new();
+            for _ in 0..top_pad { centered.push(Line::from("")); }
+            centered.append(&mut lines);
 
-            f.render_widget(detail_paragraph, popup_area);
+            f.render_widget(Clear, area);
+            let body = Rect { x: area.x + left_pad, width: content_width, ..area };
+            f.render_widget(Paragraph::new(centered).alignment(Alignment::Left).wrap(Wrap { trim: false }), body);
         }
     }
 
     pub(super) fn render_entity_add_popup(&self, f: &mut Frame, area: ratatui::layout::Rect) {
-        let popup_area = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Percentage(15),
-                Constraint::Percentage(70),
-                Constraint::Percentage(15),
-            ])
-            .split(area)[1];
-        let popup_area = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(15),
-                Constraint::Percentage(70),
-                Constraint::Percentage(15),
-            ])
-            .split(popup_area)[1];
-
-        f.render_widget(Clear, popup_area);
-
         let cursor = "\u{2588}";
-        let name_style = if self.entity_add_field == EntityEditField::Name {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        let context_style = if self.entity_add_field == EntityEditField::Context {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White)
-        };
+        let active = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
+        let inactive = Style::default().fg(Color::Indexed(242));
 
         let name_display = if self.entity_add_field == EntityEditField::Name {
             format!("{}{}", self.entity_add_name, cursor)
         } else if self.entity_add_name.is_empty() {
-            "(type a name)".to_string()
+            "\u{2014}".to_string()
         } else {
             self.entity_add_name.clone()
         };
+        let name_style = if self.entity_add_field == EntityEditField::Name { active } else { inactive };
+        let name_label_style = if self.entity_add_field == EntityEditField::Name { Style::default().fg(ACCENT).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::DarkGray) };
 
+        let type_focused = self.entity_add_field == EntityEditField::Type;
+        let type_label_style = if type_focused { Style::default().fg(ACCENT).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::DarkGray) };
         let type_display: Vec<Span> = ENTITY_TYPES.iter().map(|t| {
-            if *t == self.entity_add_type {
-                Span::styled(format!(" [{}] ", t), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
+            let is_selected = *t == self.entity_add_type;
+            if type_focused {
+                if is_selected {
+                    Span::styled(format!("[{}]  ", t), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
+                } else {
+                    Span::styled(format!("{}  ", t), Style::default().fg(Color::White))
+                }
             } else {
-                Span::styled(format!("  {}  ", t), Style::default().fg(Color::Gray))
+                if is_selected {
+                    Span::styled(format!("[{}]  ", t), Style::default().fg(Color::Indexed(242)))
+                } else {
+                    Span::styled(format!("{}  ", t), Style::default().fg(Color::Indexed(238)))
+                }
             }
         }).collect();
 
         let context_display = if self.entity_add_field == EntityEditField::Context {
             format!("{}{}", self.entity_add_context, cursor)
         } else if self.entity_add_context.is_empty() {
-            "(optional)".to_string()
+            "\u{2014}".to_string()
         } else {
             self.entity_add_context.clone()
         };
+        let context_style = if self.entity_add_field == EntityEditField::Context { active } else { inactive };
+        let context_label_style = if self.entity_add_field == EntityEditField::Context { Style::default().fg(ACCENT).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::DarkGray) };
 
-        let content = vec![
-            Line::from(vec![
-                Span::styled("Name: ", Style::default().fg(Color::Green)),
-            ]),
-            Line::from(vec![Span::styled(name_display, name_style)]),
+        let mut lines: Vec<Line> = vec![
+            Line::from(Span::styled("Add entity", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))),
             Line::from(""),
-            Line::from(vec![
-                Span::styled("Type: ", Style::default().fg(Color::Green)),
-            ]),
+            Line::from(Span::styled("name", name_label_style)),
+            Line::from(Span::styled(name_display, name_style)),
+            Line::from(""),
+            Line::from(Span::styled("type", type_label_style)),
             Line::from(type_display),
             Line::from(""),
-            Line::from(vec![
-                Span::styled("Context: ", Style::default().fg(Color::Green)),
-            ]),
-            Line::from(vec![Span::styled(context_display, context_style)]),
+            Line::from(Span::styled("context", context_label_style)),
+            Line::from(Span::styled(context_display, context_style)),
             Line::from(""),
             Line::from(vec![
-                Span::styled("Tab/\u{2191}\u{2193}: Switch Field | Space: Cycle Type | Enter: Save | Esc: Cancel", Style::default().fg(Color::DarkGray)),
+                Span::styled("↑↓", Style::default().fg(Color::White)),
+                Span::styled(" navigate  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Tab", Style::default().fg(Color::White)),
+                Span::styled(" cycle type  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Enter", Style::default().fg(Color::White)),
+                Span::styled(" save  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Esc", Style::default().fg(Color::White)),
+                Span::styled(" cancel", Style::default().fg(Color::DarkGray)),
             ]),
         ];
 
-        let add_paragraph = Paragraph::new(content)
-            .style(Style::default().fg(Color::White))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" ADD NEW ENTITY ")
-                    .title_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
-                    .border_style(Style::default().fg(Color::Yellow)),
-            )
-            .wrap(Wrap { trim: true });
+        let max_w: u16 = lines.iter().map(|l| l.width() as u16).max().unwrap_or(0).max(40);
+        let content_width = max_w.min(60).min(area.width);
+        let left_pad = (area.width.saturating_sub(content_width)) / 2;
+        let line_count = lines.len() as u16;
+        let top_pad = (area.height.saturating_sub(line_count)) / 2;
+        let mut centered: Vec<Line> = Vec::new();
+        for _ in 0..top_pad { centered.push(Line::from("")); }
+        centered.append(&mut lines);
 
-        f.render_widget(add_paragraph, popup_area);
+        f.render_widget(Clear, area);
+        let body = Rect { x: area.x + left_pad, width: content_width, ..area };
+        f.render_widget(Paragraph::new(centered).alignment(Alignment::Left).wrap(Wrap { trim: false }), body);
     }
 
     pub(super) fn render_entity_edit_popup(&self, f: &mut Frame, area: ratatui::layout::Rect) {
-        let popup_area = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Percentage(15),
-                Constraint::Percentage(70),
-                Constraint::Percentage(15),
-            ])
-            .split(area)[1];
-        let popup_area = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(15),
-                Constraint::Percentage(70),
-                Constraint::Percentage(15),
-            ])
-            .split(popup_area)[1];
-
-        f.render_widget(Clear, popup_area);
-
-        let name_style = if self.entity_edit_field == EntityEditField::Name {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        let context_style = if self.entity_edit_field == EntityEditField::Context {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White)
-        };
-
         let cursor = "\u{2588}";
+        let active = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
+        let inactive = Style::default().fg(Color::Indexed(242));
+
         let name_display = if self.entity_edit_field == EntityEditField::Name {
             format!("{}{}", self.entity_edit_name, cursor)
         } else {
             self.entity_edit_name.clone()
         };
+        let name_style = if self.entity_edit_field == EntityEditField::Name { active } else { inactive };
+        let name_label_style = if self.entity_edit_field == EntityEditField::Name { Style::default().fg(ACCENT).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::DarkGray) };
 
+        let type_focused = self.entity_edit_field == EntityEditField::Type;
+        let type_label_style = if type_focused { Style::default().fg(ACCENT).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::DarkGray) };
         let type_display: Vec<Span> = ENTITY_TYPES.iter().map(|t| {
-            if *t == self.entity_edit_type {
-                Span::styled(format!(" [{}] ", t), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
+            let is_selected = *t == self.entity_edit_type;
+            if type_focused {
+                if is_selected {
+                    Span::styled(format!("[{}]  ", t), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
+                } else {
+                    Span::styled(format!("{}  ", t), Style::default().fg(Color::White))
+                }
             } else {
-                Span::styled(format!("  {}  ", t), Style::default().fg(Color::Gray))
+                if is_selected {
+                    Span::styled(format!("[{}]  ", t), Style::default().fg(Color::Indexed(242)))
+                } else {
+                    Span::styled(format!("{}  ", t), Style::default().fg(Color::Indexed(238)))
+                }
             }
         }).collect();
 
         let context_display = if self.entity_edit_field == EntityEditField::Context {
             format!("{}{}", self.entity_edit_context, cursor)
+        } else if self.entity_edit_context.is_empty() {
+            "\u{2014}".to_string()
         } else {
-            if self.entity_edit_context.is_empty() { "(empty)".to_string() } else { self.entity_edit_context.clone() }
+            self.entity_edit_context.clone()
         };
+        let context_style = if self.entity_edit_field == EntityEditField::Context { active } else { inactive };
+        let context_label_style = if self.entity_edit_field == EntityEditField::Context { Style::default().fg(ACCENT).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::DarkGray) };
 
-        let content = vec![
+        let entity_name = self.selected_entity.as_ref()
+            .map(|e| e.canonical_name.as_str())
+            .unwrap_or("");
+
+        let mut lines: Vec<Line> = vec![
             Line::from(vec![
-                Span::styled("Name: ", Style::default().fg(Color::Green)),
+                Span::styled("Edit  ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+                Span::styled(entity_name, Style::default().fg(Color::White)),
             ]),
-            Line::from(vec![Span::styled(name_display, name_style)]),
             Line::from(""),
-            Line::from(vec![
-                Span::styled("Type: ", Style::default().fg(Color::Green)),
-            ]),
+            Line::from(Span::styled("name", name_label_style)),
+            Line::from(Span::styled(name_display, name_style)),
+            Line::from(""),
+            Line::from(Span::styled("type", type_label_style)),
             Line::from(type_display),
             Line::from(""),
+            Line::from(Span::styled("context", context_label_style)),
+            Line::from(Span::styled(context_display, context_style)),
+            Line::from(""),
             Line::from(vec![
-                Span::styled("Context: ", Style::default().fg(Color::Green)),
+                Span::styled("↑↓", Style::default().fg(Color::White)),
+                Span::styled(" navigate  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Tab", Style::default().fg(Color::White)),
+                Span::styled(" cycle type  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Enter", Style::default().fg(Color::White)),
+                Span::styled(" save  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Esc", Style::default().fg(Color::White)),
+                Span::styled(" cancel", Style::default().fg(Color::DarkGray)),
             ]),
-            Line::from(vec![Span::styled(context_display, context_style)]),
         ];
 
-        let edit_paragraph = Paragraph::new(content)
-            .style(Style::default().fg(Color::White))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Edit Entity")
-                    .title_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
-                    .border_style(Style::default().fg(Color::Yellow)),
-            )
-            .wrap(Wrap { trim: true });
+        let max_w: u16 = lines.iter().map(|l| l.width() as u16).max().unwrap_or(0).max(40);
+        let content_width = max_w.min(60).min(area.width);
+        let left_pad = (area.width.saturating_sub(content_width)) / 2;
+        let line_count = lines.len() as u16;
+        let top_pad = (area.height.saturating_sub(line_count)) / 2;
+        let mut centered: Vec<Line> = Vec::new();
+        for _ in 0..top_pad { centered.push(Line::from("")); }
+        centered.append(&mut lines);
 
-        f.render_widget(edit_paragraph, popup_area);
+        f.render_widget(Clear, area);
+        let body = Rect { x: area.x + left_pad, width: content_width, ..area };
+        f.render_widget(Paragraph::new(centered).alignment(Alignment::Left).wrap(Wrap { trim: false }), body);
     }
 
     pub(super) fn render_entity_delete_confirm(&self, f: &mut Frame, area: ratatui::layout::Rect) {

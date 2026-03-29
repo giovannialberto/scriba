@@ -42,16 +42,10 @@ impl Dashboard {
                 }
             }
             KeyCode::Up => {
-                self.previous_recording();
+                self.previous_recording().await?;
             }
             KeyCode::Down => {
-                self.next_recording();
-            }
-            KeyCode::PageUp | KeyCode::Char('[') => {
-                self.previous_page().await?;
-            }
-            KeyCode::PageDown | KeyCode::Char(']') => {
-                self.next_page().await?;
+                self.next_recording().await?;
             }
             KeyCode::Enter => match self.show_selected_transcript().await {
                 Ok(()) => {}
@@ -73,6 +67,9 @@ impl Dashboard {
                     self.show_message = true;
                 }
             },
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                self.execute_add_external_file().await?;
+            }
             KeyCode::Char('d') | KeyCode::Delete => {
                 self.show_delete_confirmation();
             }
@@ -142,33 +139,39 @@ impl Dashboard {
     pub(super) async fn handle_file_dialog_keys(&mut self, key_code: KeyCode) -> Result<DashboardAction> {
         match key_code {
             KeyCode::Esc => {
-                // Cancel file import
                 self.show_file_dialog = false;
                 self.file_path_input.clear();
                 self.file_name_input.clear();
                 self.file_dialog_stage = FileDialogStage::FilePath;
+                self.file_dialog_error = None;
                 Ok(DashboardAction::Continue)
             }
             KeyCode::Enter => {
                 match self.file_dialog_stage {
                     FileDialogStage::FilePath => {
-                        // Validate file path
                         if self.file_path_input.trim().is_empty() {
-                            self.notification_message = Some(("Please enter a file path".to_string(), 40));
+                            self.file_dialog_error = Some("Please enter a file path.".to_string());
                             return Ok(DashboardAction::Continue);
                         }
 
-                        // Check if file exists
-                        let file_path = PathBuf::from(self.file_path_input.trim());
-                        if !file_path.exists() {
-                            self.notification_message = Some(("File not found. Please check the path.".to_string(), 40));
+                        // Expand leading ~ to home directory
+                        let raw = self.file_path_input.trim();
+                        let expanded = if raw.starts_with("~/") {
+                            home_dir()
+                                .map(|h| h.join(&raw[2..]))
+                                .unwrap_or_else(|| PathBuf::from(raw))
+                        } else {
+                            PathBuf::from(raw)
+                        };
+
+                        if !expanded.exists() {
+                            self.file_dialog_error = Some("File not found. Check the path.".to_string());
                             return Ok(DashboardAction::Continue);
                         }
 
-                        // Move to name input stage
+                        self.file_dialog_error = None;
                         self.file_dialog_stage = FileDialogStage::FileName;
-                        // Pre-fill with file stem as default name
-                        if let Some(stem) = file_path.file_stem().and_then(|s| s.to_str()) {
+                        if let Some(stem) = expanded.file_stem().and_then(|s| s.to_str()) {
                             self.file_name_input = stem.to_string();
                         }
                     }
@@ -221,14 +224,26 @@ impl Dashboard {
         }
     }
 
-    pub(super) fn next_recording(&mut self) {
+    pub(super) async fn next_recording(&mut self) -> Result<()> {
         if self.recordings.is_empty() {
-            return;
+            return Ok(());
         }
         let i = match self.table_state.selected() {
             Some(i) => {
                 if i >= self.recordings.len() - 1 {
-                    0
+                    // At the last item on this page — try to advance to next page
+                    let old_page = self.current_page;
+                    self.current_page += 1;
+                    self.load_recordings()?;
+                    if self.recordings.is_empty() {
+                        // No next page — hard stop, stay exactly where we are
+                        self.current_page = old_page;
+                        self.load_recordings()?;
+                        self.table_state.select(Some(self.recordings.len() - 1));
+                    } else {
+                        self.table_state.select(Some(0));
+                    }
+                    return Ok(());
                 } else {
                     i + 1
                 }
@@ -236,16 +251,25 @@ impl Dashboard {
             None => 0,
         };
         self.table_state.select(Some(i));
+        Ok(())
     }
 
-    pub(super) fn previous_recording(&mut self) {
+    pub(super) async fn previous_recording(&mut self) -> Result<()> {
         if self.recordings.is_empty() {
-            return;
+            return Ok(());
         }
         let i = match self.table_state.selected() {
             Some(i) => {
                 if i == 0 {
-                    self.recordings.len() - 1
+                    // At the first item on this page — try to go back to previous page
+                    if self.current_page > 0 {
+                        self.current_page -= 1;
+                        self.load_recordings()?;
+                        let last = self.recordings.len().saturating_sub(1);
+                        self.table_state.select(Some(last));
+                    }
+                    // Already on page 0, item 0 — hard stop, do nothing
+                    return Ok(());
                 } else {
                     i - 1
                 }
@@ -253,28 +277,6 @@ impl Dashboard {
             None => 0,
         };
         self.table_state.select(Some(i));
-    }
-
-    pub(super) async fn next_page(&mut self) -> Result<()> {
-        // Try to load next page - if it has recordings, advance
-        let old_page = self.current_page;
-        self.current_page += 1;
-        self.load_recordings()?;
-
-        // If no recordings found on next page, go back to previous page
-        if self.recordings.is_empty() {
-            self.current_page = old_page;
-            self.load_recordings()?;
-        }
-
-        Ok(())
-    }
-
-    pub(super) async fn previous_page(&mut self) -> Result<()> {
-        if self.current_page > 0 {
-            self.current_page -= 1;
-            self.load_recordings()?;
-        }
         Ok(())
     }
 
@@ -508,7 +510,7 @@ impl Dashboard {
             area
         };
 
-        // Left side: ▸ scriba · v0.21.2 · N recordings · Xh Ym
+        // Left side: ▸ scriba · vX.Y.Z · N recordings · Xh Ym
         let version = env!("CARGO_PKG_VERSION");
         let rec_count = self.stats.as_ref().map(|s| s.total_recordings).unwrap_or(0);
         let total_secs = self.stats.as_ref().map(|s| s.total_duration_seconds).unwrap_or(0);
@@ -536,18 +538,29 @@ impl Dashboard {
             ));
         }
 
-        // Right side: shortcuts
-        let right_spans = vec![
+        // Right side: shortcuts + page indicator (only shown when >1 page)
+        let total_pages = if self.page_size > 0 {
+            ((rec_count as usize) + self.page_size - 1) / self.page_size
+        } else {
+            1
+        }.max(1);
+
+        let mut right_spans = vec![
             Span::styled("[", Style::default().fg(Color::DarkGray)),
             Span::styled("Tab", Style::default().fg(Color::White)),
             Span::styled("] Home  ", Style::default().fg(Color::DarkGray)),
             Span::styled("[", Style::default().fg(Color::DarkGray)),
             Span::styled("Ctrl+R", Style::default().fg(Color::White)),
-            Span::styled("] Record  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[", Style::default().fg(Color::DarkGray)),
-            Span::styled("/", Style::default().fg(Color::White)),
-            Span::styled("] Search ", Style::default().fg(Color::DarkGray)),
+            Span::styled("] Record", Style::default().fg(Color::DarkGray)),
         ];
+
+        if total_pages > 1 {
+            right_spans.push(Span::styled(
+                format!("  {}/{}", self.current_page + 1, total_pages),
+                Style::default().fg(Color::White),
+            ));
+        }
+        right_spans.push(Span::raw(" "));
 
         // Compute widths to fill gap
         let left_width: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
@@ -790,81 +803,76 @@ impl Dashboard {
     }
 
     pub(super) fn render_file_dialog_popup(&self, f: &mut Frame, area: ratatui::layout::Rect) {
-        let popup_area = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Percentage(25),
-                Constraint::Length(12),
-                Constraint::Percentage(65),
-            ])
-            .split(area)[1];
+        let current_step = match self.file_dialog_stage {
+            FileDialogStage::FilePath => 0usize,
+            FileDialogStage::FileName => 1,
+        };
+        let total_steps = 2usize;
 
-        let popup_area = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(15),
-                Constraint::Percentage(70),
-                Constraint::Percentage(15),
-            ])
-            .split(popup_area)[1];
-
-        f.render_widget(Clear, popup_area);
-
-        let (title, prompt, current_input, hint) = match self.file_dialog_stage {
+        let (prompt, current_input, hint) = match self.file_dialog_stage {
             FileDialogStage::FilePath => (
-                "Import Audio File - Step 1/2",
-                "Enter the full path to the audio file:",
+                "Path to audio file",
                 &self.file_path_input,
-                "Example: /path/to/your/audio.mp3 or ~/Downloads/recording.wav",
+                "e.g. ~/Downloads/recording.mp3",
             ),
             FileDialogStage::FileName => (
-                "Import Audio File - Step 2/2",
-                "Enter a display name for this recording:",
+                "Display name",
                 &self.file_name_input,
-                "This name will be shown in your recordings list",
+                "shown in your recordings list",
             ),
         };
 
-        let content = vec![
-            Line::from(vec![Span::styled(
-                prompt,
-                Style::default().fg(Color::White),
-            )]),
+        // Step dots (onboarding style)
+        let dots: Vec<Span> = (0..total_steps).map(|i| {
+            let (ch, color) = if i == current_step {
+                ("\u{25CF}", ACCENT)
+            } else if i < current_step {
+                ("\u{25CF}", Color::DarkGray)
+            } else {
+                ("\u{25CB}", Color::Indexed(237))
+            };
+            Span::styled(format!(" {} ", ch), Style::default().fg(color))
+        }).collect();
+
+        let mut lines: Vec<Line> = vec![
+            Line::from(Span::styled("Import audio", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))),
+            Line::from(dots),
             Line::from(""),
-            Line::from(vec![
-                Span::styled("Input: ", Style::default().fg(Color::Green)),
-                Span::styled(
-                    format!("{}_", current_input),
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]),
+            Line::from(Span::styled(prompt, Style::default().fg(Color::DarkGray))),
+            Line::from(Span::styled(
+                format!("{}\u{2588}", current_input),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            )),
             Line::from(""),
-            Line::from(vec![Span::styled(hint, Style::default().fg(Color::Gray))]),
-            Line::from(""),
-            Line::from(vec![Span::styled(
-                "Press ENTER to continue, ESC to cancel",
-                Style::default().fg(Color::Blue),
-            )]),
+            Line::from(Span::styled(hint, Style::default().fg(Color::Indexed(238)))),
         ];
 
-        let dialog_paragraph = Paragraph::new(content)
-            .style(Style::default().fg(Color::White))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(title)
-                    .title_style(
-                        Style::default()
-                            .fg(ACCENT)
-                            .add_modifier(Modifier::BOLD),
-                    )
-                    .border_style(Style::default().fg(ACCENT)),
-            )
-            .wrap(Wrap { trim: true });
+        // Inline error (shown instead of blank line when validation fails)
+        if let Some(ref err) = self.file_dialog_error {
+            lines.push(Line::from(Span::styled(err.as_str(), Style::default().fg(Color::Red))));
+        } else {
+            lines.push(Line::from(""));
+        }
 
-        f.render_widget(dialog_paragraph, popup_area);
+        lines.push(Line::from(vec![
+            Span::styled("Enter", Style::default().fg(Color::White)),
+            Span::styled(" continue  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc", Style::default().fg(Color::White)),
+            Span::styled(" cancel", Style::default().fg(Color::DarkGray)),
+        ]));
+
+        let max_w: u16 = lines.iter().map(|l| l.width() as u16).max().unwrap_or(0).max(40);
+        let content_width = max_w.min(area.width);
+        let left_pad = (area.width.saturating_sub(content_width)) / 2;
+        let line_count = lines.len() as u16;
+        let top_pad = (area.height.saturating_sub(line_count)) / 2;
+        let mut centered: Vec<Line> = Vec::new();
+        for _ in 0..top_pad { centered.push(Line::from("")); }
+        centered.append(&mut lines);
+
+        f.render_widget(Clear, area);
+        let body = Rect { x: area.x + left_pad, width: content_width, ..area };
+        f.render_widget(Paragraph::new(centered).alignment(Alignment::Left), body);
     }
 
     pub(super) fn render_message_popup(&self, f: &mut Frame, area: ratatui::layout::Rect) {
