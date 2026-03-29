@@ -1,3 +1,4 @@
+use crate::core::AudioPlayer;
 use crate::database::Recording;
 use anyhow::{Context, Result};
 use crossterm::event::KeyCode;
@@ -9,9 +10,6 @@ use ratatui::{
     Frame,
 };
 use std::path::PathBuf;
-use std::process::Stdio;
-use tokio::sync::mpsc;
-use tokio::process::Command as TokioCommand;
 use dirs::home_dir;
 
 use super::chat::ACCENT;
@@ -289,207 +287,20 @@ impl Dashboard {
                     .find_audio_file(recording)
                     .ok_or_else(|| anyhow!("Could not find an audio file for this recording"))?;
 
-                // Determine file extension to choose optimal players
-                let is_mp3 = audio_path
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .map(|ext| ext.to_lowercase() == "mp3")
-                    .unwrap_or(false);
+                // Use native rodio playback — no external tools needed
+                let player = AudioPlayer::play_file(&audio_path)?;
+                self.audio_player = Some(player);
 
-                // Candidate players differ by platform. For MP3 files, prioritize mpv/ffplay over afplay
-                #[cfg(target_os = "macos")]
-                let candidates: Vec<(&str, &[&str])> = if is_mp3 {
-                    vec![
-                        ("mpv", &["--really-quiet", "--audio-channels=stereo"]),
-                        (
-                            "ffplay",
-                            &["-nodisp", "-autoexit", "-loglevel", "quiet", "-ac", "2"],
-                        ),
-                        ("afplay", &[]), // Last resort for MP3
-                    ]
-                } else {
-                    vec![
-                        ("mpv", &["--really-quiet", "--audio-channels=stereo"]),
-                        (
-                            "ffplay",
-                            &["-nodisp", "-autoexit", "-loglevel", "quiet", "-ac", "2"],
-                        ),
-                        ("afplay", &[]), // Works well with WAV
-                    ]
-                };
-
-                #[cfg(all(unix, not(target_os = "macos")))]
-                let candidates: Vec<(&str, &[&str])> = vec![
-                    ("mpv", &["--really-quiet", "--audio-channels=stereo"]),
-                    (
-                        "ffplay",
-                        &["-nodisp", "-autoexit", "-loglevel", "quiet", "-ac", "2"],
-                    ),
-                    ("aplay", &["-c", "2"]), // Force stereo output
-                ];
-
-                #[cfg(target_os = "windows")]
-                let candidates: Vec<(&str, &[&str])> = vec![
-                    ("mpv", &["--really-quiet", "--audio-channels=stereo"]),
-                    (
-                        "ffplay",
-                        &["-nodisp", "-autoexit", "-loglevel", "quiet", "-ac", "2"],
-                    ),
-                    (
-                        "powershell",
-                        &["-NoProfile", "-Command", "(New-Object Media.SoundPlayer '"],
-                    ), // will be handled specially
-                ];
-
-                // Try each candidate until one spawns successfully
-                let mut launched_with: Option<String> = None;
-
-                #[cfg(not(target_os = "windows"))]
-                for (prog, base_args) in candidates {
-                    let mut cmd = TokioCommand::new(prog);
-                    // Detach from TTY so player doesn't consume keyboard (Esc) input
-                    cmd.stdin(Stdio::null())
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null());
-
-                    // For afplay on macOS, check if this is a mono WAV file and needs special handling
-                    if prog == "afplay" && recording.channels == 1 && !is_mp3 {
-                        // Create a temporary stereo version of the mono WAV file
-                        if let Ok(stereo_path) = self.create_stereo_temp_file(&audio_path).await {
-                            cmd.arg(stereo_path);
-                        } else {
-                            // Fallback to original mono file
-                            cmd.arg(&audio_path);
-                        }
-                    } else {
-                        for a in base_args {
-                            cmd.arg(a);
-                        }
-                        cmd.arg(&audio_path);
-                    }
-
-                    match cmd.spawn() {
-                        Ok(mut child) => {
-                            launched_with = Some(prog.to_string());
-
-                            // Store child process for potential termination - ensure we have a valid PID
-                            if let Some(child_id) = child.id() {
-                                // Store the process ID for killing on key press immediately
-                                self.current_playback_pid = Some(child_id);
-
-                                // Create channel for playback completion notification
-                                let (finished_tx, finished_rx) = mpsc::channel(1);
-                                self.playback_finished_rx = Some(finished_rx);
-
-                                tokio::spawn(async move {
-                                    let _ = child.wait().await;
-                                    let _ = finished_tx.send(()).await;
-                                });
-                                break;
-                            } else {
-                                // If we can't get PID, we can't control the process
-                                launched_with = None;
-                                continue;
-                            }
-                        }
-                        Err(e) => {
-                            // Store error for debugging if no player works
-                            if prog == "mpv" && is_mp3 {
-                                self.message = format!("mpv failed to play MP3: {}", e);
-                            }
-                        }
-                    }
-                }
-
-                #[cfg(target_os = "windows")]
-                {
-                    // Try standard players first (mpv, ffplay), then fallback to PowerShell
-                    for (prog, base_args) in &candidates[..candidates.len() - 1] {
-                        // All except powershell
-                        let mut cmd = TokioCommand::new(prog);
-                        // Detach from TTY so player doesn't consume keyboard (Esc) input
-                        cmd.stdin(Stdio::null())
-                            .stdout(Stdio::null())
-                            .stderr(Stdio::null());
-                        for a in base_args {
-                            cmd.arg(a);
-                        }
-                        cmd.arg(&audio_path);
-                        match cmd.spawn() {
-                            Ok(mut child) => {
-                                if let Some(child_id) = child.id() {
-                                    launched_with = Some(prog.to_string());
-                                    self.current_playback_pid = Some(child_id);
-
-                                    // Create channel for playback completion notification
-                                    let (finished_tx, finished_rx) = mpsc::channel(1);
-                                    self.playback_finished_rx = Some(finished_rx);
-
-                                    tokio::spawn(async move {
-                                        let _ = child.wait().await;
-                                        let _ = finished_tx.send(()).await;
-                                    });
-                                    break;
-                                }
-                            }
-                            Err(_e) => continue,
-                        }
-                    }
-
-                    // PowerShell SoundPlayer fallback if no other player worked
-                    if launched_with.is_none() {
-                        let escaped = audio_path.to_string_lossy().replace("'", "''");
-                        let ps =
-                            format!("$p=New-Object Media.SoundPlayer '{}';$p.Play();", escaped);
-                        let mut pscmd = TokioCommand::new("powershell");
-                        // Detach from TTY so player doesn't consume keyboard (Esc) input
-                        pscmd
-                            .stdin(Stdio::null())
-                            .stdout(Stdio::null())
-                            .stderr(Stdio::null());
-                        match pscmd.arg("-NoProfile").arg("-Command").arg(ps).spawn() {
-                            Ok(mut child) => {
-                                if let Some(child_id) = child.id() {
-                                    launched_with = Some("powershell".to_string());
-                                    self.current_playback_pid = Some(child_id);
-
-                                    // Create channel for playback completion notification
-                                    let (finished_tx, finished_rx) = mpsc::channel(1);
-                                    self.playback_finished_rx = Some(finished_rx);
-
-                                    tokio::spawn(async move {
-                                        let _ = child.wait().await;
-                                        let _ = finished_tx.send(()).await;
-                                    });
-                                }
-                            }
-                            Err(_e) => {}
-                        }
-                    }
-                }
-
-                if let Some(player) = launched_with {
-                    let name = recording
-                        .display_name
-                        .as_ref()
-                        .unwrap_or(&recording.directory_name);
-                    self.message = format!(
-                        "\u{25B6} Playing: {}\nUsing player: {}\n\nPress ESC to stop playback",
-                        name, player
-                    );
-                    self.show_message = true;
-                    return Ok(());
-                }
-
-                // If we reach here, no player succeeded
-                #[cfg(target_os = "macos")]
-                let hint = "Install `mpv` (brew install mpv) or ensure `afplay` is available.";
-                #[cfg(all(unix, not(target_os = "macos")))]
-                let hint = "Install `mpv` or `ffmpeg` (ffplay).";
-                #[cfg(target_os = "windows")]
-                let hint = "Ensure PowerShell is available or install a player like mpv.";
-
-                Err(anyhow!("No audio player found on PATH. {}", hint))
+                let name = recording
+                    .display_name
+                    .as_ref()
+                    .unwrap_or(&recording.directory_name);
+                self.message = format!(
+                    "\u{25B6} Playing: {}\n\nPress ESC to stop playback",
+                    name,
+                );
+                self.show_message = true;
+                Ok(())
             } else {
                 Ok(())
             }
@@ -553,8 +364,7 @@ impl Dashboard {
 
                     self.load_recordings()?;
                     self.load_stats()?;
-                    self.message = "Recording deleted.".to_string();
-                    self.show_message = true;
+                    self.notification_message = Some(("Recording deleted.".to_string(), 40));
                 }
                 Err(_e) => {
                     return Err(anyhow::anyhow!(
@@ -634,11 +444,7 @@ impl Dashboard {
             return;
         }
 
-        if self.show_message {
-            self.render_message_popup(f, size);
-            return;
-        }
-
+        // Full-screen replacements — these take over the entire view.
         if self.show_transcript {
             self.render_transcript_popup(f, size);
             return;
@@ -649,6 +455,8 @@ impl Dashboard {
             return;
         }
 
+        // Base browse view — always rendered so ratatui's diff-based renderer
+        // has a full-screen baseline when small popups are dismissed.
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -662,6 +470,11 @@ impl Dashboard {
 
         if self.search_mode {
             self.render_search_input(f, size);
+        }
+
+        // Small centered popup overlay on top of the browse list
+        if self.show_message {
+            self.render_message_popup(f, size);
         }
     }
 
@@ -1055,12 +868,24 @@ impl Dashboard {
     }
 
     pub(super) fn render_message_popup(&self, f: &mut Frame, area: ratatui::layout::Rect) {
+        // Calculate popup width (60% of terminal) and derive content height
+        let inner_width = (area.width as usize * 60 / 100).saturating_sub(2);
+        let content_lines = if inner_width > 0 {
+            self.message.lines().map(|line| {
+                let chars = line.len();
+                if chars == 0 { 1 } else { (chars + inner_width - 1) / inner_width }
+            }).sum::<usize>()
+        } else {
+            1
+        };
+        let popup_height = (content_lines as u16 + 2).max(5); // +2 for borders
+
         let popup_area = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Percentage(30),
-                Constraint::Length(5),
-                Constraint::Percentage(65),
+                Constraint::Length(popup_height),
+                Constraint::Min(0),
             ])
             .split(area)[1];
 

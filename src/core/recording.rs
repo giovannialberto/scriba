@@ -10,9 +10,11 @@ use tokio::signal;
 use tokio::sync::mpsc;
 
 use super::audio::{
-    convert_wav_to_mp3, create_encoder, AudioEncoder, AudioFormat, CompressionSettings,
+    convert_wav_to_mp3, create_encoder, merge_wav_files, AudioEncoder, AudioFormat,
+    CompressionSettings,
 };
 use super::files::FileManager;
+use super::loopback;
 use crate::database::{Database, Recording};
 use crate::utils::BASE_PATH;
 use chrono::Utc;
@@ -20,6 +22,45 @@ use chrono::Utc;
 /// RMS level below which we consider the mic dead (near-zero signal).
 /// Typical closed-lid / muted mic noise floor sits around 0.002-0.004.
 const SILENCE_THRESHOLD: f32 = 0.005;
+
+/// List all available audio input devices by name.
+pub fn list_input_devices() -> Result<Vec<String>> {
+    let host = cpal::default_host();
+    let devices = host.input_devices()
+        .map_err(|e| anyhow::anyhow!("Failed to enumerate input devices: {}", e))?;
+    let names: Vec<String> = devices
+        .filter_map(|d| d.name().ok())
+        .collect();
+    Ok(names)
+}
+
+/// Resolve an input device by name, falling back to the system default.
+/// If `device_name` is `Some`, searches all input devices for a substring match.
+pub fn resolve_input_device(device_name: Option<&str>) -> Result<cpal::Device> {
+    let host = cpal::default_host();
+
+    if let Some(name) = device_name {
+        let devices = host.input_devices()
+            .map_err(|e| anyhow::anyhow!("Failed to enumerate input devices: {}", e))?;
+        let name_lower = name.to_lowercase();
+        for device in devices {
+            if let Ok(dev_name) = device.name() {
+                if dev_name.to_lowercase().contains(&name_lower) {
+                    return Ok(device);
+                }
+            }
+        }
+        // No match found — warn and fall back to default
+        eprintln!(
+            "⚠️  Input device '{}' not found, falling back to system default. \
+             Use `scriba health --verbose` to list available devices.",
+            name
+        );
+    }
+
+    host.default_input_device()
+        .ok_or_else(|| anyhow::anyhow!("No input device available"))
+}
 
 /// Monitors audio input levels for real-time feedback during recording.
 pub struct AudioLevelMonitor {
@@ -84,6 +125,13 @@ pub struct RecordOptions {
     pub verbose: bool,
     /// If set, recording auto-stops after this duration of continuous silence.
     pub silence_timeout: Option<Duration>,
+    /// Preferred input device name. Substring-matched against available devices.
+    /// Falls back to system default if not found or not set.
+    pub input_device: Option<String>,
+    /// System audio loopback device name for capturing the other side of a call.
+    /// On macOS uses ScreenCaptureKit natively; on Linux uses PulseAudio/PipeWire
+    /// monitor sources. When set, both mic and system audio are recorded and merged.
+    pub loopback_device: Option<String>,
 }
 
 impl Default for RecordOptions {
@@ -94,6 +142,8 @@ impl Default for RecordOptions {
             level_tx: None,
             verbose: false,
             silence_timeout: None,
+            input_device: None,
+            loopback_device: None,
         }
     }
 }
@@ -191,11 +241,10 @@ fn record_core(
     silence_flag: Arc<AtomicBool>,
     last_callback_ms: Arc<AtomicU64>,
     wait_stop: Box<dyn FnOnce()>,
+    input_device_name: Option<String>,
+    loopback_device_name: Option<String>,
 ) -> Result<RecordingResult, anyhow::Error> {
-    let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or_else(|| anyhow::anyhow!("No input device available"))?;
+    let device = resolve_input_device(input_device_name.as_deref())?;
 
     let config = device
         .default_input_config()
@@ -208,6 +257,14 @@ fn record_core(
         std::fs::create_dir_all(parent)?;
     }
 
+    // When loopback is enabled, mic goes to a temp file; otherwise straight to recording.wav
+    let use_loopback = loopback_device_name.is_some();
+    let mic_wav_path = if use_loopback {
+        wav_file_path.with_file_name("mic_temp.wav")
+    } else {
+        wav_file_path.clone()
+    };
+
     let recording_settings = CompressionSettings {
         format: AudioFormat::Wav,
         sample_rate: config.sample_rate().0,
@@ -215,12 +272,38 @@ fn record_core(
         channels: config.channels(),
         speech_optimized: false,
     };
-    let encoder = create_encoder(&wav_file_path, &recording_settings)?;
+    let encoder = create_encoder(&mic_wav_path, &recording_settings)?;
     let encoder = Arc::new(Mutex::new(Some(encoder)));
+
+    // Start loopback capture if configured
+    let loopback_wav_path = wav_file_path.with_file_name("loopback_temp.wav");
+    let loopback_session = if use_loopback {
+        match loopback::start_loopback_capture(
+            loopback_device_name.as_deref(),
+            &loopback_wav_path,
+        ) {
+            Ok(session) => {
+                if verbose {
+                    println!("🔊 Loopback capture started (system audio)");
+                }
+                Some(session)
+            }
+            Err(e) => {
+                eprintln!(
+                    "⚠️  Loopback capture failed, recording mic only: {}",
+                    e
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let level_monitor = Arc::new(Mutex::new(AudioLevelMonitor::new()));
 
     if verbose {
+        let device_name = device.name().unwrap_or_else(|_| "Unknown".to_string());
         println!(
             "🎙️  Begin recording... (Press {} to stop)",
             if level_tx_opt.is_some() {
@@ -229,6 +312,7 @@ fn record_core(
                 "Ctrl+C"
             }
         );
+        println!("Input device: {}", device_name);
         println!("Device config: {:?}", config);
     }
 
@@ -306,8 +390,32 @@ fn record_core(
     let auto_stopped = silence_flag.load(Ordering::Relaxed);
     drop(stream);
 
+    // Finalize mic encoder
     if let Some(mut enc) = encoder.lock().unwrap().take() {
         enc.finalize()?;
+    }
+
+    // Finalize loopback and merge with mic audio
+    if let Some(session) = loopback_session {
+        session
+            .handle
+            .stop_and_finalize(&session.encoder)
+            .context("Failed to finalize loopback capture")?;
+
+        if verbose {
+            println!("🔀 Merging mic and system audio...");
+        }
+        merge_wav_files(&mic_wav_path, &loopback_wav_path, &wav_file_path)
+            .context("Failed to merge mic and loopback audio")?;
+
+        // Clean up temp files
+        let _ = std::fs::remove_file(&mic_wav_path);
+        let _ = std::fs::remove_file(&loopback_wav_path);
+    } else if use_loopback {
+        // Loopback was requested but failed to start — mic_temp.wav is all we have.
+        // Move it to the expected recording.wav path.
+        std::fs::rename(&mic_wav_path, &wav_file_path)
+            .context("Failed to rename mic temp file")?;
     }
 
     if needs_conversion {
@@ -448,6 +556,8 @@ pub async fn record_audio(output_path: PathBuf, options: RecordOptions) -> Resul
         silence_flag,
         last_callback_ms,
         wait_strategy,
+        options.input_device,
+        options.loopback_device,
     )
 }
 

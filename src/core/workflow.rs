@@ -137,6 +137,8 @@ impl WorkflowManager {
         let directory_name = generate_recording_name(config.name.clone());
         let recording_path = PathBuf::from(&directory_name);
 
+        let input_device = self.config.audio_settings.input_device.clone();
+        let loopback_device = self.config.audio_settings.loopback_device.clone();
         let final_directory_name = match mode {
             RecordingMode::Cli => {
                 let result = record_audio(
@@ -147,6 +149,8 @@ impl WorkflowManager {
                         level_tx: None,
                         verbose: true,
                         silence_timeout: None,
+                        input_device,
+                        loopback_device,
                     },
                 )
                 .await?;
@@ -161,6 +165,8 @@ impl WorkflowManager {
                         level_tx: Some(level_tx),
                         verbose: false,
                         silence_timeout,
+                        input_device,
+                        loopback_device,
                     },
                 )
                 .await?;
@@ -844,6 +850,27 @@ impl WorkflowManager {
             ));
         }
 
+        // Enumerate audio input devices
+        let input_devices = super::recording::list_input_devices().unwrap_or_default();
+        if input_devices.is_empty() {
+            issues.push("No audio input devices found".to_string());
+        }
+
+        let configured_device = self.config.audio_settings.input_device.clone();
+
+        // Detect loopback sources
+        let loopback_sources = super::loopback::detect_loopback_sources().unwrap_or_default();
+        let configured_loopback = self.config.audio_settings.loopback_device.clone();
+
+        if let Some(ref lb_device) = configured_loopback {
+            if !lb_device.is_empty() && loopback_sources.is_empty() {
+                warnings.push(format!(
+                    "Loopback device '{}' configured but no loopback sources detected",
+                    lb_device
+                ));
+            }
+        }
+
         let status = if issues.is_empty() {
             HealthStatusLevel::Healthy
         } else {
@@ -854,6 +881,10 @@ impl WorkflowManager {
             status,
             issues,
             warnings,
+            input_devices,
+            configured_device,
+            loopback_sources,
+            configured_loopback,
         })
     }
 }
@@ -1208,6 +1239,10 @@ pub struct HealthStatus {
     pub status: HealthStatusLevel,
     pub issues: Vec<String>,
     pub warnings: Vec<String>,
+    pub input_devices: Vec<String>,
+    pub configured_device: Option<String>,
+    pub loopback_sources: Vec<String>,
+    pub configured_loopback: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1242,6 +1277,53 @@ impl HealthStatus {
             println!("\n⚠️ Warnings:");
             for warning in &self.warnings {
                 println!("  - {}", warning);
+            }
+        }
+
+        if !self.input_devices.is_empty() {
+            println!("\n🎙️ Audio input devices:");
+            for device in &self.input_devices {
+                let marker = match &self.configured_device {
+                    Some(configured) if device.to_lowercase().contains(&configured.to_lowercase()) => " ← configured",
+                    _ => "",
+                };
+                println!("  - {}{}", device, marker);
+            }
+            if let Some(ref configured) = self.configured_device {
+                println!("\n  Configured device: \"{}\"", configured);
+            } else {
+                println!("\n  No device configured (using system default).");
+                println!("  To use a specific device (e.g. headphones), set it in config:");
+                println!("    Edit ~/scriba_recordings/config.json and set");
+                println!("    \"input_device\": \"<device name>\" in audio_settings,");
+                println!("    or pass --device \"<name>\" to `scriba record`.");
+            }
+        }
+
+        // Loopback sources
+        println!("\n🔊 System audio loopback:");
+        if self.loopback_sources.is_empty() {
+            #[cfg(target_os = "macos")]
+            println!("  ScreenCaptureKit not available (requires macOS 12.3+)");
+            #[cfg(target_os = "linux")]
+            println!("  No PulseAudio/PipeWire monitor sources found");
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            println!("  Loopback not supported on this platform");
+        } else {
+            for source in &self.loopback_sources {
+                println!("  - {}", source);
+            }
+        }
+        match &self.configured_loopback {
+            Some(d) if d.is_empty() => {
+                println!("  Loopback: enabled (auto-detect)");
+            }
+            Some(d) => {
+                println!("  Loopback: enabled (device: \"{}\")", d);
+            }
+            None => {
+                println!("  Loopback: disabled");
+                println!("  Enable with --loopback flag or set \"loopback_device\": \"\" in config.");
             }
         }
     }

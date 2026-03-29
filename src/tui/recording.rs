@@ -3,7 +3,7 @@ use crate::core::{
     TranscriptionMode, WorkflowManager, record_audio,
 };
 use crate::utils::generate_recording_name;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -237,6 +237,8 @@ impl Dashboard {
 
         // Use unified recording function with TUI control channels
         let output_path = PathBuf::from(&recording_name);
+        let input_device = self.config.audio_settings.input_device.clone();
+        let loopback_device = self.config.audio_settings.loopback_device.clone();
 
         self.recording_task = Some(tokio::spawn(async move {
             record_audio(
@@ -247,6 +249,8 @@ impl Dashboard {
                     level_tx: Some(level_tx),
                     verbose: false,
                     silence_timeout,
+                    input_device,
+                    loopback_device,
                 },
             )
             .await
@@ -265,192 +269,6 @@ impl Dashboard {
             transcription_mode,
         });
 
-        Ok(())
-    }
-
-    pub(super) async fn create_stereo_temp_file(
-        &self,
-        mono_file_path: &std::path::Path,
-    ) -> Result<std::path::PathBuf> {
-        use std::fs;
-
-        // Create a temporary file path for the stereo version
-        let temp_dir = std::env::temp_dir();
-        let temp_filename = format!(
-            "scriba_stereo_{}.wav",
-            mono_file_path
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-        );
-        let temp_path = temp_dir.join(temp_filename);
-
-        // Use Rust's hound crate to convert mono to stereo
-        let mono_reader =
-            hound::WavReader::open(mono_file_path).context("Failed to open mono audio file")?;
-
-        let spec = mono_reader.spec();
-
-        // Create stereo spec (2 channels)
-        let stereo_spec = hound::WavSpec {
-            channels: 2,
-            sample_rate: spec.sample_rate,
-            bits_per_sample: spec.bits_per_sample,
-            sample_format: spec.sample_format,
-        };
-
-        let mut stereo_writer = hound::WavWriter::create(&temp_path, stereo_spec)
-            .context("Failed to create stereo audio file")?;
-
-        // Convert samples based on format
-        match spec.sample_format {
-            hound::SampleFormat::Float => {
-                // 32-bit float samples
-                for sample in mono_reader.into_samples::<f32>() {
-                    match sample {
-                        Ok(s) => {
-                            // Write the same sample to both left and right channels
-                            stereo_writer.write_sample(s)?; // Left
-                            stereo_writer.write_sample(s)?; // Right
-                        }
-                        Err(e) => {
-                            return Err(anyhow::anyhow!("Error processing audio sample: {}", e))
-                        }
-                    }
-                }
-            }
-            hound::SampleFormat::Int => {
-                // Integer samples (16-bit or 24-bit)
-                if spec.bits_per_sample == 16 {
-                    for sample in mono_reader.into_samples::<i16>() {
-                        match sample {
-                            Ok(s) => {
-                                stereo_writer.write_sample(s)?; // Left
-                                stereo_writer.write_sample(s)?; // Right
-                            }
-                            Err(e) => {
-                                return Err(anyhow::anyhow!(
-                                    "Error processing audio sample: {}",
-                                    e
-                                ));
-                            }
-                        }
-                    }
-                } else if spec.bits_per_sample == 24 {
-                    for sample in mono_reader.into_samples::<i32>() {
-                        match sample {
-                            Ok(s) => {
-                                stereo_writer.write_sample(s)?; // Left
-                                stereo_writer.write_sample(s)?; // Right
-                            }
-                            Err(e) => {
-                                return Err(anyhow::anyhow!(
-                                    "Error processing audio sample: {}",
-                                    e
-                                ));
-                            }
-                        }
-                    }
-                } else {
-                    return Err(anyhow::anyhow!(
-                        "Unsupported bit depth: {}",
-                        spec.bits_per_sample
-                    ));
-                }
-            }
-        }
-
-        // Finalize the stereo file
-        stereo_writer
-            .finalize()
-            .context("Failed to finalize stereo audio file")?;
-
-        // Schedule cleanup of temp file after a delay
-        let temp_path_clone = temp_path.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
-            let _ = fs::remove_file(&temp_path_clone);
-        });
-
-        Ok(temp_path)
-    }
-
-    pub(super) fn stop_audio_playback(&self, pid: u32) -> Result<()> {
-        #[cfg(unix)]
-        {
-            use std::process::Command;
-            // Use SIGTERM first for graceful shutdown, then SIGKILL if needed
-            let _ = Command::new("kill")
-                .arg("-TERM")
-                .arg(pid.to_string())
-                .output();
-
-            // Give a very brief moment for graceful shutdown
-            std::thread::sleep(std::time::Duration::from_millis(10));
-
-            // Use SIGKILL immediately for faster termination (audio players can be stubborn)
-            let kill_result = Command::new("kill")
-                .arg("-KILL")
-                .arg(pid.to_string())
-                .output();
-
-            // Also try pkill in case the process spawned children
-            let _ = Command::new("pkill")
-                .arg("-P")
-                .arg(pid.to_string())
-                .output();
-
-            match kill_result {
-                Ok(_) => Ok(()),
-                Err(_e) => {
-                    // If direct kill fails, try killall on common audio players
-                    let _ = Command::new("killall")
-                        .arg("mpv")
-                        .arg("ffplay")
-                        .arg("afplay")
-                        .output();
-                    Ok(())
-                }
-            }
-        }
-
-        #[cfg(windows)]
-        {
-            use std::process::Command;
-            let _ = Command::new("taskkill")
-                .arg("/PID")
-                .arg(pid.to_string())
-                .arg("/F")
-                .output();
-            Ok(())
-        }
-    }
-
-    pub(super) fn emergency_stop_all_audio_players(&self) -> Result<()> {
-        // Kill all common audio players as a fallback when PID is not available
-        #[cfg(unix)]
-        {
-            use std::process::Command;
-            // Try to kill common audio players
-            let players = ["mpv", "ffplay", "afplay"];
-            for player in &players {
-                let _ = Command::new("killall").arg(player).output();
-            }
-        }
-
-        #[cfg(windows)]
-        {
-            use std::process::Command;
-            // Try to kill common audio players on Windows
-            let players = ["mpv.exe", "ffplay.exe"];
-            for player in &players {
-                let _ = Command::new("taskkill")
-                    .arg("/IM")
-                    .arg(player)
-                    .arg("/F")
-                    .output();
-            }
-        }
         Ok(())
     }
 

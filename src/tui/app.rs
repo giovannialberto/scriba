@@ -1,5 +1,5 @@
 use crate::core::{
-    EnrichmentMode, RecordingResult, ScribaConfig,
+    AudioPlayer, EnrichmentMode, RecordingResult, ScribaConfig,
     VoiceCommand, VoiceDetectorHandle, VoiceListeningState,
     start_voice_detector,
 };
@@ -55,8 +55,7 @@ pub struct Dashboard {
     pub(super) show_delete_confirm: bool,
     pub(super) delete_confirm_selection: usize,  // 0 = Yes, 1 = No
     pub(super) delete_candidate: Option<Recording>,
-    pub(super) current_playback_pid: Option<u32>,
-    pub(super) playback_finished_rx: Option<mpsc::Receiver<()>>, // Channel to receive playback completion
+    pub(super) audio_player: Option<AudioPlayer>, // Native rodio playback (replaces subprocess players)
     pub(super) last_transcribe_warning: Option<usize>, // Track which recording showed overwrite warning
     pub(super) progress_animation: Option<String>,     // Base message for progress animation
     pub(super) progress_frame: usize,                  // Animation frame counter
@@ -181,8 +180,7 @@ impl Dashboard {
             show_delete_confirm: false,
             delete_confirm_selection: 1, // default to No
             delete_candidate: None,
-            current_playback_pid: None,
-            playback_finished_rx: None,
+            audio_player: None,
             last_transcribe_warning: None,
             progress_animation: None,
             progress_frame: 0,
@@ -428,10 +426,11 @@ impl Dashboard {
             }
 
             // Check for playback completion
-            if let Some(finished_rx) = &mut self.playback_finished_rx {
-                if finished_rx.try_recv().is_ok() {
-                    self.current_playback_pid = None;
-                    self.playback_finished_rx = None;
+            if let Some(ref player) = self.audio_player {
+                if !player.is_playing() {
+                    self.audio_player = None;
+                    self.show_message = false;
+                    self.message.clear();
                 }
             }
 
@@ -838,25 +837,12 @@ impl Dashboard {
     async fn handle_key_event(&mut self, key_code: KeyCode, modifiers: crossterm::event::KeyModifiers) -> Result<DashboardAction> {
         // If audio is playing and ESC is pressed, stop it immediately
         if matches!(key_code, KeyCode::Esc) {
-            // Check if we're in audio playback mode (either with PID or with playback message)
-            let is_playing_audio = self.current_playback_pid.is_some()
-                || (self.show_message && self.message.contains("Playing:"));
-
-            if is_playing_audio {
-                // Try both methods to ensure reliable stopping
-                if let Some(pid) = self.current_playback_pid {
-                    self.stop_audio_playback(pid)?;
+            if self.audio_player.is_some() {
+                if let Some(player) = self.audio_player.take() {
+                    player.stop();
                 }
-                // Also use emergency stop as a fallback (in case PID method fails)
-                self.emergency_stop_all_audio_players()?;
-
-                // Clear playback state
-                self.current_playback_pid = None;
-                self.playback_finished_rx = None;
                 self.show_message = false;
                 self.message.clear();
-
-                // Audio playback stops immediately - return to dashboard
                 return Ok(DashboardAction::Continue);
             }
         }
@@ -1288,7 +1274,7 @@ impl Dashboard {
         } else {
             // Start voice detector
             let (tx, rx) = mpsc::channel(8);
-            match start_voice_detector(&self.config.voice, tx).await {
+            match start_voice_detector(&self.config.voice, tx, self.config.audio_settings.input_device.as_deref()).await {
                 Ok(handle) => {
                     self.voice_detector_handle = Some(handle);
                     self.voice_command_rx = Some(rx);

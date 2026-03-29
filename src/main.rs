@@ -71,6 +71,21 @@ enum Command {
             help = "Use speech-optimized compression settings"
         )]
         speech_optimized: bool,
+        #[structopt(
+            long = "device",
+            help = "Input device name (substring match). Use `scriba health --verbose` to list devices"
+        )]
+        device: Option<String>,
+        #[structopt(
+            long = "loopback",
+            help = "Enable system audio loopback capture (records both mic and system audio)"
+        )]
+        loopback: bool,
+        #[structopt(
+            long = "loopback-device",
+            help = "Loopback device name hint (Linux only). On macOS ScreenCaptureKit is used automatically"
+        )]
+        loopback_device: Option<String>,
         #[structopt(long = "local", help = "Force local transcription (overrides config)")]
         force_local: bool,
         #[structopt(
@@ -319,6 +334,9 @@ async fn main() -> Result<()> {
                     bitrate,
                     channels,
                     speech_optimized,
+                    device,
+                    loopback,
+                    loopback_device,
                     force_local,
                     model,
                     api_key,
@@ -333,7 +351,7 @@ async fn main() -> Result<()> {
                     };
 
                     // Load config and resolve transcription mode
-                    let config = ScribaConfig::load()?;
+                    let mut config = ScribaConfig::load()?;
                     let transcription_mode = if skip_transcription {
                         None
                     } else {
@@ -345,8 +363,22 @@ async fn main() -> Result<()> {
                         )?)
                     };
 
+                    // Apply CLI device override
+                    if device.is_some() {
+                        config.audio_settings.input_device = device;
+                    }
+
+                    // Apply CLI loopback override
+                    if loopback {
+                        // --loopback flag enables it; --loopback-device sets a specific hint
+                        config.audio_settings.loopback_device =
+                            Some(loopback_device.unwrap_or_default());
+                    } else if loopback_device.is_some() {
+                        config.audio_settings.loopback_device = loopback_device;
+                    }
+
                     // Use unified workflow
-                    let mut workflow = WorkflowManager::new()?;
+                    let mut workflow = WorkflowManager::with_config(config)?;
                     let _recording = workflow
                         .record_cli(
                             name,
@@ -426,6 +458,18 @@ async fn main() -> Result<()> {
                             println!(
                                 "  Speech Optimized: {}",
                                 config.audio_settings.speech_optimized
+                            );
+                            println!(
+                                "  Input Device: {}",
+                                config.audio_settings.input_device.as_deref().unwrap_or("(system default)")
+                            );
+                            println!(
+                                "  Loopback: {}",
+                                match &config.audio_settings.loopback_device {
+                                    Some(d) if d.is_empty() => "enabled (auto-detect)".to_string(),
+                                    Some(d) => format!("enabled ({})", d),
+                                    None => "disabled".to_string(),
+                                }
                             );
                         }
                         Ok(())

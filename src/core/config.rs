@@ -463,6 +463,18 @@ pub struct AudioSettings {
     pub bitrate: u32,
     pub channels: u16,
     pub speech_optimized: bool,
+    /// Preferred input device name. When set, Scriba will try to use this device
+    /// instead of the system default. Useful for headphone/external microphones.
+    /// Use `scriba health --verbose` to list available devices.
+    #[serde(default)]
+    pub input_device: Option<String>,
+    /// System audio loopback device for capturing the other side of a call.
+    /// On macOS, set to "screencapturekit" (or omit) to use the native
+    /// ScreenCaptureKit API. On Linux, set to a PulseAudio/PipeWire monitor
+    /// source name (e.g. "Monitor of Built-in Audio").
+    /// Use `scriba health --verbose` to detect available loopback sources.
+    #[serde(default)]
+    pub loopback_device: Option<String>,
 }
 
 impl Default for ScribaConfig {
@@ -476,6 +488,8 @@ impl Default for ScribaConfig {
                 bitrate: 128,
                 channels: 1,
                 speech_optimized: true,
+                input_device: None,
+                loopback_device: None,
             },
             last_api_key: None,
             enrichment: EnrichmentConfig::default(),

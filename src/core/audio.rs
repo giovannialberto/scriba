@@ -219,3 +219,151 @@ pub fn convert_wav_to_mp3(
 
     Ok(())
 }
+
+/// Merge a microphone WAV and a loopback WAV into a single mono WAV.
+///
+/// Handles sample rate mismatches (resamples loopback to match mic via rubato),
+/// channel count mismatches (downmixes stereo to mono), and different lengths
+/// (pads the shorter file with silence). No external tools needed.
+pub fn merge_wav_files(
+    mic_wav: &Path,
+    loopback_wav: &Path,
+    output_wav: &Path,
+) -> Result<()> {
+    let mut mic_reader =
+        hound::WavReader::open(mic_wav).context("Failed to open mic WAV for merge")?;
+    let mut lb_reader =
+        hound::WavReader::open(loopback_wav).context("Failed to open loopback WAV for merge")?;
+
+    let mic_spec = mic_reader.spec();
+    let lb_spec = lb_reader.spec();
+
+    let mic_rate = mic_spec.sample_rate;
+    let lb_rate = lb_spec.sample_rate;
+
+    // Read all samples as f32
+    let mic_samples: Vec<f32> = read_samples_as_f32(&mut mic_reader)?;
+    let lb_samples_raw: Vec<f32> = read_samples_as_f32(&mut lb_reader)?;
+
+    // Downmix loopback to mono if stereo
+    let lb_mono = if lb_spec.channels > 1 {
+        downmix_to_mono(&lb_samples_raw, lb_spec.channels)
+    } else {
+        lb_samples_raw
+    };
+
+    // Downmix mic to mono if stereo
+    let mic_mono = if mic_spec.channels > 1 {
+        downmix_to_mono(&mic_samples, mic_spec.channels)
+    } else {
+        mic_samples
+    };
+
+    // Resample loopback to match mic sample rate if different
+    let lb_resampled = if lb_rate != mic_rate {
+        resample_mono(&lb_mono, lb_rate, mic_rate)?
+    } else {
+        lb_mono
+    };
+
+    // Mix: add samples with clamping, pad shorter with silence
+    let max_len = mic_mono.len().max(lb_resampled.len());
+    let mut mixed = Vec::with_capacity(max_len);
+    for i in 0..max_len {
+        let s1 = if i < mic_mono.len() { mic_mono[i] } else { 0.0 };
+        let s2 = if i < lb_resampled.len() {
+            lb_resampled[i]
+        } else {
+            0.0
+        };
+        mixed.push((s1 + s2).clamp(-1.0, 1.0));
+    }
+
+    // Write merged mono WAV
+    let out_spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: mic_rate,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+    let mut writer =
+        hound::WavWriter::create(output_wav, out_spec).context("Failed to create merged WAV")?;
+    for sample in &mixed {
+        writer
+            .write_sample(*sample)
+            .context("Failed to write merged sample")?;
+    }
+    writer.finalize().context("Failed to finalize merged WAV")?;
+
+    Ok(())
+}
+
+/// Read all samples from a WAV reader as f32, regardless of the source format.
+fn read_samples_as_f32(reader: &mut hound::WavReader<std::io::BufReader<std::fs::File>>) -> Result<Vec<f32>> {
+    let spec = reader.spec();
+    match spec.sample_format {
+        hound::SampleFormat::Float => {
+            let samples: Result<Vec<f32>, _> = reader.samples::<f32>().collect();
+            Ok(samples.context("Failed to read f32 samples")?)
+        }
+        hound::SampleFormat::Int => {
+            match spec.bits_per_sample {
+                16 => {
+                    let samples: Result<Vec<f32>, _> = reader
+                        .samples::<i16>()
+                        .map(|s| s.map(|v| v as f32 / 32768.0))
+                        .collect();
+                    Ok(samples.context("Failed to read i16 samples")?)
+                }
+                32 => {
+                    let samples: Result<Vec<f32>, _> = reader
+                        .samples::<i32>()
+                        .map(|s| s.map(|v| v as f32 / 2147483648.0))
+                        .collect();
+                    Ok(samples.context("Failed to read i32 samples")?)
+                }
+                bits => Err(anyhow::anyhow!("Unsupported WAV bit depth: {}", bits)),
+            }
+        }
+    }
+}
+
+/// Downmix interleaved multi-channel audio to mono by averaging channels.
+fn downmix_to_mono(samples: &[f32], channels: u16) -> Vec<f32> {
+    let ch = channels as usize;
+    samples
+        .chunks_exact(ch)
+        .map(|frame| frame.iter().sum::<f32>() / ch as f32)
+        .collect()
+}
+
+/// Resample mono audio via linear interpolation.
+///
+/// For merging two audio streams that may differ in sample rate (e.g. 44100 vs 48000),
+/// linear interpolation provides adequate quality without external dependencies.
+fn resample_mono(samples: &[f32], from_rate: u32, to_rate: u32) -> Result<Vec<f32>> {
+    if from_rate == to_rate {
+        return Ok(samples.to_vec());
+    }
+
+    let ratio = from_rate as f64 / to_rate as f64;
+    let out_len = ((samples.len() as f64) / ratio).ceil() as usize;
+    let mut output = Vec::with_capacity(out_len);
+
+    for i in 0..out_len {
+        let src_pos = i as f64 * ratio;
+        let idx = src_pos as usize;
+        let frac = (src_pos - idx as f64) as f32;
+
+        let sample = if idx + 1 < samples.len() {
+            samples[idx] * (1.0 - frac) + samples[idx + 1] * frac
+        } else if idx < samples.len() {
+            samples[idx]
+        } else {
+            0.0
+        };
+        output.push(sample);
+    }
+
+    Ok(output)
+}

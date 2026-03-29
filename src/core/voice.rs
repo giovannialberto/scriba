@@ -4,7 +4,7 @@
 //! energy-based VAD + whisper-tiny, then emits commands to the TUI.
 
 use anyhow::{Context, Result};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::{DeviceTrait, StreamTrait};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -14,7 +14,7 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 
 use super::audio::{create_encoder, AudioEncoder, AudioFormat, CompressionSettings};
 use super::config::{LocalModelSize, VoiceConfig};
-use super::recording::AudioLevelMonitor;
+use super::recording::{resolve_input_device, AudioLevelMonitor};
 use super::ring_buffer::RingBuffer;
 use super::transcription::{ensure_model_path_local, ensure_whisper_logs_suppressed};
 use crate::utils::BASE_PATH;
@@ -157,18 +157,20 @@ impl VoiceDetectorHandle {
 /// Opens the default audio input device, listens for speech using VAD,
 /// and runs whisper-tiny on detected speech chunks to identify wake phrases.
 /// Sends `VoiceCommand` messages through the provided channel.
+///
+/// Note: Voice mode operates on a single mic stream for VAD/wake-word detection.
+/// System audio loopback capture is used only during standard recordings (see
+/// `recording.rs` and `loopback.rs`), not during voice detection.
 pub async fn start_voice_detector(
     config: &VoiceConfig,
     command_tx: mpsc::Sender<VoiceCommand>,
+    input_device_name: Option<&str>,
 ) -> Result<VoiceDetectorHandle> {
     // Ensure whisper-tiny model is available
     let model_path = ensure_model_path_local(LocalModelSize::Tiny, true).await?;
     ensure_whisper_logs_suppressed();
 
-    let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or_else(|| anyhow::anyhow!("No input device available for voice detection"))?;
+    let device = resolve_input_device(input_device_name)?;
     let device_config = device
         .default_input_config()
         .map_err(|e| anyhow::anyhow!("Failed to get default input config: {}", e))?;
