@@ -1,5 +1,5 @@
 use crate::core::{
-    CloudProvider, EnrichmentMode, LocalModelSize, ScribaConfig, TranscriptionMode,
+    CloudProvider, EnrichmentMode, LocalModelSize, TranscriptionMode,
 };
 use crate::enrichment::OllamaClient;
 use anyhow::Result;
@@ -15,6 +15,29 @@ use tokio::sync::mpsc;
 
 use super::app::{Dashboard, DashboardAction, DashboardView};
 use super::chat::ACCENT;
+
+// ─── Settings index layout ───────────────────────────────────────────────────
+//
+// Index 0 is always the mode toggle. Mode-specific items follow (3 for Private,
+// 4 for Cloud), then 6 shared items (Recording, Diarization, Voice).
+
+const IDX_MODE: usize = 0;
+/// Number of mode-specific items in Private mode (Whisper Model, Ollama Model, Ollama Server).
+const PRIVATE_MODE_ITEMS: usize = 3;
+/// Number of mode-specific items in Cloud mode (Whisper API Key, LLM Provider, Model, Provider API Key).
+const CLOUD_MODE_ITEMS: usize = 4;
+/// Number of shared items (Auto-Stop, Timeout, Diarization, Max Speakers, Voice, Sensitivity).
+const SHARED_ITEMS: usize = 6;
+
+/// First shared-section index for a given mode.
+fn shared_offset(is_private: bool) -> usize {
+    1 + if is_private { PRIVATE_MODE_ITEMS } else { CLOUD_MODE_ITEMS }
+}
+
+/// Maximum selectable index for a given mode.
+fn max_index(is_private: bool) -> usize {
+    shared_offset(is_private) + SHARED_ITEMS - 1
+}
 
 // ─── Settings types ──────────────────────────────────────────────────────────
 
@@ -40,9 +63,7 @@ impl Dashboard {
     }
 
     pub(super) fn save_enrichment_config(&mut self) -> Result<()> {
-        self.config.save()?;
-        self.config = ScribaConfig::load()?;
-        Ok(())
+        self.config.save()
     }
 
     pub(super) fn close_model_picker(&mut self) {
@@ -105,12 +126,10 @@ impl Dashboard {
     }
 
     pub(super) async fn handle_settings_keys(&mut self, key_code: KeyCode) -> Result<DashboardAction> {
-        // Max settings index: 0=Mode, 1=ModeSpecific,
-        //                    2=EnrichProvider, 3=EnrichModel, 4=EnrichKeyOrEndpoint,
-        //                    5=SilenceAutoStop, 6=SilenceTimeout,
-        //                    7=Diarization, 8=MaxSpeakers,
-        //                    9=VoiceMode, 10=VoiceSensitivity
-        let max_index = 10;
+        // Dual-mode settings layout:
+        let is_private = self.config.is_private_mode();
+        let max_idx = max_index(is_private);
+        let shared_off = shared_offset(is_private);
 
         match key_code {
             KeyCode::Esc => {
@@ -142,25 +161,21 @@ impl Dashboard {
                         );
                     }
                 } else if !self.is_editing_settings_field() {
-                    self.settings_selection = std::cmp::min(self.settings_selection + 1, max_index);
+                    self.settings_selection = std::cmp::min(self.settings_selection + 1, max_idx);
                 }
                 Ok(DashboardAction::Continue)
             }
             KeyCode::Enter => {
+                // Handle active editing states first (these are mode-independent)
                 if self.editing_api_key {
-                    // Save API key
+                    // Save OpenAI transcription API key
                     let new_mode = TranscriptionMode::Api {
                         api_key: self.api_key_input.clone(),
                     };
-                    match self.config.set_transcription_mode(new_mode) {
-                        Ok(()) => {
-                            self.config = ScribaConfig::load()?;
-                        }
-                        Err(e) => {
-                            self.message = format!("Failed to save API key: {}", e);
-                            self.show_message = true;
-                            self.return_to_view = Some(DashboardView::Settings);
-                        }
+                    if let Err(e) = self.config.set_transcription_mode(new_mode) {
+                        self.message = format!("Failed to save API key: {}", e);
+                        self.show_message = true;
+                        self.return_to_view = Some(DashboardView::Settings);
                     }
                     self.editing_api_key = false;
                     self.api_key_input.clear();
@@ -169,7 +184,6 @@ impl Dashboard {
                         if item.display_name == "Loading..." {
                             // no-op while loading
                         } else if let Some(ref id) = item.model_id {
-                            // Selected a concrete model — save it
                             let new_model = id.clone();
                             match &mut self.config.enrichment.mode {
                                 EnrichmentMode::Cloud { model, .. } => {
@@ -186,7 +200,6 @@ impl Dashboard {
                             }
                             self.close_model_picker();
                         } else {
-                            // "Custom..." sentinel — switch to custom text entry
                             self.model_picker_state = ModelPickerState::EditingCustom;
                             self.model_picker_custom_input = self.config.enrichment.model_name().to_string();
                         }
@@ -223,7 +236,9 @@ impl Dashboard {
                     self.enrichment_endpoint_input.clear();
                 } else if self.editing_enrichment_api_key {
                     let new_key = self.enrichment_api_key_input.trim().to_string();
-                    // Clone the provider before mutating
+                    // Update both the inline api_key (authoritative at runtime, read by
+                    // resolve_api_key) and the per-provider map (for cross-provider
+                    // persistence when cycling providers).
                     let provider_clone = self.config.enrichment.cloud_provider().cloned();
                     if let EnrichmentMode::Cloud { api_key, .. } = &mut self.config.enrichment.mode {
                         *api_key = new_key.clone();
@@ -239,38 +254,63 @@ impl Dashboard {
                     self.editing_enrichment_api_key = false;
                     self.enrichment_api_key_input.clear();
                 } else {
-                    match self.settings_selection {
-                        0 => {
-                            // Toggle transcription mode
-                            let new_mode = match &self.config.transcription {
-                                TranscriptionMode::Local { .. } => {
-                                    let api_key = self
-                                        .config
-                                        .last_api_key
-                                        .as_ref()
-                                        .cloned()
-                                        .unwrap_or_default();
-                                    TranscriptionMode::Api { api_key }
-                                }
-                                TranscriptionMode::Api { .. } => TranscriptionMode::Local {
-                                    model_size: LocalModelSize::Medium,
-                                },
+                    let idx = self.settings_selection;
+
+                    if idx == IDX_MODE {
+                        // ── Atomic mode switch (Private ↔ Cloud) ────────
+                        // Build new config on a clone so the original stays
+                        // consistent if save() fails.
+                        self.close_model_picker();
+                        let mut new_cfg = self.config.clone();
+                        if is_private {
+                            // Private → Cloud
+                            new_cfg.enrichment.last_ollama_endpoint = Some(new_cfg.enrichment.ollama_endpoint());
+                            new_cfg.enrichment.last_ollama_model = Some(new_cfg.enrichment.ollama_model());
+                            let provider = new_cfg.last_cloud_provider.clone().unwrap_or(CloudProvider::Anthropic);
+                            let transcription_key = new_cfg.last_api_key.clone().unwrap_or_default();
+                            let enrichment_key = new_cfg.enrichment.load_key_for_provider(&provider);
+                            let enrichment_model = new_cfg.enrichment.load_model_for_provider(&provider);
+                            new_cfg.enrichment.mode = EnrichmentMode::Cloud {
+                                provider,
+                                api_key: enrichment_key,
+                                model: enrichment_model,
                             };
-                            match self.config.set_transcription_mode(new_mode) {
-                                Ok(()) => {
-                                    self.config = ScribaConfig::load()?;
-                                    self.settings_selection = 0;
-                                }
-                                Err(e) => {
-                                    self.message = format!("Failed to change mode: {}", e);
-                                    self.show_message = true;
-                                    self.return_to_view = Some(DashboardView::Settings);
-                                }
+                            // set_transcription_mode preserves last_local_model_size & last_api_key, then saves
+                            new_cfg.set_transcription_mode(TranscriptionMode::Api { api_key: transcription_key })?;
+                        } else {
+                            // Cloud → Private
+                            if let Some(p) = new_cfg.enrichment.cloud_provider().cloned() {
+                                new_cfg.last_cloud_provider = Some(p.clone());
+                                let key = new_cfg.enrichment.api_key().unwrap_or("").to_string();
+                                new_cfg.enrichment.save_key_for_provider(&p, &key);
+                                let model = match &new_cfg.enrichment.mode {
+                                    EnrichmentMode::Cloud { model, .. } => model.clone(),
+                                    _ => None,
+                                };
+                                new_cfg.enrichment.save_model_for_provider(&p, &model);
                             }
+                            let model_size = new_cfg.last_local_model_size.unwrap_or(LocalModelSize::Medium);
+                            let ep = new_cfg.enrichment.last_ollama_endpoint.clone()
+                                .unwrap_or_else(|| "http://localhost:11434".to_string());
+                            let mdl = new_cfg.enrichment.last_ollama_model.clone()
+                                .unwrap_or_else(|| "mistral:latest".to_string());
+                            new_cfg.enrichment.mode = EnrichmentMode::Local {
+                                ollama_endpoint: ep,
+                                ollama_model: mdl,
+                            };
+                            // set_transcription_mode preserves last_api_key & last_local_model_size, then saves
+                            new_cfg.set_transcription_mode(TranscriptionMode::Local { model_size })?;
                         }
-                        1 => {
-                            match &self.config.transcription {
-                                TranscriptionMode::Local { model_size } => {
+                        // Save succeeded — adopt the new config
+                        self.config = new_cfg;
+                        self.settings_selection = IDX_MODE;
+
+                    } else if idx < shared_off {
+                        // ── Mode-specific items ─────────────────────────
+                        match (idx, is_private) {
+                            (1, true) => {
+                                // Cycle Whisper model size
+                                if let TranscriptionMode::Local { model_size } = &self.config.transcription {
                                     let new_model = match model_size {
                                         LocalModelSize::Tiny => LocalModelSize::Base,
                                         LocalModelSize::Base => LocalModelSize::Small,
@@ -279,197 +319,153 @@ impl Dashboard {
                                         LocalModelSize::Large => LocalModelSize::Turbo,
                                         LocalModelSize::Turbo => LocalModelSize::Tiny,
                                     };
-                                    let new_mode = TranscriptionMode::Local {
-                                        model_size: new_model,
-                                    };
-                                    match self.config.set_transcription_mode(new_mode) {
-                                        Ok(()) => {
-                                            self.config = ScribaConfig::load()?;
-                                        }
-                                        Err(e) => {
-                                            self.message =
-                                                format!("Failed to change model: {}", e);
-                                            self.show_message = true;
-                                            self.return_to_view = Some(DashboardView::Settings);
-                                        }
+                                    let new_mode = TranscriptionMode::Local { model_size: new_model };
+                                    if let Err(e) = self.config.set_transcription_mode(new_mode) {
+                                        self.message = format!("Failed to change model: {}", e);
+                                        self.show_message = true;
+                                        self.return_to_view = Some(DashboardView::Settings);
                                     }
-                                }
-                                TranscriptionMode::Api { .. } => {
-                                    self.editing_api_key = true;
-                                    self.api_key_input = match &self.config.transcription {
-                                        TranscriptionMode::Api { api_key } => api_key.clone(),
-                                        _ => String::new(),
-                                    };
                                 }
                             }
-                        }
-                        2 => {
-                            // Enrichment Provider — cycle: Anthropic → OpenAI → Google → Ollama → Anthropic
-                            // Close picker if open (prevents stale state)
-                            self.close_model_picker();
-                            // Clone current state to avoid borrow issues
-                            let (cur_provider, cur_key, cur_ollama) = match &self.config.enrichment.mode {
-                                EnrichmentMode::Cloud { provider, api_key, .. } => {
-                                    (Some(provider.clone()), api_key.clone(), None)
-                                }
-                                EnrichmentMode::Local { ollama_endpoint, ollama_model } => {
-                                    (None, String::new(), Some((ollama_endpoint.clone(), ollama_model.clone())))
-                                }
-                            };
-                            // Save current settings before switching
-                            if let Some(ref p) = cur_provider {
-                                self.config.enrichment.save_key_for_provider(p, &cur_key);
+                            (2, true) => {
+                                // Open Ollama model picker
+                                self.open_model_picker();
                             }
-                            if let Some((ref ep, ref mdl)) = cur_ollama {
-                                self.config.enrichment.last_ollama_endpoint = Some(ep.clone());
-                                self.config.enrichment.last_ollama_model = Some(mdl.clone());
-                            }
-                            let new_mode = match cur_provider {
-                                Some(CloudProvider::Anthropic) => {
-                                    let next_key = self.config.enrichment.load_key_for_provider(&CloudProvider::OpenAI);
-                                    EnrichmentMode::Cloud {
-                                        provider: CloudProvider::OpenAI,
-                                        api_key: next_key,
-                                        model: None,
-                                    }
-                                }
-                                Some(CloudProvider::OpenAI) => {
-                                    let next_key = self.config.enrichment.load_key_for_provider(&CloudProvider::Google);
-                                    EnrichmentMode::Cloud {
-                                        provider: CloudProvider::Google,
-                                        api_key: next_key,
-                                        model: None,
-                                    }
-                                }
-                                Some(CloudProvider::Google) => {
-                                    // Google → Ollama (Local) — restore previous settings if available
-                                    let ep = self.config.enrichment.last_ollama_endpoint.clone()
-                                        .unwrap_or_else(|| "http://localhost:11434".to_string());
-                                    let mdl = self.config.enrichment.last_ollama_model.clone()
-                                        .unwrap_or_else(|| "mistral:latest".to_string());
-                                    EnrichmentMode::Local {
-                                        ollama_endpoint: ep,
-                                        ollama_model: mdl,
-                                    }
-                                }
-                                None => {
-                                    // Ollama → Anthropic
-                                    let next_key = self.config.enrichment.load_key_for_provider(&CloudProvider::Anthropic);
-                                    EnrichmentMode::Cloud {
-                                        provider: CloudProvider::Anthropic,
-                                        api_key: next_key,
-                                        model: None,
-                                    }
-                                }
-                            };
-                            self.config.enrichment.mode = new_mode;
-                            if let Err(e) = self.save_enrichment_config() {
-                                self.message = format!("Failed to save provider: {}", e);
-                                self.show_message = true;
-                                self.return_to_view = Some(DashboardView::Settings);
-                            }
-                        }
-                        3 => {
-                            // Enrichment Model — open picker
-                            self.open_model_picker();
-                        }
-                        4 => {
-                            // Enrichment API Key (cloud) or Ollama Endpoint (local)
-                            if self.config.enrichment.is_local() {
+                            (3, true) => {
+                                // Edit Ollama server URL
                                 self.editing_enrichment_endpoint = true;
                                 self.enrichment_endpoint_input = self.config.enrichment.ollama_endpoint();
-                            } else {
+                            }
+                            (1, false) => {
+                                // Edit OpenAI transcription API key
+                                self.editing_api_key = true;
+                                self.api_key_input = match &self.config.transcription {
+                                    TranscriptionMode::Api { api_key } => api_key.clone(),
+                                    _ => String::new(),
+                                };
+                            }
+                            (2, false) => {
+                                // Cycle cloud enrichment provider: Anthropic → OpenAI → Google → Anthropic
+                                self.close_model_picker();
+                                let (cur_provider, cur_key, cur_model) = match &self.config.enrichment.mode {
+                                    EnrichmentMode::Cloud { provider, api_key, model } => {
+                                        (provider.clone(), api_key.clone(), model.clone())
+                                    }
+                                    _ => (CloudProvider::Anthropic, String::new(), None),
+                                };
+                                self.config.enrichment.save_key_for_provider(&cur_provider, &cur_key);
+                                self.config.enrichment.save_model_for_provider(&cur_provider, &cur_model);
+                                let next_provider = match cur_provider {
+                                    CloudProvider::Anthropic => CloudProvider::OpenAI,
+                                    CloudProvider::OpenAI => CloudProvider::Google,
+                                    CloudProvider::Google => CloudProvider::Anthropic,
+                                };
+                                let next_key = self.config.enrichment.load_key_for_provider(&next_provider);
+                                let next_model = self.config.enrichment.load_model_for_provider(&next_provider);
+                                self.config.enrichment.mode = EnrichmentMode::Cloud {
+                                    provider: next_provider,
+                                    api_key: next_key,
+                                    model: next_model,
+                                };
+                                if let Err(e) = self.save_enrichment_config() {
+                                    self.message = format!("Failed to save provider: {}", e);
+                                    self.show_message = true;
+                                    self.return_to_view = Some(DashboardView::Settings);
+                                }
+                            }
+                            (3, false) => {
+                                // Open cloud model picker
+                                self.open_model_picker();
+                            }
+                            (4, false) => {
+                                // Edit enrichment API key
                                 self.editing_enrichment_api_key = true;
                                 self.enrichment_api_key_input = self.config.enrichment.api_key().unwrap_or("").to_string();
                             }
+                            _ => {}
                         }
-                        5 => {
-                            // Toggle silence auto-stop enabled/disabled
-                            self.config.silence_auto_stop.enabled = !self.config.silence_auto_stop.enabled;
-                            if let Err(e) = self.config.save() {
-                                self.message = format!("Failed to save setting: {}", e);
-                                self.show_message = true;
-                                self.return_to_view = Some(DashboardView::Settings);
-                            } else {
-                                self.config = ScribaConfig::load()?;
-                            }
-                        }
-                        6 => {
-                            // Cycle silence timeout: 30s → 60s → 120s → 300s
-                            if self.config.silence_auto_stop.enabled {
-                                self.config.silence_auto_stop.timeout_seconds = match self.config.silence_auto_stop.timeout_seconds {
-                                    30 => 60,
-                                    60 => 120,
-                                    120 => 300,
-                                    _ => 30,
-                                };
+
+                    } else {
+                        // ── Shared sections (Recording, Diarization, Voice) ─
+                        match idx - shared_off {
+                            0 => {
+                                // Toggle silence auto-stop
+                                self.config.silence_auto_stop.enabled = !self.config.silence_auto_stop.enabled;
                                 if let Err(e) = self.config.save() {
                                     self.message = format!("Failed to save setting: {}", e);
                                     self.show_message = true;
                                     self.return_to_view = Some(DashboardView::Settings);
-                                } else {
-                                    self.config = ScribaConfig::load()?;
                                 }
                             }
-                        }
-                        7 => {
-                            // Toggle speaker diarization enabled/disabled
-                            self.config.diarization.enabled = !self.config.diarization.enabled;
-                            if let Err(e) = self.config.save() {
-                                self.message = format!("Failed to save setting: {}", e);
-                                self.show_message = true;
-                                self.return_to_view = Some(DashboardView::Settings);
-                            } else {
-                                self.config = ScribaConfig::load()?;
+                            1 => {
+                                // Cycle silence timeout: 30s → 60s → 120s → 300s
+                                if self.config.silence_auto_stop.enabled {
+                                    self.config.silence_auto_stop.timeout_seconds = match self.config.silence_auto_stop.timeout_seconds {
+                                        30 => 60,
+                                        60 => 120,
+                                        120 => 300,
+                                        _ => 30,
+                                    };
+                                    if let Err(e) = self.config.save() {
+                                        self.message = format!("Failed to save setting: {}", e);
+                                        self.show_message = true;
+                                        self.return_to_view = Some(DashboardView::Settings);
+                                    }
+                                }
                             }
-                        }
-                        8 => {
-                            // Cycle max speakers: 2 → 4 → 6 → 8
-                            if self.config.diarization.enabled {
-                                self.config.diarization.max_speakers = match self.config.diarization.max_speakers {
-                                    2 => 4,
-                                    4 => 6,
-                                    6 => 8,
-                                    _ => 2,
-                                };
+                            2 => {
+                                // Toggle speaker diarization
+                                self.config.diarization.enabled = !self.config.diarization.enabled;
                                 if let Err(e) = self.config.save() {
                                     self.message = format!("Failed to save setting: {}", e);
                                     self.show_message = true;
                                     self.return_to_view = Some(DashboardView::Settings);
-                                } else {
-                                    self.config = ScribaConfig::load()?;
                                 }
                             }
-                        }
-                        9 => {
-                            // Toggle voice mode on/off
-                            self.toggle_voice_mode().await;
-                            self.config.voice.enabled = self.voice_mode_active;
-                            if let Err(e) = self.config.save() {
-                                self.message = format!("Failed to save setting: {}", e);
-                                self.show_message = true;
-                                self.return_to_view = Some(DashboardView::Settings);
+                            3 => {
+                                // Cycle max speakers: 2 → 4 → 6 → 8
+                                if self.config.diarization.enabled {
+                                    self.config.diarization.max_speakers = match self.config.diarization.max_speakers {
+                                        2 => 4,
+                                        4 => 6,
+                                        6 => 8,
+                                        _ => 2,
+                                    };
+                                    if let Err(e) = self.config.save() {
+                                        self.message = format!("Failed to save setting: {}", e);
+                                        self.show_message = true;
+                                        self.return_to_view = Some(DashboardView::Settings);
+                                    }
+                                }
                             }
-                        }
-                        10 => {
-                            // Cycle voice sensitivity: 0.005 → 0.01 → 0.02 → 0.05
-                            if self.voice_mode_active {
-                                self.config.voice.vad_threshold = match self.config.voice.vad_threshold {
-                                    t if t <= 0.005 => 0.01,
-                                    t if t <= 0.01 => 0.02,
-                                    t if t <= 0.02 => 0.05,
-                                    _ => 0.005,
-                                };
+                            4 => {
+                                // Toggle voice mode
+                                self.toggle_voice_mode().await;
+                                self.config.voice.enabled = self.voice_mode_active;
                                 if let Err(e) = self.config.save() {
                                     self.message = format!("Failed to save setting: {}", e);
                                     self.show_message = true;
                                     self.return_to_view = Some(DashboardView::Settings);
-                                } else {
-                                    self.config = ScribaConfig::load()?;
                                 }
                             }
+                            5 => {
+                                // Cycle voice sensitivity: 0.005 → 0.01 → 0.02 → 0.05
+                                if self.voice_mode_active {
+                                    self.config.voice.vad_threshold = match self.config.voice.vad_threshold {
+                                        t if t <= 0.005 => 0.01,
+                                        t if t <= 0.01 => 0.02,
+                                        t if t <= 0.02 => 0.05,
+                                        _ => 0.005,
+                                    };
+                                    if let Err(e) = self.config.save() {
+                                        self.message = format!("Failed to save setting: {}", e);
+                                        self.show_message = true;
+                                        self.return_to_view = Some(DashboardView::Settings);
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
                 Ok(DashboardAction::Continue)
@@ -499,6 +495,49 @@ impl Dashboard {
                 Ok(DashboardAction::Continue)
             }
             _ => Ok(DashboardAction::Continue),
+        }
+    }
+
+    /// Render the inline model picker items into the given `lines` vec.
+    fn render_model_picker_items<'a>(
+        &self,
+        lines: &mut Vec<Line<'a>>,
+        val_selected: Style,
+        val_editing: Style,
+        val_normal: Style,
+    ) {
+        let current_model = self.config.enrichment.model_name().to_string();
+        for (i, item) in self.model_picker_items.iter().enumerate() {
+            let is_cursor = i == self.model_picker_selection;
+            let is_current = item.model_id.as_deref() == Some(current_model.as_str());
+            let is_custom_sentinel = item.model_id.is_none() && item.display_name == "Custom...";
+
+            let arrow = if is_cursor { "    \u{25B8} " } else { "      " };
+
+            let style = if is_cursor {
+                if self.model_picker_state == ModelPickerState::EditingCustom && is_custom_sentinel {
+                    val_editing
+                } else {
+                    val_selected
+                }
+            } else if is_current {
+                Style::default().fg(ACCENT)
+            } else {
+                val_normal
+            };
+
+            if is_custom_sentinel && self.model_picker_state == ModelPickerState::EditingCustom {
+                lines.push(Line::from(vec![
+                    Span::styled(arrow.to_string(), style),
+                    Span::styled(format!("Custom: {}_", self.model_picker_custom_input), style),
+                ]));
+            } else {
+                let suffix = if is_current && !is_cursor { " (current)" } else { "" };
+                lines.push(Line::from(vec![
+                    Span::styled(arrow.to_string(), style),
+                    Span::styled(format!("{}{}", item.display_name, suffix), style),
+                ]));
+            }
         }
     }
 
@@ -533,18 +572,25 @@ impl Dashboard {
         let hint_style = Style::default().fg(Color::DarkGray);
         let val_disabled = Style::default().fg(Color::DarkGray);
         let section_style = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+        let marker_style = Style::default().fg(ACCENT);
         let pad = 28; // label column width (must fit "Anthropic (Claude) API Key")
 
+        let is_private = self.config.is_private_mode();
         let sel = self.settings_selection;
         let mut lines: Vec<Line> = Vec::new();
 
-        // Helper closure-like macro for building a setting line
+        // Shared section indices depend on mode
+        let shared_off = shared_offset(is_private);
+
+        // Helper macro for building a setting line with ▸ selection marker
         macro_rules! setting_line {
             ($label:expr, $value:expr, $idx:expr, $hint:expr, $style_override:expr) => {{
-                let padded_label = format!("  {:<width$}", $label, width = pad);
                 let is_sel = sel == $idx;
+                let marker = if is_sel { "\u{25B8} " } else { "  " };
+                let padded_label = format!("{:<width$}", $label, width = pad);
                 let v_style = if let Some(s) = $style_override { s } else if is_sel { val_selected } else { val_normal };
                 let mut spans = vec![
+                    Span::styled(marker, if is_sel { marker_style } else { Style::default() }),
                     Span::styled(padded_label, label_style),
                     Span::styled($value.to_string(), v_style),
                 ];
@@ -555,97 +601,106 @@ impl Dashboard {
             }};
         }
 
-        // ── TRANSCRIPTION ───────────────────────────────────────────
+        // ── MODE TOGGLE (index 0) ───────────────────────────────────
         lines.push(Line::from(""));
-        lines.push(Line::from(vec![Span::raw("  "), Span::styled("TRANSCRIPTION", section_style)]));
-
-        let mode_value = match &self.config.transcription {
-            TranscriptionMode::Local { model_size } => format!("Local (Whisper {})", model_size),
-            TranscriptionMode::Api { .. } => "OpenAI API".to_string(),
-        };
-        setting_line!("Mode", mode_value, 0, "\u{2190} Enter to change", None::<Style>);
-
-        // Model size (only for local mode)
-        if let TranscriptionMode::Local { model_size } = &self.config.transcription {
-            setting_line!("Model Size", model_size, 1, "\u{2190} Enter to cycle", None::<Style>);
-        }
-
-        // API key (only for API mode)
-        if let TranscriptionMode::Api { api_key } = &self.config.transcription {
-            let api_key_display = if self.editing_api_key {
-                format!("{}_", self.api_key_input)
-            } else if api_key.is_empty() {
-                "[Not Set]".to_string()
+        {
+            let (priv_style, cloud_style) = if is_private {
+                (
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    Style::default().fg(Color::DarkGray),
+                )
             } else {
-                let prefix: String = api_key.chars().take(4).collect();
-                format!("{}******", prefix)
+                (
+                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                )
             };
-            let style_override = if sel == 1 && self.editing_api_key { Some(val_editing) } else { None };
-            setting_line!("OpenAI API Key", api_key_display, 1, "\u{2190} Enter to edit", style_override);
-        }
-
-        // ── ENRICHMENT ──────────────────────────────────────────────
-        lines.push(Line::from(""));
-        let enrichment_label = if self.config.enrichment.is_local() { "ENRICHMENT (Privacy)" } else { "ENRICHMENT" };
-        lines.push(Line::from(vec![Span::raw("  "), Span::styled(enrichment_label, section_style)]));
-
-        setting_line!("Provider", self.config.enrichment.provider_display_name(), 2, "\u{2190} Enter to cycle", None::<Style>);
-
-        // Model (index 3)
-        if self.model_picker_state == ModelPickerState::Closed {
-            setting_line!("Model", self.config.enrichment.model_name(), 3, "\u{2190} Enter to choose", None::<Style>);
-        } else {
-            // Picker is open
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {:<width$}", "Model", width = pad), label_style),
-                Span::styled("(select below)", hint_style),
-            ]));
-
-            let current_model = self.config.enrichment.model_name().to_string();
-            for (i, item) in self.model_picker_items.iter().enumerate() {
-                let is_cursor = i == self.model_picker_selection;
-                let is_current = item.model_id.as_deref() == Some(current_model.as_str());
-                let is_custom_sentinel = item.model_id.is_none() && item.display_name == "Custom...";
-
-                let arrow = if is_cursor { "    \u{25B8} " } else { "      " };
-
-                let style = if is_cursor {
-                    if self.model_picker_state == ModelPickerState::EditingCustom && is_custom_sentinel {
-                        val_editing
-                    } else {
-                        val_selected
-                    }
-                } else if is_current {
-                    Style::default().fg(ACCENT)
-                } else {
-                    val_normal
-                };
-
-                if is_custom_sentinel && self.model_picker_state == ModelPickerState::EditingCustom {
-                    lines.push(Line::from(vec![
-                        Span::styled(arrow, style),
-                        Span::styled(format!("Custom: {}_", self.model_picker_custom_input), style),
-                    ]));
-                } else {
-                    let suffix = if is_current && !is_cursor { " (current)" } else { "" };
-                    lines.push(Line::from(vec![
-                        Span::styled(arrow, style),
-                        Span::styled(format!("{}{}", item.display_name, suffix), style),
-                    ]));
-                }
+            let marker = if sel == IDX_MODE { "\u{25B8} " } else { "  " };
+            let m_style = if sel == IDX_MODE { marker_style } else { Style::default() };
+            let mut mode_spans = vec![
+                Span::styled(marker, m_style),
+                Span::styled(format!("{:<width$}", "Mode", width = pad), label_style),
+                Span::styled("PRIVATE", priv_style),
+                Span::styled("   ", Style::default()),
+                Span::styled("CLOUD", cloud_style),
+            ];
+            if sel == IDX_MODE {
+                mode_spans.push(Span::styled("  \u{2190} Enter to switch", hint_style));
             }
+            lines.push(Line::from(mode_spans));
         }
 
-        // API Key or Ollama Endpoint (index 4)
-        if self.config.enrichment.is_local() {
+        // ── MODE-SPECIFIC SECTION ───────────────────────────────────
+        if is_private {
+            // ── PRIVATE ─────────────────────────────────────────────
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![Span::raw("  "), Span::styled("PRIVATE", section_style)]));
+
+            // Index 1: Whisper Model Size
+            if let TranscriptionMode::Local { model_size } = &self.config.transcription {
+                setting_line!("Whisper Model", model_size, 1, "\u{2190} Enter to cycle", None::<Style>);
+            }
+
+            // Index 2: Ollama Model (picker)
+            let model_idx: usize = 2;
+            if self.model_picker_state == ModelPickerState::Closed {
+                setting_line!("Ollama Model", self.config.enrichment.model_name(), model_idx, "\u{2190} Enter to choose", None::<Style>);
+            } else {
+                let picker_marker = if sel == model_idx { "\u{25B8} " } else { "  " };
+                lines.push(Line::from(vec![
+                    Span::styled(picker_marker, if sel == model_idx { marker_style } else { Style::default() }),
+                    Span::styled(format!("{:<width$}", "Ollama Model", width = pad), label_style),
+                    Span::styled("(select below)", hint_style),
+                ]));
+                self.render_model_picker_items(&mut lines, val_selected, val_editing, val_normal);
+            }
+
+            // Index 3: Ollama Server
             let endpoint_display = if self.editing_enrichment_endpoint {
                 format!("{}_", self.enrichment_endpoint_input)
             } else {
                 self.config.enrichment.ollama_endpoint().to_string()
             };
-            let style_override = if sel == 4 && self.editing_enrichment_endpoint { Some(val_editing) } else { None };
-            setting_line!("Ollama Server", endpoint_display, 4, "\u{2190} Enter to edit", style_override);
+            let style_override = if sel == 3 && self.editing_enrichment_endpoint { Some(val_editing) } else { None };
+            setting_line!("Ollama Server", endpoint_display, 3, "\u{2190} Enter to edit", style_override);
+
         } else {
+            // ── CLOUD ───────────────────────────────────────────────
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![Span::raw("  "), Span::styled("CLOUD", section_style)]));
+
+            // Index 1: Whisper API Key (transcription)
+            if let TranscriptionMode::Api { api_key } = &self.config.transcription {
+                let api_key_display = if self.editing_api_key {
+                    format!("{}_", self.api_key_input)
+                } else if api_key.is_empty() {
+                    "[Not Set]".to_string()
+                } else {
+                    let prefix: String = api_key.chars().take(4).collect();
+                    format!("{}******", prefix)
+                };
+                let style_override = if sel == 1 && self.editing_api_key { Some(val_editing) } else { None };
+                setting_line!("Whisper API Key", api_key_display, 1, "\u{2190} Enter to edit", style_override);
+            }
+
+            // Index 2: LLM Provider (cycle)
+            setting_line!("LLM Provider", self.config.enrichment.provider_display_name(), 2, "\u{2190} Enter to cycle", None::<Style>);
+
+            // Index 3: Model (picker)
+            let model_idx: usize = 3;
+            if self.model_picker_state == ModelPickerState::Closed {
+                setting_line!("Model", self.config.enrichment.model_name(), model_idx, "\u{2190} Enter to choose", None::<Style>);
+            } else {
+                let picker_marker = if sel == model_idx { "\u{25B8} " } else { "  " };
+                lines.push(Line::from(vec![
+                    Span::styled(picker_marker, if sel == model_idx { marker_style } else { Style::default() }),
+                    Span::styled(format!("{:<width$}", "Model", width = pad), label_style),
+                    Span::styled("(select below)", hint_style),
+                ]));
+                self.render_model_picker_items(&mut lines, val_selected, val_editing, val_normal);
+            }
+
+            // Index 4: Enrichment API Key
             let key_label = match self.config.enrichment.cloud_provider() {
                 Some(p) => format!("{} API Key", p.display_name()),
                 None => "API Key".to_string(),
@@ -676,7 +731,7 @@ impl Dashboard {
 
         let silence_enabled = self.config.silence_auto_stop.enabled;
         let silence_value = if silence_enabled { "Enabled" } else { "Disabled" };
-        setting_line!("Auto-Stop", silence_value, 5, "\u{2190} Enter to toggle", None::<Style>);
+        setting_line!("Auto-Stop", silence_value, shared_off, "\u{2190} Enter to toggle", None::<Style>);
 
         let timeout_secs = self.config.silence_auto_stop.timeout_seconds;
         let timeout_display = match timeout_secs {
@@ -686,7 +741,7 @@ impl Dashboard {
         };
         let timeout_style_override = if !silence_enabled { Some(val_disabled) } else { None };
         let timeout_hint = if silence_enabled { "\u{2190} Enter to cycle" } else { "(enable auto-stop first)" };
-        setting_line!("Timeout", timeout_display, 6, timeout_hint, timeout_style_override);
+        setting_line!("Timeout", timeout_display, shared_off + 1, timeout_hint, timeout_style_override);
 
         // ── DIARIZATION ─────────────────────────────────────────────
         lines.push(Line::from(""));
@@ -694,12 +749,12 @@ impl Dashboard {
 
         let diarization_enabled = self.config.diarization.enabled;
         let diar_value = if diarization_enabled { "Enabled" } else { "Disabled" };
-        setting_line!("Speaker Diarization", diar_value, 7, "\u{2190} Enter to toggle", None::<Style>);
+        setting_line!("Speaker Diarization", diar_value, shared_off + 2, "\u{2190} Enter to toggle", None::<Style>);
 
         let max_speakers = self.config.diarization.max_speakers;
         let speakers_style_override = if !diarization_enabled { Some(val_disabled) } else { None };
         let speakers_hint = if diarization_enabled { "\u{2190} Enter to cycle" } else { "(enable diarization first)" };
-        setting_line!("Max Speakers", max_speakers, 8, speakers_hint, speakers_style_override);
+        setting_line!("Max Speakers", max_speakers, shared_off + 3, speakers_hint, speakers_style_override);
 
         // ── VOICE MODE ──────────────────────────────────────────────
         lines.push(Line::from(""));
@@ -707,7 +762,7 @@ impl Dashboard {
 
         let voice_enabled = self.voice_mode_active;
         let voice_value = if voice_enabled { "Active" } else { "Off" };
-        setting_line!("Voice Activation", voice_value, 9, "\u{2190} Enter to toggle", None::<Style>);
+        setting_line!("Voice Activation", voice_value, shared_off + 4, "\u{2190} Enter to toggle", None::<Style>);
 
         let sensitivity_label = match self.config.voice.vad_threshold {
             t if t <= 0.005 => "Very High (0.005)",
@@ -717,7 +772,7 @@ impl Dashboard {
         };
         let sens_style_override = if !voice_enabled { Some(val_disabled) } else { None };
         let sens_hint = if voice_enabled { "\u{2190} Enter to cycle" } else { "(enable voice mode first)" };
-        setting_line!("Sensitivity", sensitivity_label, 10, sens_hint, sens_style_override);
+        setting_line!("Sensitivity", sensitivity_label, shared_off + 5, sens_hint, sens_style_override);
 
         let body = Paragraph::new(lines).style(Style::default().fg(Color::White));
         f.render_widget(body, chunks[1]);

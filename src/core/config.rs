@@ -74,6 +74,12 @@ pub struct ScribaConfig {
     /// Voice-activated recording ("Scriba Forever") settings.
     #[serde(default)]
     pub voice: VoiceConfig,
+    /// Preserved local model size when switching from Private to Cloud mode.
+    #[serde(default)]
+    pub last_local_model_size: Option<LocalModelSize>,
+    /// Preserved cloud provider when switching from Cloud to Private mode.
+    #[serde(default)]
+    pub last_cloud_provider: Option<CloudProvider>,
 }
 
 /// Configuration for voice-activated recording ("Scriba Forever" mode).
@@ -249,6 +255,9 @@ pub struct EnrichmentConfig {
     /// Per-provider API keys so switching providers doesn't lose keys.
     #[serde(default)]
     pub cloud_api_keys: HashMap<String, String>,
+    /// Per-provider model selections so switching providers doesn't lose model choice.
+    #[serde(default)]
+    pub cloud_models: HashMap<String, String>,
 
     /// Preserved Ollama endpoint so cycling away from Local doesn't lose it.
     #[serde(default)]
@@ -290,6 +299,7 @@ impl Default for EnrichmentConfig {
             ollama_endpoint: None,
             ollama_model: None,
             cloud_api_keys: HashMap::new(),
+            cloud_models: HashMap::new(),
             last_ollama_endpoint: None,
             last_ollama_model: None,
             auto_link_threshold: 0.8,
@@ -345,6 +355,21 @@ impl EnrichmentConfig {
             .get(&provider.to_string())
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Save a model selection for a specific provider into the per-provider map.
+    pub fn save_model_for_provider(&mut self, provider: &CloudProvider, model: &Option<String>) {
+        if let Some(m) = model {
+            self.cloud_models.insert(provider.to_string(), m.clone());
+        } else {
+            self.cloud_models.remove(&provider.to_string());
+        }
+    }
+
+    /// Load a previously-stored model selection for a specific provider.
+    /// Returns `None` if no explicit selection was saved (use provider default).
+    pub fn load_model_for_provider(&self, provider: &CloudProvider) -> Option<String> {
+        self.cloud_models.get(&provider.to_string()).cloned()
     }
 
     /// Get the current cloud provider, if in cloud mode.
@@ -482,22 +507,22 @@ impl Default for ScribaConfig {
             silence_auto_stop: SilenceAutoStopConfig::default(),
             diarization: DiarizationConfig::default(),
             voice: VoiceConfig::default(),
+            last_local_model_size: None,
+            last_cloud_provider: None,
         }
     }
 }
 
 impl ScribaConfig {
     /// Get the path to the configuration file.
-    pub fn config_path() -> PathBuf {
-        home_dir()
-            .expect("Failed to get home directory")
-            .join("scriba_recordings")
-            .join("config.json")
+    pub fn config_path() -> Result<PathBuf> {
+        let home = home_dir().context("Failed to get home directory")?;
+        Ok(home.join("scriba_recordings").join("config.json"))
     }
 
     /// Load configuration from disk, creating default if it doesn't exist.
     pub fn load() -> Result<Self> {
-        let config_path = Self::config_path();
+        let config_path = Self::config_path()?;
 
         if !config_path.exists() {
             let config = Self::default();
@@ -516,7 +541,7 @@ impl ScribaConfig {
 
     /// Save configuration to disk.
     pub fn save(&self) -> Result<()> {
-        let config_path = Self::config_path();
+        let config_path = Self::config_path()?;
 
         if let Some(parent) = config_path.parent() {
             fs::create_dir_all(parent).context("Failed to create config directory")?;
@@ -536,13 +561,17 @@ impl ScribaConfig {
                 self.last_api_key = Some(api_key.clone());
             }
         }
+        // Save current local model size if switching away from Local mode
+        if let TranscriptionMode::Local { model_size } = &self.transcription {
+            self.last_local_model_size = Some(*model_size);
+        }
 
         self.transcription = mode;
         self.save()
     }
 
-    /// Check if using local transcription mode.
-    pub fn is_local_mode(&self) -> bool {
+    /// Check if in Private mode (local Whisper + Ollama).
+    pub fn is_private_mode(&self) -> bool {
         matches!(self.transcription, TranscriptionMode::Local { .. })
     }
 
