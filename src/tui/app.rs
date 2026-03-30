@@ -1,5 +1,5 @@
 use crate::core::{
-    AudioPlayer, EnrichmentMode, RecordingResult, ScribaConfig,
+    AudioPlayer, EnrichmentMode, RecordingResult, ScribaConfig, TranscriptionMode,
     VoiceCommand, VoiceDetectorHandle, VoiceListeningState,
     start_voice_detector,
 };
@@ -33,7 +33,7 @@ use super::chat::{
 
 use super::browse::FileDialogStage;
 use super::entities::{EntityMode, EntityEditField};
-use super::onboarding::{OnboardingState, OnboardingStep, CheckStatus, DownloadStatus};
+use super::onboarding::{OnboardingState, OnboardingStep, OnboardingTickResult};
 use super::recording::{RecordingMode, ActiveTranscription, PendingTranscription};
 use super::settings::{ModelPickerState, ModelPickerItem};
 
@@ -532,256 +532,32 @@ impl Dashboard {
 
             // Onboarding tick logic (runs every frame for typewriter + async polling)
             if let Some(ref mut ob) = self.onboarding {
-                if anim_tick {
-                    ob.anim_frame = ob.anim_frame.wrapping_add(1);
-                }
-
-                match ob.step {
-                    OnboardingStep::Entrance => {
-                        // Auto-advance after 25 frames (~2.5s)
-                        if ob.anim_frame >= 25 {
-                            ob.step = OnboardingStep::Intro;
-                            ob.set_step_text(
-                                "Welcome to Scriba.\n\n\
-                                 Scriba records, transcribes, and remembers\n\
-                                 everything \u{2014} names, places, topics.\n\
-                                 Your personal audio assistant\n\
-                                 with a very good memory.\n\n\
-                                 Let's get you set up.",
-                                true,
-                            );
+                if let Some(result) = ob.tick(anim_tick).await {
+                    match result {
+                        OnboardingTickResult::Complete => {
+                            self.onboarding = None;
+                            self.current_view = DashboardView::Main;
+                            self.load_entities().ok();
+                            self.init_global_chat();
                         }
-                    }
-                    OnboardingStep::Intro => {
-                        // Line-by-line reveal after logo pause (3 frames = 300ms)
-                        if ob.anim_frame >= 3 {
-                            ob.tick_typewriter_lines();
+                        OnboardingTickResult::SaveWhisperKey(key) => {
+                            self.config.transcription = TranscriptionMode::Api {
+                                api_key: key,
+                            };
+                            let _ = self.config.save();
                         }
-                    }
-                    OnboardingStep::AskName | OnboardingStep::AskRole => {
-                        ob.tick_typewriter_lines();
-                    }
-                    OnboardingStep::ModeSelection | OnboardingStep::ProviderSelection
-                    | OnboardingStep::ApiKeyEntry => {
-                        // Instant text -- no typewriter
-                    }
-                    OnboardingStep::ModelSetup => {
-                        // Phase 3: drain download progress
-                        if ob.setup_phase == 3 {
-                            if let Some(ref mut rx) = ob.download_rx {
-                                while let Ok(prog) = rx.try_recv() {
-                                    if prog.index < ob.download_items.len() {
-                                        ob.download_items[prog.index].1 = prog.status;
-                                    }
-                                }
-                            }
-                            if let Some(ref task) = ob.download_task {
-                                if task.is_finished() {
-                                    ob.download_task.take();
-                                    ob.download_rx.take();
-                                    for item in ob.download_items.iter_mut() {
-                                        if matches!(item.1, DownloadStatus::Pending | DownloadStatus::InProgress(_)) {
-                                            item.1 = DownloadStatus::Done;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        // Phases 0, 1, 2: instant text, no typewriter
-                    }
-                    OnboardingStep::SystemCheck => {
-                        // Drain system check channel
-                        let mut all_resolved = false;
-                        if let Some(ref mut rx) = ob.system_check_rx {
-                            while let Ok((idx, passed, hint)) = rx.try_recv() {
-                                if idx < ob.system_checks.len() {
-                                    if hint.is_empty() && !passed {
-                                        // "Running" signal (empty hint, false)
-                                        ob.system_checks[idx].1 = CheckStatus::Running;
-                                    } else if passed {
-                                        ob.system_checks[idx].1 = CheckStatus::Passed;
-                                        if idx == 2 {
-                                            ob.ollama_reachable = true;
-                                        }
-                                    } else {
-                                        ob.system_checks[idx].1 = CheckStatus::Failed(hint);
-                                    }
-                                }
-                            }
-                        }
-                        // Check if task is done
-                        if let Some(ref task) = ob.system_check_task {
-                            if task.is_finished() {
-                                ob.system_check_task.take();
-                                ob.system_check_rx.take();
-                                all_resolved = true;
-                            }
-                        }
-                        if all_resolved {
-                            let any_failed = ob.system_checks.iter().any(|(_, s)| matches!(s, CheckStatus::Failed(_)));
-                            ob.system_check_done = true;
-                            if any_failed {
-                                ob.system_check_selection = 0;
+                        OnboardingTickResult::FetchOllamaModels => {
+                            let endpoint = if let EnrichmentMode::Local { ollama_endpoint, .. } = &self.config.enrichment.mode {
+                                ollama_endpoint.clone()
                             } else {
-                                // All passed -- start linger counter (will auto-advance after ~1.5s)
-                                ob.transition_frame = 0;
-
-                                // Pre-fetch Ollama models while lingering
-                                if ob.ollama_reachable {
-                                    let endpoint = if let EnrichmentMode::Local { ollama_endpoint, .. } = &self.config.enrichment.mode {
-                                        ollama_endpoint.clone()
-                                    } else {
-                                        "http://localhost:11434".to_string()
-                                    };
-                                    let (tx, rx) = mpsc::channel(1);
-                                    self.ollama_models_rx = Some(rx);
-                                    tokio::spawn(async move {
-                                        let result = OllamaClient::fetch_models(&endpoint).await;
-                                        let _ = tx.send(result.map_err(|e| e.to_string())).await;
-                                    });
-                                }
-                            }
-                        }
-
-                        // Linger on all-green for ~1.5s before auto-advancing
-                        let all_passed = ob.system_check_done
-                            && !ob.system_checks.iter().any(|(_, s)| matches!(s, CheckStatus::Failed(_)));
-                        if all_passed && anim_tick {
-                            ob.transition_frame += 1;
-                            if ob.transition_frame >= 15 {
-                                ob.step = OnboardingStep::ModelSetup;
-                                ob.anim_frame = 0;
-                                ob.setup_phase = 0;
-                                ob.transition_frame = 0;
-                                ob.set_step_text("Choose your transcription model", false);
-                            }
-                        }
-                    }
-                    OnboardingStep::ApiKeyValidation => {
-                        // Poll the async validation task
-                        if let Some(ref task) = ob.validation_task {
-                            if task.is_finished() {
-                                let completed = ob.validation_task.take().unwrap();
-                                match completed.await {
-                                    Ok(Ok(valid)) => {
-                                        ob.api_key_valid = Some(valid);
-                                        if valid {
-                                            ob.step = OnboardingStep::AskName;
-                                            ob.anim_frame = 0;
-                                            ob.set_step_text(
-                                                "API key verified.\n\n\
-                                                 What's your name?",
-                                                true,
-                                            );
-                                        } else {
-                                            ob.validation_fail_selection = 0;
-                                            ob.set_step_text(
-                                                "API key validation failed.",
-                                                false,
-                                            );
-                                        }
-                                    }
-                                    _ => {
-                                        ob.api_key_valid = Some(false);
-                                        ob.validation_fail_selection = 0;
-                                        ob.set_step_text(
-                                            "API key validation failed.",
-                                            false,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    OnboardingStep::Processing => {
-                        // Check if processing task completed
-                        if let Some(ref task) = ob.processing_task {
-                            if task.is_finished() {
-                                let completed = ob.processing_task.take().unwrap();
-                                match completed.await {
-                                    Ok(Ok((Some((world_data, entities)), _))) => {
-                                        // Fill confirmation data
-                                        ob.confirm_owner = world_data.owner.name.clone();
-                                        ob.confirm_role = world_data.owner.role.clone();
-                                        ob.confirm_org = world_data.owner.organization.clone();
-                                        let people_names: Vec<String> = world_data.people.iter()
-                                            .map(|p| p.name.clone()).collect();
-                                        ob.confirm_people = if people_names.is_empty() {
-                                            "(none detected)".to_string()
-                                        } else {
-                                            people_names.join(", ")
-                                        };
-                                        ob.processed_world = Some(world_data);
-                                        ob.processed_entities = Some(entities);
-                                        ob.ollama_available = true;
-                                        // Advance to confirmation
-                                        ob.step = OnboardingStep::Confirmation;
-                                        ob.confirm_selection = 0;
-                                        ob.set_step_text("Here's what I've got:", false);
-                                    }
-                                    Ok(Ok((None, hint))) => {
-                                        ob.ollama_available = false;
-                                        let msg = if let Some(hint) = hint {
-                                            format!(
-                                                "{}\n\n\
-                                                 Your info has been saved.\n\
-                                                 You can fix this later in Settings (Ctrl+S).",
-                                                hint
-                                            )
-                                        } else {
-                                            "Enrichment provider is not reachable.\n\n\
-                                             Your info has been saved.\n\
-                                             You can fix this later in Settings (Ctrl+S).".to_string()
-                                        };
-                                        ob.set_step_text(&msg, false);
-                                    }
-                                    Ok(Err(e)) => {
-                                        ob.ollama_available = false;
-                                        let err_msg = format!("{:#}", e);
-                                        ob.set_step_text(
-                                            &format!(
-                                                "Something went wrong during setup:\n\
-                                                 {}\n\n\
-                                                 Your info has been saved.\n\
-                                                 You can fix this later in Settings (Ctrl+S).",
-                                                err_msg,
-                                            ),
-                                            false,
-                                        );
-                                    }
-                                    Err(e) => {
-                                        ob.ollama_available = false;
-                                        let err_msg = format!("{:#}", e);
-                                        ob.set_step_text(
-                                            &format!(
-                                                "Something went wrong during setup:\n\
-                                                 {}\n\n\
-                                                 Your info has been saved.\n\
-                                                 You can fix this later in Settings (Ctrl+S).",
-                                                err_msg,
-                                            ),
-                                            false,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    OnboardingStep::Confirmation => {
-                        // Text is instant now
-                    }
-                    OnboardingStep::Done => {
-                        ob.tick_typewriter_lines();
-                        // Fade-out transition (triggered by Enter key, throttled to anim_tick ~100ms)
-                        if ob.transitioning && anim_tick {
-                            ob.transition_frame += 1;
-                            if ob.transition_frame > 10 {
-                                // Transition complete -- go to main dashboard
-                                self.onboarding = None;
-                                self.current_view = DashboardView::Main;
-                                self.load_entities().ok();
-                                self.init_global_chat();
-                            }
+                                "http://localhost:11434".to_string()
+                            };
+                            let (tx, rx) = mpsc::channel(1);
+                            self.ollama_models_rx = Some(rx);
+                            tokio::spawn(async move {
+                                let result = OllamaClient::fetch_models(&endpoint).await;
+                                let _ = tx.send(result.map_err(|e| e.to_string())).await;
+                            });
                         }
                     }
                 }
@@ -1114,9 +890,9 @@ impl Dashboard {
     }
 
     fn render_home_footer(&self, f: &mut Frame, area: ratatui::layout::Rect) {
-        // Align footer with chat box: 1 char left pad, 3 chars right pad
+        // Align footer with chat box: symmetric 2-char margin each side
         let aligned = Rect {
-            x: area.x + 1,
+            x: area.x + 2,
             width: area.width.saturating_sub(4),
             ..area
         };
