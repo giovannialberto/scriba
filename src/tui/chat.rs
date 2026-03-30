@@ -540,10 +540,10 @@ impl ChatState {
                 all_lines.push(Line::from(Span::styled(sub, dim)));
             }
 
-            // Recording tree — constrain to chat box width
+            // Recording tree — constrain to chat box width (area.width - 4 margin)
             let rec_count = self.home_recordings.len();
             let action_labels = ["View transcript", "Summarize", "Ask about it"];
-            let tree_max = content_width.saturating_sub(2); // match chat box width
+            let tree_max = (area.width as usize).saturating_sub(4);
             for (i, rec) in self.home_recordings.iter().enumerate() {
                 let is_last = i == rec_count - 1;
                 let connector = if is_last { "\u{2514}\u{2500}\u{2500}" } else { "\u{251C}\u{2500}\u{2500}" };
@@ -601,7 +601,8 @@ impl ChatState {
             // ── Chat input area (grey background, no borders) ─────────────
             let box_height = 7; // total lines for the input area
             let bg = Color::DarkGray; // matches the summary text color tone
-            let box_width = content_width.saturating_sub(2);
+            // Symmetric: 2-char margin each side, computed from area.width directly
+            let box_width = (area.width as usize).saturating_sub(4);
             let inner_width = box_width.saturating_sub(6); // prompt + side padding
 
             // Blank line before input area
@@ -616,12 +617,19 @@ impl ChatState {
             let mut input_lines: Vec<Line> = Vec::new();
             let mut input_texts: Vec<String> = Vec::new();
 
+            // Box left/right margin (2 chars each side for symmetry)
+            let box_margin = "  ";
+
             // Top padding line (empty, with background)
             let full_bg = " ".repeat(box_width);
             input_texts.push(full_bg.clone());
-            input_lines.push(Line::from(Span::styled(format!(" {}", full_bg), bg_style)));
+            input_lines.push(Line::from(vec![
+                Span::raw(box_margin),
+                Span::styled(full_bg, bg_style),
+                Span::raw(box_margin),
+            ]));
 
-            // Target total width per line: 1 + box_width (leading space + fill)
+            // Target total width per line: margin(1) + box_width + margin(1)
             let pad_left = "   "; // 3-char left padding inside box
             let pad_len = pad_left.len(); // 3
             if !self.input_buffer.is_empty() {
@@ -630,15 +638,15 @@ impl ChatState {
                 let wrapped = textwrap::wrap(&display, wrap_w);
                 for w in &wrapped {
                     let w_len = w.chars().count();
-                    // " " (1) + pad (3) + text + fill = 1 + box_width
-                    let right_fill = (1 + box_width).saturating_sub(1 + pad_len + w_len);
+                    let right_fill = box_width.saturating_sub(pad_len + w_len);
                     let text = format!("{}{}{}", pad_left, w, " ".repeat(right_fill));
                     input_texts.push(text.clone());
                     input_lines.push(Line::from(vec![
-                        Span::styled(" ", bg_style),
+                        Span::raw(box_margin),
                         Span::styled(pad_left.to_string(), bg_style),
                         Span::styled(w.to_string(), Style::default().fg(Color::White).bg(bg)),
                         Span::styled(" ".repeat(right_fill), bg_style),
+                        Span::raw(box_margin),
                     ]));
                 }
             } else {
@@ -646,15 +654,16 @@ impl ChatState {
                 let hint = if !self.placeholder.is_empty() { self.placeholder.as_str() } else { "" };
                 let hint_len = hint.chars().count();
                 let total_content = 1 + hint_len; // cursor + hint
-                let right_fill = (1 + box_width).saturating_sub(1 + pad_len + total_content);
+                let right_fill = box_width.saturating_sub(pad_len + total_content);
                 let text = format!("{}{}{}{}", pad_left, cursor_char, hint, " ".repeat(right_fill));
                 input_texts.push(text.clone());
                 input_lines.push(Line::from(vec![
-                    Span::styled(" ", bg_style),
+                    Span::raw(box_margin),
                     Span::styled(pad_left.to_string(), bg_style),
                     Span::styled(cursor_char.to_string(), Style::default().fg(Color::White).bg(bg)),
                     Span::styled(hint.to_string(), Style::default().fg(Color::Indexed(246)).bg(bg)),
                     Span::styled(" ".repeat(right_fill), bg_style),
+                    Span::raw(box_margin),
                 ]));
             }
 
@@ -667,7 +676,11 @@ impl ChatState {
             for _ in used..box_height {
                 let bg_fill = " ".repeat(box_width);
                 content_texts.push(bg_fill.clone());
-                all_lines.push(Line::from(Span::styled(format!(" {}", bg_fill), bg_style)));
+                all_lines.push(Line::from(vec![
+                    Span::raw(box_margin),
+                    Span::styled(bg_fill, bg_style),
+                    Span::raw(box_margin),
+                ]));
             }
 
             // ── Vertical centering (bias upper third) ────────────────────

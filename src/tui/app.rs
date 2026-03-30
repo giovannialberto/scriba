@@ -890,9 +890,9 @@ impl Dashboard {
     }
 
     fn render_home_footer(&self, f: &mut Frame, area: ratatui::layout::Rect) {
-        // Align footer with chat box: 1 char left pad, 3 chars right pad
+        // Align footer with chat box: symmetric 2-char margin each side
         let aligned = Rect {
-            x: area.x + 1,
+            x: area.x + 2,
             width: area.width.saturating_sub(4),
             ..area
         };
