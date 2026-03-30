@@ -16,7 +16,7 @@ use ratatui::{
 use tokio::sync::mpsc;
 
 use super::chat::ACCENT;
-use super::app::{Dashboard, DashboardAction, DashboardView};
+use super::app::{Dashboard, DashboardAction};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Onboarding
@@ -61,6 +61,14 @@ pub(super) enum DownloadStatus {
 pub(super) struct DownloadProgress {
     pub(super) index: usize,
     pub(super) status: DownloadStatus,
+}
+
+/// Side-effects that `Dashboard` must handle after an onboarding tick.
+pub(super) enum OnboardingTickResult {
+    /// Onboarding is finished — tear down state, load entities, init chat.
+    Complete,
+    /// SystemCheck passed with Ollama reachable — pre-fetch available models.
+    FetchOllamaModels,
 }
 
 pub(super) const WHISPER_MODELS: &[(LocalModelSize, &str, &str)] = &[
@@ -211,12 +219,260 @@ impl OnboardingState {
         &self.full_text[..byte_end]
     }
 
+    /// Called every frame from the main event loop.
+    /// Returns `Some(result)` when the tick produces a side-effect that
+    /// `Dashboard` needs to act on (e.g. fetching Ollama models, finishing onboarding).
+    pub(super) async fn tick(&mut self, anim_tick: bool) -> Option<OnboardingTickResult> {
+        if anim_tick {
+            self.anim_frame = self.anim_frame.wrapping_add(1);
+        }
+
+        match self.step {
+            OnboardingStep::Entrance => {
+                // Auto-advance after 25 frames (~2.5s)
+                if self.anim_frame >= 25 {
+                    self.step = OnboardingStep::Intro;
+                    self.set_step_text(
+                        "Welcome to Scriba.\n\n\
+                         Scriba turns recordings into knowledge.\n\
+                         Record or import audio, get transcripts,\n\
+                         and let AI extract who was mentioned,\n\
+                         what was discussed, and what to remember.\n\n\
+                         Let's get you set up.",
+                        true,
+                    );
+                }
+            }
+            OnboardingStep::Intro => {
+                // Line-by-line reveal after logo pause (3 frames = 300ms)
+                if self.anim_frame >= 3 {
+                    self.tick_typewriter_lines();
+                }
+            }
+            OnboardingStep::AskName | OnboardingStep::AskRole => {
+                self.tick_typewriter_lines();
+            }
+            OnboardingStep::ModeSelection | OnboardingStep::ProviderSelection
+            | OnboardingStep::ApiKeyEntry => {
+                // Instant text -- no typewriter
+            }
+            OnboardingStep::ModelSetup => {
+                // Phase 3: drain download progress
+                if self.setup_phase == 3 {
+                    if let Some(ref mut rx) = self.download_rx {
+                        while let Ok(prog) = rx.try_recv() {
+                            if prog.index < self.download_items.len() {
+                                self.download_items[prog.index].1 = prog.status;
+                            }
+                        }
+                    }
+                    if let Some(ref task) = self.download_task {
+                        if task.is_finished() {
+                            self.download_task.take();
+                            self.download_rx.take();
+                            for item in self.download_items.iter_mut() {
+                                if matches!(item.1, DownloadStatus::Pending | DownloadStatus::InProgress(_)) {
+                                    item.1 = DownloadStatus::Done;
+                                }
+                            }
+                        }
+                    }
+                }
+                // Phases 0, 1, 2: instant text, no typewriter
+            }
+            OnboardingStep::SystemCheck => {
+                // Drain system check channel
+                let mut all_resolved = false;
+                if let Some(ref mut rx) = self.system_check_rx {
+                    while let Ok((idx, passed, hint)) = rx.try_recv() {
+                        if idx < self.system_checks.len() {
+                            if hint.is_empty() && !passed {
+                                // "Running" signal (empty hint, false)
+                                self.system_checks[idx].1 = CheckStatus::Running;
+                            } else if passed {
+                                self.system_checks[idx].1 = CheckStatus::Passed;
+                                if idx == 2 {
+                                    self.ollama_reachable = true;
+                                }
+                            } else {
+                                self.system_checks[idx].1 = CheckStatus::Failed(hint);
+                            }
+                        }
+                    }
+                }
+                // Check if task is done
+                if let Some(ref task) = self.system_check_task {
+                    if task.is_finished() {
+                        self.system_check_task.take();
+                        self.system_check_rx.take();
+                        all_resolved = true;
+                    }
+                }
+                if all_resolved {
+                    let any_failed = self.system_checks.iter().any(|(_, s)| matches!(s, CheckStatus::Failed(_)));
+                    self.system_check_done = true;
+                    if any_failed {
+                        self.system_check_selection = 0;
+                    } else {
+                        // All passed -- start linger counter (will auto-advance after ~1.5s)
+                        self.transition_frame = 0;
+
+                        // Signal Dashboard to pre-fetch Ollama models
+                        if self.ollama_reachable {
+                            return Some(OnboardingTickResult::FetchOllamaModels);
+                        }
+                    }
+                }
+
+                // Linger on all-green for ~1.5s before auto-advancing
+                let all_passed = self.system_check_done
+                    && !self.system_checks.iter().any(|(_, s)| matches!(s, CheckStatus::Failed(_)));
+                if all_passed && anim_tick {
+                    self.transition_frame += 1;
+                    if self.transition_frame >= 15 {
+                        self.step = OnboardingStep::ModelSetup;
+                        self.anim_frame = 0;
+                        self.setup_phase = 0;
+                        self.transition_frame = 0;
+                        self.set_step_text("Choose a Whisper model for local transcription.\nLarger models are more accurate but slower.", false);
+                    }
+                }
+            }
+            OnboardingStep::ApiKeyValidation => {
+                // Poll the async validation task
+                if let Some(ref task) = self.validation_task {
+                    if task.is_finished() {
+                        let completed = self.validation_task.take().unwrap();
+                        match completed.await {
+                            Ok(Ok(valid)) => {
+                                self.api_key_valid = Some(valid);
+                                if valid {
+                                    self.step = OnboardingStep::AskName;
+                                    self.anim_frame = 0;
+                                    self.set_step_text(
+                                        "API key verified.\n\n\
+                                         Scriba uses your name and role to better\n\
+                                         understand your recordings.\n\n\
+                                         What's your name?",
+                                        true,
+                                    );
+                                } else {
+                                    self.validation_fail_selection = 0;
+                                    self.set_step_text(
+                                        "API key validation failed.",
+                                        false,
+                                    );
+                                }
+                            }
+                            _ => {
+                                self.api_key_valid = Some(false);
+                                self.validation_fail_selection = 0;
+                                self.set_step_text(
+                                    "API key validation failed.",
+                                    false,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            OnboardingStep::Processing => {
+                // Check if processing task completed
+                if let Some(ref task) = self.processing_task {
+                    if task.is_finished() {
+                        let completed = self.processing_task.take().unwrap();
+                        match completed.await {
+                            Ok(Ok((Some((world_data, entities)), _))) => {
+                                // Fill confirmation data
+                                self.confirm_owner = world_data.owner.name.clone();
+                                self.confirm_role = world_data.owner.role.clone();
+                                self.confirm_org = world_data.owner.organization.clone();
+                                let people_names: Vec<String> = world_data.people.iter()
+                                    .map(|p| p.name.clone()).collect();
+                                self.confirm_people = if people_names.is_empty() {
+                                    "(none detected)".to_string()
+                                } else {
+                                    people_names.join(", ")
+                                };
+                                self.processed_world = Some(world_data);
+                                self.processed_entities = Some(entities);
+                                self.ollama_available = true;
+                                // Advance to confirmation
+                                self.step = OnboardingStep::Confirmation;
+                                self.confirm_selection = 0;
+                                self.set_step_text("Here's what I've got:", false);
+                            }
+                            Ok(Ok((None, hint))) => {
+                                self.ollama_available = false;
+                                let msg = if let Some(hint) = hint {
+                                    format!(
+                                        "{}\n\n\
+                                         Your info has been saved.\n\
+                                         You can fix this later in Settings (Ctrl+S).",
+                                        hint
+                                    )
+                                } else {
+                                    "Enrichment provider is not reachable.\n\n\
+                                     Your info has been saved.\n\
+                                     You can fix this later in Settings (Ctrl+S).".to_string()
+                                };
+                                self.set_step_text(&msg, false);
+                            }
+                            Ok(Err(e)) => {
+                                self.ollama_available = false;
+                                let err_msg = format!("{:#}", e);
+                                self.set_step_text(
+                                    &format!(
+                                        "Something went wrong during setup:\n\
+                                         {}\n\n\
+                                         Your info has been saved.\n\
+                                         You can fix this later in Settings (Ctrl+S).",
+                                        err_msg,
+                                    ),
+                                    false,
+                                );
+                            }
+                            Err(e) => {
+                                self.ollama_available = false;
+                                let err_msg = format!("{:#}", e);
+                                self.set_step_text(
+                                    &format!(
+                                        "Something went wrong during setup:\n\
+                                         {}\n\n\
+                                         Your info has been saved.\n\
+                                         You can fix this later in Settings (Ctrl+S).",
+                                        err_msg,
+                                    ),
+                                    false,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            OnboardingStep::Confirmation => {
+                // Text is instant now
+            }
+            OnboardingStep::Done => {
+                self.tick_typewriter_lines();
+                // Fade-out transition (triggered by Enter key, throttled to anim_tick ~100ms)
+                if self.transitioning && anim_tick {
+                    self.transition_frame += 1;
+                    if self.transition_frame > 10 {
+                        return Some(OnboardingTickResult::Complete);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Reset system-check state and spawn the async check task.
     pub(super) fn start_system_checks(&mut self) {
         self.system_checks = vec![
-            ("FFmpeg".to_string(), CheckStatus::Pending),
-            ("Ollama".to_string(), CheckStatus::Pending),
-            ("Ollama server".to_string(), CheckStatus::Pending),
+            ("FFmpeg installed".to_string(), CheckStatus::Pending),
+            ("Ollama installed".to_string(), CheckStatus::Pending),
+            ("Ollama server running".to_string(), CheckStatus::Pending),
         ];
         self.system_check_done = false;
         self.system_check_selection = 0;
@@ -279,7 +535,7 @@ impl OnboardingState {
                 .map(|r| r.status().is_success())
                 .unwrap_or(false);
             let _ = tx.send((2, server_ok, if server_ok { String::new() } else {
-                "Start with: ollama serve".to_string()
+                "Run: ollama serve (default port 11434)".to_string()
             }));
         }));
     }
@@ -292,11 +548,9 @@ impl Dashboard {
             None => return Ok(DashboardAction::Continue),
         };
 
-        // Esc at any step → skip onboarding
+        // Esc at any step → quit the application
         if matches!(key_code, KeyCode::Esc) {
-            self.onboarding = None;
-            self.current_view = DashboardView::Main;
-            return Ok(DashboardAction::Continue);
+            return Ok(DashboardAction::Quit);
         }
 
         match ob.step {
@@ -310,7 +564,7 @@ impl Dashboard {
                 } else if matches!(key_code, KeyCode::Enter) {
                     ob.step = OnboardingStep::ModeSelection;
                     ob.anim_frame = 0;
-                    ob.set_step_text("Scriba uses AI to extract names, topics, and summaries\nfrom your recordings. Choose a mode:", false);
+                    ob.set_step_text("Scriba uses AI to understand your recordings.\nHow do you want to run it?", false);
                 }
             }
             OnboardingStep::ModeSelection => {
@@ -323,22 +577,21 @@ impl Dashboard {
                     }
                     KeyCode::Enter => {
                         if ob.selected_mode == 0 {
-                            ob.step = OnboardingStep::ProviderSelection;
-                            ob.anim_frame = 0;
-                            ob.set_step_text("Which cloud provider?", false);
-                        } else {
-                            ob.selected_mode = 1;
-                            // Set local mode defaults in config
+                            // Private (Local) mode
                             self.config.enrichment.mode = EnrichmentMode::Local {
                                 ollama_endpoint: "http://localhost:11434".to_string(),
                                 ollama_model: "mistral:latest".to_string(),
                             };
                             let _ = self.config.save();
 
-                            // Start system checks
                             ob.step = OnboardingStep::SystemCheck;
                             ob.anim_frame = 0;
                             ob.start_system_checks();
+                        } else {
+                            // Cloud mode
+                            ob.step = OnboardingStep::ProviderSelection;
+                            ob.anim_frame = 0;
+                            ob.set_step_text("Which cloud provider?", false);
                         }
                     }
                     _ => {}
@@ -435,6 +688,8 @@ impl Dashboard {
                                 ob.anim_frame = 0;
                                 ob.set_step_text(
                                     "No problem. You can set the key later in Settings.\n\n\
+                                     Scriba uses your name and role to better\n\
+                                     understand your recordings.\n\n\
                                      What's your name?",
                                     true,
                                 );
@@ -462,7 +717,7 @@ impl Dashboard {
                                 ob.step = OnboardingStep::ModelSetup;
                                 ob.anim_frame = 0;
                                 ob.setup_phase = 0;
-                                ob.set_step_text("Choose your transcription model", false);
+                                ob.set_step_text("Choose a Whisper model for local transcription.\nLarger models are more accurate but slower.", false);
                             }
                         }
                         _ => {}
@@ -483,7 +738,7 @@ impl Dashboard {
                             KeyCode::Enter => {
                                 if ob.ollama_reachable {
                                     ob.setup_phase = 1;
-                                    ob.set_step_text("Choose your enrichment model", false);
+                                    ob.set_step_text("Choose an Ollama model for knowledge extraction.\nThis is used to identify people, topics, and context.", false);
                                     // Fetch available models if not already done
                                     if !ob.ollama_models_fetched {
                                         ob.ollama_models_fetched = true;
@@ -560,7 +815,7 @@ impl Dashboard {
 
                                     let mut items: Vec<(String, DownloadStatus)> = Vec::new();
                                     items.push((
-                                        format!("Whisper {}", whisper_label.replace(" (Recommended)", "")),
+                                        format!("Downloading Whisper {}", whisper_label.replace(" (Recommended)", "")),
                                         if whisper_already { DownloadStatus::Done } else { DownloadStatus::Pending },
                                     ));
 
@@ -664,6 +919,8 @@ impl Dashboard {
                                     ob.anim_frame = 0;
                                     ob.set_step_text(
                                         "No problem. Models will download on first use.\n\n\
+                                         Scriba uses your name and role to better\n\
+                                         understand your recordings.\n\n\
                                          What's your name?",
                                         true,
                                     );
@@ -688,12 +945,17 @@ impl Dashboard {
                                     ob.anim_frame = 0;
                                     if all_done {
                                         ob.set_step_text(
-                                            "All set!\n\nWhat's your name?",
+                                            "All set!\n\n\
+                                         Scriba uses your name and role to better\n\
+                                         understand your recordings.\n\n\
+                                         What's your name?",
                                             true,
                                         );
                                     } else {
                                         ob.set_step_text(
                                             "Some downloads had issues. You can retry later.\n\n\
+                                             Scriba uses your name and role to better\n\
+                                             understand your recordings.\n\n\
                                              What's your name?",
                                             true,
                                         );
@@ -719,10 +981,9 @@ impl Dashboard {
                                 let name = ob.user_name.clone();
                                 ob.set_step_text(&format!(
                                     "Nice to meet you, {}.\n\n\
-                                     Tell me about yourself \u{2014}\n\
-                                     What do you do? What's your company?\n\
-                                     Who do you work with?\n\n\
-                                     Just write naturally.",
+                                     Tell Scriba about yourself so it can better\n\
+                                     understand your recordings. What do you do?\n\
+                                     Who do you work with?",
                                     name
                                 ), true);
                             }
@@ -790,9 +1051,10 @@ impl Dashboard {
                             ob.step = OnboardingStep::Done;
                             ob.anim_frame = 0;
                             ob.set_step_text(
-                                "Your world is ready!\n\n\
-                                 Every recording you make will be enriched\n\
-                                 with what Scriba knows about you and your world.\n\n\
+                                "You're all set.\n\n\
+                                 Record or import audio, and Scriba will\n\
+                                 extract who, what, and why — building\n\
+                                 a knowledge base that grows over time.\n\n\
                                  Let's get started.",
                                 true,
                             );
@@ -800,7 +1062,12 @@ impl Dashboard {
                             // Go back to AskName with values preserved
                             ob.step = OnboardingStep::AskName;
                             ob.anim_frame = 0;
-                            ob.set_step_text("What's your name?", true);
+                            ob.set_step_text(
+                                "Scriba uses your name and role to better\n\
+                                 understand your recordings.\n\n\
+                                 What's your name?",
+                                true,
+                            );
                             // Delete the world.md that was created during processing
                             let _ = std::fs::remove_file(WorldContext::file_path());
                         }
@@ -845,6 +1112,9 @@ impl Dashboard {
             let mut result = None;
             for attempt in 0..max_attempts {
                 if attempt > 0 {
+                    // Remove world.md from a previous fallback attempt so
+                    // initialize_world_from_seed won't hit "already exists".
+                    let _ = std::fs::remove_file(WorldContext::file_path());
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 }
                 match initialize_world_from_seed(&mut db, &config, &seed).await? {
@@ -1002,17 +1272,20 @@ impl Dashboard {
             let sel = ob.selected_mode;
             let sel_bg = Color::Indexed(236);
 
-            let mode_blocks: [(&str, &[&str]); 2] = [
-                ("Cloud Provider", &["Uses Anthropic, OpenAI or Google.", "Best quality. Needs an API key."]),
-                ("Privacy Mode (local)", &["Runs entirely on your machine.", "Fully private \u{2014} no data leaves", "your computer."]),
+            let mode_blocks: [(&str, &str); 2] = [
+                ("Private (Local)", "Whisper + Ollama on your machine. No data leaves your computer."),
+                ("Cloud", "Whisper API + Anthropic/OpenAI/Google. Best quality. Needs an API key."),
             ];
-            // Find max visible width across all blocks for uniform padding
-            let block_width = mode_blocks.iter().flat_map(|(title, descs)| {
-                std::iter::once(title.chars().count() + 2) // "▸ " prefix
-                    .chain(descs.iter().map(|d| d.chars().count() + 2)) // "  " prefix
-            }).max().unwrap_or(0);
+            // Use the header text width so the highlight box spans the full content area
+            let header_width = visible.split('\n').map(|l| l.chars().count()).max().unwrap_or(0);
+            let block_width = header_width.max(
+                mode_blocks.iter().flat_map(|(title, desc)| {
+                    std::iter::once(title.chars().count() + 2)
+                        .chain(std::iter::once(desc.chars().count() + 2))
+                }).max().unwrap_or(0)
+            );
 
-            for (i, (title, descs)) in mode_blocks.iter().enumerate() {
+            for (i, (title, desc)) in mode_blocks.iter().enumerate() {
                 if i > 0 { lines.push(Line::from("")); }
                 if sel == i {
                     let title_text = format!("{}{}", title, " ".repeat(block_width.saturating_sub(title.chars().count() + 2)));
@@ -1020,17 +1293,13 @@ impl Dashboard {
                         Span::styled("\u{25B8} ", Style::default().fg(ACCENT).bg(sel_bg)),
                         Span::styled(title_text, Style::default().fg(Color::White).bg(sel_bg)),
                     ]));
-                    let ds = Style::default().fg(Color::Indexed(245)).bg(sel_bg);
-                    for d in *descs {
-                        let padded = format!("  {}{}", d, " ".repeat(block_width.saturating_sub(d.chars().count() + 2)));
-                        lines.push(Line::from(Span::styled(padded, ds)));
-                    }
+                    let padded = format!("  {}{}", desc, " ".repeat(block_width.saturating_sub(desc.chars().count() + 2)));
+                    lines.push(Line::from(Span::styled(padded, Style::default().fg(Color::Indexed(245)).bg(sel_bg))));
                 } else {
-                    lines.push(Line::from(Span::styled(format!("  {}", title), Style::default().fg(Color::DarkGray))));
-                    let ds = Style::default().fg(Color::DarkGray);
-                    for d in *descs {
-                        lines.push(Line::from(Span::styled(format!("  {}", d), ds)));
-                    }
+                    let title_pad = " ".repeat(block_width.saturating_sub(title.chars().count() + 2));
+                    lines.push(Line::from(Span::styled(format!("  {}{}", title, title_pad), Style::default().fg(Color::DarkGray))));
+                    let desc_pad = " ".repeat(block_width.saturating_sub(desc.chars().count() + 2));
+                    lines.push(Line::from(Span::styled(format!("  {}{}", desc, desc_pad), Style::default().fg(Color::DarkGray))));
                 }
             }
         } else if ob.step == OnboardingStep::ProviderSelection {
@@ -1046,27 +1315,30 @@ impl Dashboard {
                 ("Google (Gemini)", "Fast and cost-effective"),
             ];
             let sel_bg = Color::Indexed(236);
-            // Find max width across all provider entries for uniform padding
-            let block_width = providers.iter().flat_map(|(name, desc)| {
-                std::iter::once(name.chars().count() + 2) // "▸ " prefix
-                    .chain(std::iter::once(desc.chars().count() + 2)) // "  " prefix
-            }).max().unwrap_or(0);
+            // Use header text width so highlight box spans the full content area
+            let header_width = visible.split('\n').map(|l| l.chars().count()).max().unwrap_or(0);
+            let block_width = header_width.max(
+                providers.iter().flat_map(|(name, desc)| {
+                    std::iter::once(name.chars().count() + 2)
+                        .chain(std::iter::once(desc.chars().count() + 2))
+                }).max().unwrap_or(0)
+            );
 
             for (i, (name, desc)) in providers.iter().enumerate() {
                 if i > 0 {
                     lines.push(Line::from(""));
                 }
+                let name_pad = " ".repeat(block_width.saturating_sub(name.chars().count() + 2));
+                let desc_pad = " ".repeat(block_width.saturating_sub(desc.chars().count() + 2));
                 if ob.selected_provider == i {
-                    let name_pad = " ".repeat(block_width.saturating_sub(name.chars().count() + 2));
                     lines.push(Line::from(vec![
                         Span::styled("\u{25B8} ", Style::default().fg(ACCENT).bg(sel_bg)),
                         Span::styled(format!("{}{}", name, name_pad), Style::default().fg(Color::White).bg(sel_bg)),
                     ]));
-                    let desc_pad = " ".repeat(block_width.saturating_sub(desc.chars().count() + 2));
                     lines.push(Line::from(Span::styled(format!("  {}{}", desc, desc_pad), Style::default().fg(Color::Indexed(245)).bg(sel_bg))));
                 } else {
-                    lines.push(Line::from(Span::styled(format!("  {}", name), Style::default().fg(Color::DarkGray))));
-                    lines.push(Line::from(Span::styled(format!("  {}", desc), Style::default().fg(Color::DarkGray))));
+                    lines.push(Line::from(Span::styled(format!("  {}{}", name, name_pad), Style::default().fg(Color::DarkGray))));
+                    lines.push(Line::from(Span::styled(format!("  {}{}", desc, desc_pad), Style::default().fg(Color::DarkGray))));
                 }
             }
         } else if ob.step == OnboardingStep::SystemCheck {
@@ -1076,6 +1348,7 @@ impl Dashboard {
             }
             lines.push(Line::from(""));
 
+            let header_width = visible.split('\n').map(|l| l.chars().count()).max().unwrap_or(0);
             let braille = ['\u{28F7}', '\u{28EF}', '\u{28DF}', '\u{28BF}', '\u{287F}', '\u{28FE}', '\u{28FD}', '\u{28FB}'];
             for (name, status) in &ob.system_checks {
                 let (icon, style) = match status {
@@ -1087,50 +1360,47 @@ impl Dashboard {
                     CheckStatus::Passed => ("\u{2713} ".to_string(), Style::default().fg(Color::Green)),
                     CheckStatus::Failed(_) => ("\u{2717} ".to_string(), Style::default().fg(Color::Red)),
                 };
+                // icon is 2 chars; pad name so total line width matches header
+                let name_pad = " ".repeat(header_width.saturating_sub(name.chars().count() + 2));
                 lines.push(Line::from(vec![
                     Span::styled(icon, style),
-                    Span::styled(name.as_str(), Style::default().fg(Color::White)),
+                    Span::styled(format!("{}{}", name, name_pad), Style::default().fg(Color::White)),
                 ]));
+                // Show hint inline under each failed check
+                if let CheckStatus::Failed(hint) = status {
+                    if !hint.is_empty() {
+                        for hint_line in hint.split('\n') {
+                            lines.push(Line::from(Span::styled(
+                                format!("  {}", hint_line),
+                                Style::default().fg(Color::Indexed(245)),
+                            )));
+                        }
+                    }
+                }
             }
 
-            // If done with failures, show instructions for the first failing check
+            // If done with failures, show actions
             if ob.system_check_done {
-                let first_fail = ob.system_checks.iter().find_map(|(name, s)| {
-                    if let CheckStatus::Failed(hint) = s {
-                        Some((name.clone(), hint.clone()))
-                    } else {
-                        None
-                    }
-                });
+                let any_failed = ob.system_checks.iter().any(|(_, s)| matches!(s, CheckStatus::Failed(_)));
 
-                if let Some((_name, hint)) = first_fail {
-                    lines.push(Line::from(""));
-                    lines.push(Line::from(Span::styled(
-                        "Almost there!",
-                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-                    )));
-                    lines.push(Line::from(""));
-                    for hint_line in hint.split('\n') {
-                        lines.push(Line::from(Span::styled(
-                            format!("  {}", hint_line),
-                            Style::default().fg(Color::Indexed(245)),
-                        )));
-                    }
+                if any_failed {
                     lines.push(Line::from(""));
 
                     // Arrow selector: Check again / Continue anyway
                     let sel_bg = Color::Indexed(236);
                     let options = ["Check again", "Continue anyway"];
-                    let opt_width = options.iter().map(|l| l.chars().count() + 2).max().unwrap_or(0);
+                    let opt_width = header_width.max(
+                        options.iter().map(|l| l.chars().count() + 2).max().unwrap_or(0)
+                    );
                     for (i, label) in options.iter().enumerate() {
+                        let pad = " ".repeat(opt_width.saturating_sub(label.chars().count() + 2));
                         if ob.system_check_selection == i {
-                            let pad = " ".repeat(opt_width.saturating_sub(label.chars().count() + 2));
                             lines.push(Line::from(vec![
                                 Span::styled("\u{25B8} ", Style::default().fg(ACCENT).bg(sel_bg)),
                                 Span::styled(format!("{}{}", label, pad), Style::default().fg(Color::White).bg(sel_bg)),
                             ]));
                         } else {
-                            lines.push(Line::from(Span::styled(format!("  {}", label), Style::default().fg(Color::DarkGray))));
+                            lines.push(Line::from(Span::styled(format!("  {}{}", label, pad), Style::default().fg(Color::DarkGray))));
                         }
                     }
                 }
@@ -1147,17 +1417,20 @@ impl Dashboard {
             match ob.setup_phase {
                 0 => {
                     // Whisper model selector
-                    let block_width = WHISPER_MODELS.iter()
-                        .map(|(_, name, size)| name.chars().count() + size.chars().count() + 6)
+                    let header_width = visible.split('\n').map(|l| l.chars().count()).max().unwrap_or(0);
+                    let min_model_width = WHISPER_MODELS.iter()
+                        .map(|(_, name, size)| name.chars().count() + size.chars().count() + 4)
                         .max().unwrap_or(0);
+                    let block_width = header_width.max(min_model_width);
 
                     for (i, (_, name, size)) in WHISPER_MODELS.iter().enumerate() {
-                        let label = format!("{}    {}", name, size);
+                        // Name left-aligned, size right-aligned within block_width
+                        let gap = block_width.saturating_sub(name.chars().count() + size.chars().count());
+                        let label = format!("{}{}{}", name, " ".repeat(gap), size);
                         if ob.whisper_model_selection == i {
-                            let pad = " ".repeat(block_width.saturating_sub(label.chars().count() + 2));
                             lines.push(Line::from(vec![
                                 Span::styled("\u{25B8} ", Style::default().fg(ACCENT).bg(sel_bg)),
-                                Span::styled(format!("{}{}", label, pad), Style::default().fg(Color::White).bg(sel_bg)),
+                                Span::styled(label, Style::default().fg(Color::White).bg(sel_bg)),
                             ]));
                         } else {
                             lines.push(Line::from(Span::styled(format!("  {}", label), Style::default().fg(Color::DarkGray))));
@@ -1166,6 +1439,7 @@ impl Dashboard {
                 }
                 1 => {
                     // Ollama model selector
+                    let header_width = visible.split('\n').map(|l| l.chars().count()).max().unwrap_or(0);
                     if ob.ollama_available_models.is_empty() {
                         let braille = ['\u{28F7}', '\u{28EF}', '\u{28DF}', '\u{28BF}', '\u{287F}', '\u{28FE}', '\u{28FD}', '\u{28FB}'];
                         lines.push(Line::from(vec![
@@ -1173,57 +1447,81 @@ impl Dashboard {
                             Span::styled("Loading models...", Style::default().fg(Color::DarkGray)),
                         ]));
                     } else {
+                        let block_width = header_width.max(
+                            ob.ollama_available_models.iter()
+                                .map(|m| m.chars().count() + 2)
+                                .max().unwrap_or(0)
+                        );
                         for (i, model_name) in ob.ollama_available_models.iter().enumerate() {
                             let display = model_name.clone();
+                            let pad = " ".repeat(block_width.saturating_sub(display.chars().count() + 2));
                             if ob.ollama_model_selection == i {
-                                let pad = " ".repeat(30usize.saturating_sub(display.chars().count() + 2));
                                 lines.push(Line::from(vec![
                                     Span::styled("\u{25B8} ", Style::default().fg(ACCENT).bg(sel_bg)),
                                     Span::styled(format!("{}{}", display, pad), Style::default().fg(Color::White).bg(sel_bg)),
                                 ]));
                             } else {
-                                lines.push(Line::from(Span::styled(format!("  {}", display), Style::default().fg(Color::DarkGray))));
+                                lines.push(Line::from(Span::styled(format!("  {}{}", display, pad), Style::default().fg(Color::DarkGray))));
                             }
                         }
                     }
                 }
                 2 => {
-                    // Download confirmation
-                    let whisper_name = WHISPER_MODELS[ob.whisper_model_selection].1
-                        .replace(" (Recommended)", "");
-                    let whisper_size = WHISPER_MODELS[ob.whisper_model_selection].2;
-                    lines.push(Line::from(vec![
-                        Span::styled("  Whisper ", Style::default().fg(Color::DarkGray)),
-                        Span::styled(whisper_name, Style::default().fg(Color::White)),
-                        Span::styled(format!("    {}", whisper_size), Style::default().fg(Color::Indexed(245))),
-                    ]));
+                    // Download confirmation — simple label: value pairs
+                    let header_width = visible.split('\n').map(|l| l.chars().count()).max().unwrap_or(0);
+                    let whisper_name = format!("Whisper {}", WHISPER_MODELS[ob.whisper_model_selection].1
+                        .replace(" (Recommended)", ""));
 
-                    if ob.ollama_reachable {
-                        let model = if let EnrichmentMode::Local { ollama_model, .. } = &self.config.enrichment.mode {
-                            ollama_model.split(':').next().unwrap_or(ollama_model).to_string()
+                    let ollama_model = if ob.ollama_reachable {
+                        Some(if let EnrichmentMode::Local { ollama_model, .. } = &self.config.enrichment.mode {
+                            ollama_model.clone()
                         } else {
-                            "mistral".to_string()
-                        };
-                        let model_line = Line::from(vec![
-                            Span::styled("  ", Style::default().fg(Color::DarkGray)),
-                            Span::styled(model, Style::default().fg(Color::White)),
-                            Span::styled("    pull from Ollama", Style::default().fg(Color::Indexed(245))),
-                        ]);
-                        lines.push(model_line);
+                            "mistral:latest".to_string()
+                        })
+                    } else {
+                        None
+                    };
+
+                    // "  Transcription   Whisper Turbo"
+                    // "  Enrichment      mistral:latest"
+                    let label_col = "Transcription".len(); // widest label
+                    let whisper_line_len = 2 + label_col + 3 + whisper_name.len();
+                    let ollama_line_len = ollama_model.as_ref()
+                        .map(|m| 2 + label_col + 3 + m.len()).unwrap_or(0);
+                    let block_width = header_width.max(whisper_line_len).max(ollama_line_len);
+
+                    let label_style = Style::default().fg(Color::DarkGray);
+                    let value_style = Style::default().fg(Color::White);
+
+                    {
+                        let label_pad = " ".repeat(label_col - "Transcription".len());
+                        let right_pad = " ".repeat(block_width.saturating_sub(whisper_line_len));
+                        lines.push(Line::from(vec![
+                            Span::styled(format!("  Transcription{}   ", label_pad), label_style),
+                            Span::styled(format!("{}{}", whisper_name, right_pad), value_style),
+                        ]));
+                    }
+                    if let Some(ref model) = ollama_model {
+                        let label_pad = " ".repeat(label_col - "Enrichment".len());
+                        let this_len = 2 + label_col + 3 + model.len();
+                        let right_pad = " ".repeat(block_width.saturating_sub(this_len));
+                        lines.push(Line::from(vec![
+                            Span::styled(format!("  Enrichment{}   ", label_pad), label_style),
+                            Span::styled(format!("{}{}", model, right_pad), value_style),
+                        ]));
                     }
                     lines.push(Line::from(""));
 
                     let options = ["Download now", "Skip for now"];
-                    let opt_width = options.iter().map(|l| l.chars().count() + 2).max().unwrap_or(0);
                     for (i, label) in options.iter().enumerate() {
+                        let pad = " ".repeat(block_width.saturating_sub(label.chars().count() + 2));
                         if ob.system_check_selection == i {
-                            let pad = " ".repeat(opt_width.saturating_sub(label.chars().count() + 2));
                             lines.push(Line::from(vec![
                                 Span::styled("\u{25B8} ", Style::default().fg(ACCENT).bg(sel_bg)),
                                 Span::styled(format!("{}{}", label, pad), Style::default().fg(Color::White).bg(sel_bg)),
                             ]));
                         } else {
-                            lines.push(Line::from(Span::styled(format!("  {}", label), Style::default().fg(Color::DarkGray))));
+                            lines.push(Line::from(Span::styled(format!("  {}{}", label, pad), Style::default().fg(Color::DarkGray))));
                         }
                     }
                 }
@@ -1287,16 +1585,19 @@ impl Dashboard {
 
             let sel_bg = Color::Indexed(236);
             let fail_labels = ["Try a different key", "Skip for now (set it later)"];
-            let fail_width = fail_labels.iter().map(|l| l.chars().count() + 2).max().unwrap_or(0);
+            let header_width = visible.split('\n').map(|l| l.chars().count()).max().unwrap_or(0);
+            let fail_width = header_width.max(
+                fail_labels.iter().map(|l| l.chars().count() + 2).max().unwrap_or(0)
+            );
             for (i, label) in fail_labels.iter().enumerate() {
+                let pad = " ".repeat(fail_width.saturating_sub(label.chars().count() + 2));
                 if ob.validation_fail_selection == i {
-                    let pad = " ".repeat(fail_width.saturating_sub(label.chars().count() + 2));
                     lines.push(Line::from(vec![
                         Span::styled("\u{25B8} ", Style::default().fg(ACCENT).bg(sel_bg)),
                         Span::styled(format!("{}{}", label, pad), Style::default().fg(Color::White).bg(sel_bg)),
                     ]));
                 } else {
-                    lines.push(Line::from(Span::styled(format!("  {}", label), Style::default().fg(Color::DarkGray))));
+                    lines.push(Line::from(Span::styled(format!("  {}{}", label, pad), Style::default().fg(Color::DarkGray))));
                 }
             }
         } else if ob.step == OnboardingStep::Confirmation {
@@ -1326,16 +1627,19 @@ impl Dashboard {
             // Line selector: Looks good / Let me fix that
             let sel_bg = Color::Indexed(236);
             let confirm_labels = ["Looks good", "Let me fix that"];
-            let confirm_width = confirm_labels.iter().map(|l| l.chars().count() + 2).max().unwrap_or(0);
+            let header_width = visible.split('\n').map(|l| l.chars().count()).max().unwrap_or(0);
+            let confirm_width = header_width.max(
+                confirm_labels.iter().map(|l| l.chars().count() + 2).max().unwrap_or(0)
+            );
             for (i, label) in confirm_labels.iter().enumerate() {
+                let pad = " ".repeat(confirm_width.saturating_sub(label.chars().count() + 2));
                 if ob.confirm_selection == i {
-                    let pad = " ".repeat(confirm_width.saturating_sub(label.chars().count() + 2));
                     lines.push(Line::from(vec![
                         Span::styled("\u{25B8} ", Style::default().fg(ACCENT).bg(sel_bg)),
                         Span::styled(format!("{}{}", label, pad), Style::default().fg(Color::White).bg(sel_bg)),
                     ]));
                 } else {
-                    lines.push(Line::from(Span::styled(format!("  {}", label), Style::default().fg(Color::DarkGray))));
+                    lines.push(Line::from(Span::styled(format!("  {}{}", label, pad), Style::default().fg(Color::DarkGray))));
                 }
             }
         } else {
@@ -1349,10 +1653,14 @@ impl Dashboard {
                         Span::styled(text_line, Style::default().fg(Color::White)),
                     ]));
                 } else if is_done {
-                    lines.push(Line::from(vec![
-                        Span::styled("\u{2713} ", Style::default().fg(ACCENT)),
-                        Span::styled(text_line, Style::default().fg(Color::White)),
-                    ]));
+                    if text_line.is_empty() {
+                        lines.push(Line::from(""));
+                    } else {
+                        lines.push(Line::from(vec![
+                            Span::styled("\u{2713} ", Style::default().fg(ACCENT)),
+                            Span::styled(text_line, Style::default().fg(Color::White)),
+                        ]));
+                    }
                 } else {
                     lines.push(Line::from(Span::styled(text_line, Style::default().fg(Color::White))));
                 }
@@ -1381,10 +1689,21 @@ impl Dashboard {
                     input_value.to_string()
                 };
 
+                // Cap input display width to header text width so centering stays stable
+                let header_char_width = visible.split('\n').map(|l| l.chars().count()).max().unwrap_or(30);
+                // "▸ " prefix = 2 chars, "_" cursor = 1 char
+                let max_input_chars = header_char_width.saturating_sub(3);
+                let truncated_display = if display_value.chars().count() > max_input_chars {
+                    let skip = display_value.chars().count() - max_input_chars;
+                    display_value.chars().skip(skip).collect::<String>()
+                } else {
+                    display_value.clone()
+                };
+
                 lines.push(Line::from(""));
                 lines.push(Line::from(vec![
                     Span::styled("\u{25B8} ", Style::default().fg(ACCENT)),
-                    Span::styled(format!("{}_", display_value), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("{}_", truncated_display), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
                 ]));
             }
         }
@@ -1399,7 +1718,7 @@ impl Dashboard {
         centered_lines.extend(lines);
 
         let max_line_width = centered_lines.iter().map(|l| l.width() as u16).max().unwrap_or(0);
-        let content_width = max_line_width.max(30).min(body.width); // floor 30, cap at body
+        let content_width = max_line_width.min(body.width);
         let left_pad = (body.width.saturating_sub(content_width)) / 2;
         let centered_body = Rect {
             x: body.x + left_pad,
@@ -1505,7 +1824,7 @@ impl Dashboard {
             right_spans.extend([
                 Span::styled("[", Style::default().fg(Color::DarkGray)),
                 Span::styled("Esc", Style::default().fg(Color::White)),
-                Span::styled("] Skip", Style::default().fg(Color::DarkGray)),
+                Span::styled("] Quit", Style::default().fg(Color::DarkGray)),
             ]);
         }
         if !right_hint.is_empty() {
@@ -1577,7 +1896,7 @@ impl Dashboard {
 
         // Horizontal centering
         let max_line_width = centered_lines.iter().map(|l| l.width() as u16).max().unwrap_or(0);
-        let content_width = max_line_width.max(30).min(body.width);
+        let content_width = max_line_width.min(body.width);
         let left_pad = (body.width.saturating_sub(content_width)) / 2;
         let centered_body = Rect {
             x: body.x + left_pad,
