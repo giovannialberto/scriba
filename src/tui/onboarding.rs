@@ -28,6 +28,8 @@ pub(super) enum OnboardingStep {
     Intro,
     ModeSelection,
     // Cloud flow
+    WhisperApiKey,
+    WhisperApiKeyValidation,
     ProviderSelection,
     ApiKeyEntry,
     ApiKeyValidation,
@@ -69,6 +71,8 @@ pub(super) enum OnboardingTickResult {
     Complete,
     /// SystemCheck passed with Ollama reachable — pre-fetch available models.
     FetchOllamaModels,
+    /// Whisper API key validated — save transcription config.
+    SaveWhisperKey(String),
 }
 
 pub(super) const WHISPER_MODELS: &[(LocalModelSize, &str, &str)] = &[
@@ -86,6 +90,9 @@ pub(super) struct OnboardingState {
     pub(super) anim_frame: usize,
     pub(super) selected_mode: usize,
     pub(super) selected_provider: usize,
+    pub(super) whisper_api_key_input: String,
+    pub(super) whisper_key_valid: Option<bool>,
+    pub(super) whisper_validation_task: Option<tokio::task::JoinHandle<Result<bool, anyhow::Error>>>,
     pub(super) api_key_input: String,
     pub(super) api_key_valid: Option<bool>,
     pub(super) validation_fail_selection: usize,
@@ -129,6 +136,9 @@ impl OnboardingState {
             anim_frame: 0,
             selected_mode: 0,
             selected_provider: 0,
+            whisper_api_key_input: String::new(),
+            whisper_key_valid: None,
+            whisper_validation_task: None,
             api_key_input: String::new(),
             api_key_valid: None,
             validation_fail_selection: 0,
@@ -252,8 +262,8 @@ impl OnboardingState {
             OnboardingStep::AskName | OnboardingStep::AskRole => {
                 self.tick_typewriter_lines();
             }
-            OnboardingStep::ModeSelection | OnboardingStep::ProviderSelection
-            | OnboardingStep::ApiKeyEntry => {
+            OnboardingStep::ModeSelection | OnboardingStep::WhisperApiKey
+            | OnboardingStep::ProviderSelection | OnboardingStep::ApiKeyEntry => {
                 // Instant text -- no typewriter
             }
             OnboardingStep::ModelSetup => {
@@ -335,6 +345,40 @@ impl OnboardingState {
                         self.setup_phase = 0;
                         self.transition_frame = 0;
                         self.set_step_text("Choose a Whisper model for local transcription.\nLarger models are more accurate but slower.", false);
+                    }
+                }
+            }
+            OnboardingStep::WhisperApiKeyValidation => {
+                // Poll the Whisper API key validation task
+                if let Some(ref task) = self.whisper_validation_task {
+                    if task.is_finished() {
+                        let completed = self.whisper_validation_task.take().unwrap();
+                        match completed.await {
+                            Ok(Ok(true)) => {
+                                self.whisper_key_valid = Some(true);
+                                let key = self.whisper_api_key_input.trim().to_string();
+                                self.step = OnboardingStep::ProviderSelection;
+                                self.anim_frame = 0;
+                                self.set_step_text(
+                                    "OpenAI key verified.\n\n\
+                                     Now choose an AI provider for knowledge extraction.\n\n\
+                                     Which provider do you want to use?",
+                                    false,
+                                );
+                                return Some(OnboardingTickResult::SaveWhisperKey(key));
+                            }
+                            _ => {
+                                self.whisper_key_valid = Some(false);
+                                self.set_step_text(
+                                    "OpenAI key validation failed.\n\n\
+                                     Check your key and try again:",
+                                    false,
+                                );
+                                // Go back to WhisperApiKey entry
+                                self.step = OnboardingStep::WhisperApiKey;
+                                self.whisper_api_key_input.clear();
+                            }
+                        }
                     }
                 }
             }
@@ -588,14 +632,56 @@ impl Dashboard {
                             ob.anim_frame = 0;
                             ob.start_system_checks();
                         } else {
-                            // Cloud mode
-                            ob.step = OnboardingStep::ProviderSelection;
+                            // Cloud mode — first ask for the Whisper API key
+                            ob.step = OnboardingStep::WhisperApiKey;
                             ob.anim_frame = 0;
-                            ob.set_step_text("Which cloud provider?", false);
+                            ob.set_step_text(
+                                "Cloud transcription uses the OpenAI Whisper API.\n\n\
+                                 Enter your OpenAI API key for transcription:",
+                                false,
+                            );
                         }
                     }
                     _ => {}
                 }
+            }
+            OnboardingStep::WhisperApiKey => {
+                match key_code {
+                    KeyCode::Enter => {
+                        if !ob.whisper_api_key_input.trim().is_empty() {
+                            let key = ob.whisper_api_key_input.trim().to_string();
+
+                            // Start validation
+                            ob.step = OnboardingStep::WhisperApiKeyValidation;
+                            ob.anim_frame = 0;
+                            ob.whisper_key_valid = None;
+                            ob.set_step_text("Testing your OpenAI key...", false);
+
+                            let key_clone = key.clone();
+                            ob.whisper_validation_task = Some(tokio::spawn(async move {
+                                let client = reqwest::Client::builder()
+                                    .timeout(std::time::Duration::from_secs(10))
+                                    .build()?;
+                                let resp = client
+                                    .get("https://api.openai.com/v1/models")
+                                    .bearer_auth(&key_clone)
+                                    .send()
+                                    .await?;
+                                Ok(resp.status().is_success())
+                            }));
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        ob.whisper_api_key_input.push(c);
+                    }
+                    KeyCode::Backspace => {
+                        ob.whisper_api_key_input.pop();
+                    }
+                    _ => {}
+                }
+            }
+            OnboardingStep::WhisperApiKeyValidation => {
+                // Waiting for async validation — no key handling
             }
             OnboardingStep::ProviderSelection => {
                 match key_code {
@@ -611,18 +697,41 @@ impl Dashboard {
                             1 => CloudProvider::OpenAI,
                             _ => CloudProvider::Google,
                         };
+
+                        // If OpenAI, reuse the Whisper API key
+                        let prefilled_key = if p == CloudProvider::OpenAI {
+                            ob.whisper_api_key_input.trim().to_string()
+                        } else {
+                            String::new()
+                        };
+
                         self.config.enrichment.mode = EnrichmentMode::Cloud {
                             provider: p.clone(),
-                            api_key: String::new(),
-                            model: None,
+                            api_key: prefilled_key.clone(),
+                            model: Some(p.default_model().to_string()),
                         };
-                        ob.step = OnboardingStep::ApiKeyEntry;
-                        ob.anim_frame = 0;
-                        ob.set_step_text(&format!(
-                            "Enter your {} API key.\n\n\
-                             Paste it below:",
-                            p.display_name()
-                        ), false);
+
+                        if !prefilled_key.is_empty() {
+                            // Same key as Whisper — already validated, skip to AskName
+                            let _ = self.config.save();
+                            ob.step = OnboardingStep::AskName;
+                            ob.anim_frame = 0;
+                            ob.set_step_text(
+                                "Using your OpenAI key for enrichment too.\n\n\
+                                 Scriba uses your name and role to better\n\
+                                 understand your recordings.\n\n\
+                                 What's your name?",
+                                true,
+                            );
+                        } else {
+                            ob.step = OnboardingStep::ApiKeyEntry;
+                            ob.anim_frame = 0;
+                            ob.set_step_text(&format!(
+                                "Enter your {} API key.\n\n\
+                                 Paste it below:",
+                                p.display_name()
+                            ), false);
+                        }
                     }
                     _ => {}
                 }
@@ -1229,6 +1338,7 @@ impl Dashboard {
         let header_title = match ob.step {
             OnboardingStep::Entrance | OnboardingStep::Intro => "Welcome",
             OnboardingStep::ModeSelection => "Setup",
+            OnboardingStep::WhisperApiKey | OnboardingStep::WhisperApiKeyValidation => "Setup \u{00B7} Transcription",
             OnboardingStep::ProviderSelection => "Setup \u{00B7} Provider",
             OnboardingStep::ApiKeyEntry | OnboardingStep::ApiKeyValidation => "Setup \u{00B7} API Key",
             OnboardingStep::SystemCheck => "Setup \u{00B7} System Check",
@@ -1258,7 +1368,8 @@ impl Dashboard {
 
         // Braille spinner for processing with task running
         let is_processing_active = ob.step == OnboardingStep::Processing && ob.processing_task.is_some();
-        let is_validating = ob.step == OnboardingStep::ApiKeyValidation && ob.validation_task.is_some();
+        let is_validating = (ob.step == OnboardingStep::ApiKeyValidation && ob.validation_task.is_some())
+            || (ob.step == OnboardingStep::WhisperApiKeyValidation && ob.whisper_validation_task.is_some());
         let is_done = ob.step == OnboardingStep::Done;
 
         // Step-specific rendering
@@ -1669,11 +1780,12 @@ impl Dashboard {
             // Input field for input steps (only after text reveal is complete)
             let show_input = ob.text_complete && matches!(
                 ob.step,
-                OnboardingStep::ApiKeyEntry | OnboardingStep::AskName | OnboardingStep::AskRole
+                OnboardingStep::WhisperApiKey | OnboardingStep::ApiKeyEntry | OnboardingStep::AskName | OnboardingStep::AskRole
             );
 
             if show_input {
                 let input_value = match ob.step {
+                    OnboardingStep::WhisperApiKey => &ob.whisper_api_key_input,
                     OnboardingStep::ApiKeyEntry => &ob.api_key_input,
                     OnboardingStep::AskName => &ob.user_name,
                     OnboardingStep::AskRole => &ob.user_role,
@@ -1681,7 +1793,7 @@ impl Dashboard {
                 };
 
                 // Mask API key input
-                let display_value = if ob.step == OnboardingStep::ApiKeyEntry && !input_value.is_empty() {
+                let display_value = if matches!(ob.step, OnboardingStep::WhisperApiKey | OnboardingStep::ApiKeyEntry) && !input_value.is_empty() {
                     let vis = input_value.chars().take(4).collect::<String>();
                     let hidden = "*".repeat(input_value.len().saturating_sub(4));
                     format!("{}{}", vis, hidden)
@@ -1731,20 +1843,40 @@ impl Dashboard {
         f.render_widget(body_para, centered_body);
 
         // ── Step dots ───────────────────────────────────────────────
-        // Both privacy and cloud flows have 9 steps:
-        // Privacy: Intro(0) → Mode(1) → SystemCheck(2) → ModelSetup(3) → Name(4) → Role(5) → Processing(6) → Confirm(7) → Done(8)
-        // Cloud:   Intro(0) → Mode(1) → Provider(2) → ApiKey(3) → Name(4) → Role(5) → Processing(6) → Confirm(7) → Done(8)
-        let step_count = 9;
-        let current_idx = match ob.step {
-            OnboardingStep::Entrance | OnboardingStep::Intro => 0,
-            OnboardingStep::ModeSelection => 1,
-            OnboardingStep::ProviderSelection | OnboardingStep::SystemCheck => 2,
-            OnboardingStep::ApiKeyEntry | OnboardingStep::ApiKeyValidation | OnboardingStep::ModelSetup => 3,
-            OnboardingStep::AskName => 4,
-            OnboardingStep::AskRole => 5,
-            OnboardingStep::Processing => 6,
-            OnboardingStep::Confirmation => 7,
-            OnboardingStep::Done => 8,
+        // Privacy: Intro(0) → Mode(1) → SystemCheck(2) → ModelSetup(3) → Name(4) → Role(5) → Processing(6) → Confirm(7) → Done(8) = 9
+        // Cloud:   Intro(0) → Mode(1) → WhisperKey(2) → Provider(3) → ApiKey(4) → Name(5) → Role(6) → Processing(7) → Confirm(8) → Done(9) = 10
+        let is_cloud = matches!(ob.step,
+            OnboardingStep::WhisperApiKey | OnboardingStep::ProviderSelection
+            | OnboardingStep::ApiKeyEntry | OnboardingStep::ApiKeyValidation
+        ) || matches!(self.config.enrichment.mode, EnrichmentMode::Cloud { .. });
+        let step_count = if is_cloud { 10 } else { 9 };
+        let current_idx = if is_cloud {
+            match ob.step {
+                OnboardingStep::Entrance | OnboardingStep::Intro => 0,
+                OnboardingStep::ModeSelection => 1,
+                OnboardingStep::WhisperApiKey | OnboardingStep::WhisperApiKeyValidation => 2,
+                OnboardingStep::ProviderSelection => 3,
+                OnboardingStep::ApiKeyEntry | OnboardingStep::ApiKeyValidation => 4,
+                OnboardingStep::AskName => 5,
+                OnboardingStep::AskRole => 6,
+                OnboardingStep::Processing => 7,
+                OnboardingStep::Confirmation => 8,
+                OnboardingStep::Done => 9,
+                _ => 0,
+            }
+        } else {
+            match ob.step {
+                OnboardingStep::Entrance | OnboardingStep::Intro => 0,
+                OnboardingStep::ModeSelection => 1,
+                OnboardingStep::SystemCheck => 2,
+                OnboardingStep::ModelSetup => 3,
+                OnboardingStep::AskName => 4,
+                OnboardingStep::AskRole => 5,
+                OnboardingStep::Processing => 6,
+                OnboardingStep::Confirmation => 7,
+                OnboardingStep::Done => 8,
+                _ => 0,
+            }
         };
 
         let mut dots: Vec<Span> = Vec::new();
@@ -1785,6 +1917,11 @@ impl Dashboard {
             OnboardingStep::Intro => "[Enter] Continue",
             OnboardingStep::ModeSelection | OnboardingStep::ProviderSelection
             | OnboardingStep::Confirmation => "[Up/Down] Select  [Enter] Confirm",
+            OnboardingStep::WhisperApiKey => "[Enter] Validate",
+            OnboardingStep::WhisperApiKeyValidation => {
+                if ob.whisper_validation_task.is_some() { "Validating..." }
+                else { "" }
+            }
             OnboardingStep::ApiKeyEntry => "[Enter] Validate",
             OnboardingStep::ApiKeyValidation => {
                 if ob.validation_task.is_some() { "Validating..." }

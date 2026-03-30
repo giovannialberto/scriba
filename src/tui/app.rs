@@ -1,5 +1,5 @@
 use crate::core::{
-    AudioPlayer, EnrichmentMode, RecordingResult, ScribaConfig,
+    AudioPlayer, EnrichmentMode, RecordingResult, ScribaConfig, TranscriptionMode,
     VoiceCommand, VoiceDetectorHandle, VoiceListeningState,
     start_voice_detector,
 };
@@ -539,6 +539,12 @@ impl Dashboard {
                             self.current_view = DashboardView::Main;
                             self.load_entities().ok();
                             self.init_global_chat();
+                        }
+                        OnboardingTickResult::SaveWhisperKey(key) => {
+                            self.config.transcription = TranscriptionMode::Api {
+                                api_key: key,
+                            };
+                            let _ = self.config.save();
                         }
                         OnboardingTickResult::FetchOllamaModels => {
                             let endpoint = if let EnrichmentMode::Local { ollama_endpoint, .. } = &self.config.enrichment.mode {
