@@ -1,6 +1,6 @@
 [package]
 name = "scriba"
-version = "0.23.0"
+version = "0.23.1"
 edition = "2021"
 description = "A CLI tool for recording and transcribing audio locally using Whisper (whisper-rs)"
 authors = ["Giovanni Alberto Falcione"]
