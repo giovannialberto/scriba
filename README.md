@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/screenshots/scriba-logo-v2.png" alt="Scriba" width="160" height="65" />
+<img src="docs/screenshots/scriba-logo-v2.png" alt="Scriba" width="280" height="115" />
 
 **Record. Transcribe. Flow.**
 
