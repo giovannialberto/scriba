@@ -165,7 +165,12 @@ pub struct ChatState {
     // Text selection state (click-drag to select, auto-copy on release)
     pub selection_anchor: Option<(usize, usize)>, // (content_line, char_col) where drag started
     pub selection_end: Option<(usize, usize)>,    // (content_line, char_col) current drag position
-    pub content_texts: Vec<String>,               // plain text of each content line for extraction
+    pub content_texts: Vec<String>,               // plain text of each content line for selection highlight
+    pub content_texts_raw: Vec<String>,           // same lines but without UI prefix chrome (for clipboard)
+
+    // Render geometry cached for mouse hit-testing
+    pub content_top_pad: usize,       // blank lines above content (home screen centering)
+    pub content_border_overhead: u16, // border lines subtracted from height (0 if borderless)
 
     // Context window tracking (Anthropic only)
     pub context_window_max: u32,
@@ -176,6 +181,7 @@ pub struct ChatState {
     // Rendering cache for completed messages
     cached_msg_lines: Vec<Line<'static>>,
     cached_msg_texts: Vec<String>,
+    cached_msg_raw_texts: Vec<String>, // prefix-free version of cached_msg_texts for clipboard
     cached_msg_count: usize,
     cached_width: usize,
 }
@@ -214,6 +220,9 @@ impl ChatState {
             selection_anchor: None,
             selection_end: None,
             content_texts: Vec::new(),
+            content_texts_raw: Vec::new(),
+            content_top_pad: 0,
+            content_border_overhead: 2,
             context_window_max: std::env::var("SCRIBA_CTX_LIMIT")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -223,6 +232,7 @@ impl ChatState {
             usage_baseline_set: false,
             cached_msg_lines: Vec::new(),
             cached_msg_texts: Vec::new(),
+            cached_msg_raw_texts: Vec::new(),
             cached_msg_count: 0,
             cached_width: 0,
         }
@@ -367,13 +377,23 @@ impl ChatState {
     /// Map a mouse position to a (content_line, char_col) in the chat content.
     pub fn mouse_to_content_pos(&self, mouse_col: u16, mouse_row: u16) -> Option<(usize, usize)> {
         let rect = self.panel_rect;
-        let click_row = (mouse_row - rect.y).saturating_sub(1) as usize;
-        let char_col = (mouse_col - rect.x).saturating_sub(1) as usize;
+        // Subtract the actual border overhead (0 if borderless, 1 if bordered)
+        let border_top = if self.content_border_overhead > 0 { 1u16 } else { 0u16 };
+        let border_left = border_top;
+        let click_row = (mouse_row.saturating_sub(rect.y + border_top)) as usize;
+        let char_col = (mouse_col.saturating_sub(rect.x + border_left)) as usize;
 
-        let inner_height = rect.height.saturating_sub(2) as usize;
+        let inner_height = rect.height.saturating_sub(self.content_border_overhead) as usize;
         let has_conv = !self.messages.is_empty() || self.is_generating;
         let reserved = if has_conv { 2 } else { 1 };
         let chat_height = inner_height.saturating_sub(reserved);
+
+        // Account for home-screen vertical centering top padding
+        let top_pad = self.content_top_pad;
+        if click_row < top_pad {
+            return None;
+        }
+        let click_row_in_content = click_row - top_pad;
 
         let scroll_y = if self.auto_scroll || self.total_content_lines <= chat_height {
             self.total_content_lines.saturating_sub(chat_height)
@@ -384,10 +404,10 @@ impl ChatState {
 
         let lines_to_show = self.total_content_lines.saturating_sub(scroll_y);
         let pad = chat_height.saturating_sub(lines_to_show.min(chat_height));
-        if click_row < pad {
+        if click_row_in_content < pad {
             return None;
         }
-        let content_line = scroll_y + (click_row - pad);
+        let content_line = scroll_y + (click_row_in_content - pad);
         if content_line >= self.total_content_lines {
             return None;
         }
@@ -395,34 +415,57 @@ impl ChatState {
     }
 
     /// Extract the plain text between two content positions.
+    /// Uses `content_texts_raw` (no UI prefixes) so pasted text is clean.
     pub fn extract_selected_text(&self, anchor: (usize, usize), end: (usize, usize)) -> String {
         let (start, end) = if anchor <= end { (anchor, end) } else { (end, anchor) };
         let (start_line, start_col) = start;
         let (end_line, end_col) = end;
 
-        let texts = &self.content_texts;
+        // Use raw (prefix-free) texts for clipboard; fall back to content_texts if not populated
+        let texts = if !self.content_texts_raw.is_empty() {
+            &self.content_texts_raw
+        } else {
+            &self.content_texts
+        };
         if texts.is_empty() || start_line >= texts.len() {
             return String::new();
         }
 
-        let mut result = String::new();
+        // Compute per-line prefix lengths from the visual content_texts so selection
+        // coordinates (which reference the visual lines) map correctly into the raw text.
+        let prefix_lens: Vec<usize> = self.content_texts.iter().zip(texts.iter()).map(|(vis, raw)| {
+            vis.chars().count().saturating_sub(raw.chars().count())
+        }).collect();
+
+        let mut lines: Vec<String> = Vec::new();
         for line_idx in start_line..=end_line.min(texts.len() - 1) {
-            let line_text = &texts[line_idx];
-            let chars: Vec<char> = line_text.chars().collect();
+            let raw_text = &texts[line_idx];
+            let raw_chars: Vec<char> = raw_text.chars().collect();
+            let prefix_len = prefix_lens.get(line_idx).copied().unwrap_or(0);
 
-            let from = if line_idx == start_line { start_col.min(chars.len()) } else { 0 };
-            let to = if line_idx == end_line { end_col.min(chars.len()) } else { chars.len() };
+            // Translate visual column coordinates into raw-text column coordinates
+            let raw_from = if line_idx == start_line {
+                start_col.saturating_sub(prefix_len).min(raw_chars.len())
+            } else {
+                0
+            };
+            let raw_to = if line_idx == end_line {
+                end_col.saturating_sub(prefix_len).min(raw_chars.len())
+            } else {
+                raw_chars.len()
+            };
 
-            if from < to {
-                let slice: String = chars[from..to].iter().collect();
-                result.push_str(&slice);
-            }
-            if line_idx < end_line {
-                result.push('\n');
+            if raw_from < raw_to {
+                let slice: String = raw_chars[raw_from..raw_to].iter().collect();
+                lines.push(slice.trim_end().to_string());
+            } else {
+                // Empty/blank line — preserve it as a paragraph separator
+                lines.push(String::new());
             }
         }
 
-        result
+        // Join lines, then trim trailing blank lines only
+        lines.join("\n").trim_end().to_string()
     }
 
     // ── Rendering ───────────────────────────────────────────────────────────
@@ -442,6 +485,8 @@ impl ChatState {
         };
 
         let border_overhead = if self.borderless { 0u16 } else { 2u16 };
+        self.content_border_overhead = border_overhead;
+        self.content_top_pad = 0; // reset; home screen will update below
         let inner_height = area.height.saturating_sub(border_overhead) as usize;
         let has_conversation = !self.messages.is_empty() || self.is_generating;
         let padding = if self.borderless { 2usize } else { 4usize };
@@ -672,6 +717,7 @@ impl ChatState {
 
             // ── Vertical centering (bias upper third) ────────────────────
             let total_content = all_lines.len();
+            self.content_texts_raw = content_texts.clone(); // home screen: no meaningful prefixes
             self.content_texts = content_texts;
             self.total_content_lines = total_content;
             // Use inner_height (not chat_height) since we included the input inline
@@ -681,6 +727,7 @@ impl ChatState {
             } else {
                 0
             };
+            self.content_top_pad = top_pad;
             for _ in 0..top_pad {
                 final_lines.push(Line::from(""));
             }
@@ -720,7 +767,9 @@ impl ChatState {
             content_texts.push(text.clone());
             all_lines.push(Line::from(Span::styled(text, style)));
 
+            self.content_texts_raw = content_texts.clone(); // suggestions: raw = display (no meaningful prefix)
             self.content_texts = content_texts;
+            self.content_top_pad = 0;
             let total_content = all_lines.len();
             self.total_content_lines = total_content;
             let scroll_y: u16 = if self.auto_scroll || total_content <= chat_height {
@@ -757,6 +806,7 @@ impl ChatState {
             if !cache_valid {
                 let mut cached_lines: Vec<Line<'static>> = Vec::new();
                 let mut cached_texts: Vec<String> = Vec::new();
+                let mut cached_raw_texts: Vec<String> = Vec::new();
                 let wrap_width = content_width.saturating_sub(2);
 
                 for msg in &self.messages {
@@ -767,11 +817,13 @@ impl ChatState {
                                 let wrapped = textwrap::wrap(line, wrap_width);
                                 if wrapped.is_empty() {
                                     cached_texts.push("  ".to_string());
+                                    cached_raw_texts.push(String::new());
                                     cached_lines.push(Line::from("  ".to_string()));
                                 } else {
                                     for w in wrapped.iter() {
                                         let text = format!(" \u{2502} {}", w);
                                         cached_texts.push(text.clone());
+                                        cached_raw_texts.push(w.to_string());
                                         cached_lines.push(Line::from(vec![
                                             Span::styled(" \u{2502} ", Style::default().fg(Color::Indexed(60))),
                                             Span::styled(w.to_string(), Style::default().fg(Color::Indexed(249))),
@@ -780,6 +832,7 @@ impl ChatState {
                                 }
                             }
                             cached_texts.push(String::new());
+                            cached_raw_texts.push(String::new());
                             cached_lines.push(Line::from(""));
                         }
                         ChatRole::Assistant => {
@@ -787,13 +840,20 @@ impl ChatState {
                             for block in &msg.blocks {
                                 match block {
                                     ChatBlock::ToolCall(tc) => {
+                                        let before = cached_texts.len();
                                         render_tool_call_cached(tc, &mut cached_lines, &mut cached_texts);
+                                        // For tool calls, raw text = same as display (no meaningful prefix to strip)
+                                        let added = cached_texts.len() - before;
+                                        for i in (cached_texts.len() - added)..cached_texts.len() {
+                                            cached_raw_texts.push(cached_texts[i].trim_start().to_string());
+                                        }
                                     }
                                     ChatBlock::Text(text) => {
                                         for wl in safe_markdown_lines(text, wrap_width) {
                                             let plain: String =
                                                 wl.spans.iter().map(|s| s.content.as_ref()).collect();
                                             cached_texts.push(format!("  {}", plain));
+                                            cached_raw_texts.push(plain.clone());
                                             let mut indented = vec![Span::raw("  ".to_string())];
                                             indented.extend(wl.spans);
                                             cached_lines.push(Line::from(indented));
@@ -803,6 +863,7 @@ impl ChatState {
                                         let dashes = "─".repeat((content_width.saturating_sub(22)) / 2);
                                         let marker = format!("  {} context compacted {}", dashes, dashes);
                                         cached_texts.push(marker.clone());
+                                        cached_raw_texts.push(String::new()); // don't copy compaction markers
                                         cached_lines.push(Line::from(Span::styled(
                                             marker,
                                             Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
@@ -811,6 +872,7 @@ impl ChatState {
                                 }
                             }
                             cached_texts.push(String::new());
+                            cached_raw_texts.push(String::new());
                             cached_lines.push(Line::from(""));
                         }
                         ChatRole::System => {
@@ -823,6 +885,7 @@ impl ChatState {
                                             let dashes = "─".repeat((content_width.saturating_sub(22)) / 2);
                                             let marker = format!("  {} context compacted {}", dashes, dashes);
                                             cached_texts.push(marker.clone());
+                                            cached_raw_texts.push(String::new());
                                             cached_lines.push(Line::from(Span::styled(
                                                 marker,
                                                 Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
@@ -835,6 +898,7 @@ impl ChatState {
                                                 for w in &wrapped {
                                                     let full = w.to_string();
                                                     cached_texts.push(full.clone());
+                                                    cached_raw_texts.push(full.clone());
                                                     cached_lines.push(Line::from(Span::styled(full, style)));
                                                 }
                                             }
@@ -849,17 +913,20 @@ impl ChatState {
                                     let wrapped = textwrap::wrap(line, content_width);
                                     if wrapped.is_empty() {
                                         cached_texts.push(String::new());
+                                        cached_raw_texts.push(String::new());
                                         cached_lines.push(Line::from(Span::styled(String::new(), style)));
                                     } else {
                                         for w in &wrapped {
                                             let full = w.to_string();
                                             cached_texts.push(full.clone());
+                                            cached_raw_texts.push(full.clone());
                                             cached_lines.push(Line::from(Span::styled(full, style)));
                                         }
                                     }
                                 }
                             }
                             cached_texts.push(String::new());
+                            cached_raw_texts.push(String::new());
                             cached_lines.push(Line::from(""));
                         }
                     }
@@ -867,6 +934,7 @@ impl ChatState {
 
                 self.cached_msg_lines = cached_lines;
                 self.cached_msg_texts = cached_texts;
+                self.cached_msg_raw_texts = cached_raw_texts;
                 self.cached_msg_count = msg_count;
                 self.cached_width = content_width;
             }
@@ -876,6 +944,7 @@ impl ChatState {
             // with spinners. Builds up the answer in real-time.
             let mut dynamic_lines: Vec<Line<'static>> = Vec::new();
             let mut dynamic_texts: Vec<String> = Vec::new();
+            let mut dynamic_raw_texts: Vec<String> = Vec::new();
             let wrap_width = content_width.saturating_sub(2);
 
             for block in &self.pending_blocks {
@@ -886,6 +955,7 @@ impl ChatState {
                             let plain: String =
                                 wl.spans.iter().map(|s| s.content.as_ref()).collect();
                             dynamic_texts.push(format!("  {}", plain));
+                            dynamic_raw_texts.push(plain.clone());
                             let mut indented = vec![Span::raw("  ".to_string())];
                             indented.extend(wl.spans);
                             dynamic_lines.push(Line::from(indented));
@@ -920,6 +990,7 @@ impl ChatState {
                             ));
                         }
                         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+                        dynamic_raw_texts.push(text.trim_start().to_string());
                         dynamic_texts.push(text);
                         dynamic_lines.push(Line::from(spans));
                     }
@@ -927,6 +998,7 @@ impl ChatState {
                         let dashes = "─".repeat((content_width.saturating_sub(22)) / 2);
                         let marker = format!("  {} context compacted {}", dashes, dashes);
                         dynamic_texts.push(marker.clone());
+                        dynamic_raw_texts.push(String::new());
                         dynamic_lines.push(Line::from(Span::styled(
                             marker,
                             Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
@@ -939,6 +1011,7 @@ impl ChatState {
                 let spinners = ['◐', '◑', '◒', '◓'];
                 let spinner = spinners[self.spinner_frame % spinners.len()];
                 let text = format!(" {} {}", spinner, status);
+                dynamic_raw_texts.push(String::new()); // don't copy status spinner lines
                 dynamic_texts.push(text);
                 dynamic_lines.push(Line::from(vec![
                     Span::styled(
@@ -963,6 +1036,10 @@ impl ChatState {
             let mut content_texts = self.cached_msg_texts.clone();
             content_texts.extend(dynamic_texts);
             self.content_texts = content_texts;
+
+            let mut content_raw_texts = self.cached_msg_raw_texts.clone();
+            content_raw_texts.extend(dynamic_raw_texts);
+            self.content_texts_raw = content_raw_texts;
 
             // ── Scroll calculation ─────────────────────────────────────────
             let scroll_y: u16 = if self.auto_scroll || total_content <= chat_height {
