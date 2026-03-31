@@ -1,208 +1,65 @@
-# Scriba
+<div align="center">
 
-Modern CLI and TUI to record audio and transcribe it locally using Whisper via whisper-rs, or via the OpenAI API. Local mode requires no API key; API mode uses your `OPENAI_API_KEY`.
+<img src="docs/screenshots/scriba-logo-v2.png" alt="Scriba" width="160" height="65" />
 
-## ✨ Features
+**Record. Transcribe. Flow.**
 
-- 🎙️ **Audio Recording** - High-quality microphone recording with smart MP3 compression
-- 📝 **Transcription (Local or API)** - Whisper.cpp engine via whisper-rs with progress indicators, or OpenAI API  
-- 📊 **Interactive Dashboard** - Browse, search, and manage recordings with model display
-- 🔍 **Full-Text Search** - Find recordings by searching transcript content
-- ▶️ **Audio Playback** - Play recordings directly from the dashboard
-- 📋 **Transcript Management** - Copy, view, re-transcribe, and manage recordings
-- 🏷️ **Model Tracking** - See which transcription model was used for each recording
-- 🔄 **Re-transcription** - Easily re-transcribe with different models from transcript view
-- 📁 **External Audio Import** - Import and transcribe external audio files (from the dashboard or CLI)
-- 🧠 **Knowledge Extraction** - LLM-powered enrichment extracts summaries, topics, and entities from transcripts via Ollama
-- 🌍 **World Context** - Persistent knowledge graph tracks people, organizations, and projects across recordings
-- 🏷️ **Entity Management** - Edit, delete, and merge entities from the TUI with automatic world sync
-- 🤖 **MCP Server Integration** - Connect with Claude Desktop and other MCP clients to access transcripts via AI assistants
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-## 🚀 Quick Start
+</div>
 
-### Installation
+---
+
+Scriba is an agent that turns your recordings into a searchable, queryable knowledge base and lets you ask questions across all of it. It builds a persistent knowledge graph so the agent always has context, not just the last thing you said.
+
+Run entirely **offline** with Whisper.cpp + Ollama, or bring your own **AI providers** (OpenAI, Anthropic, Google).
+
+<div align="center">
+<img src="docs/screenshots/scriba-home-cut.png" alt="Scriba home" width="700" />
+</div>
+
+## How it works
+
+1. **Record** — capture your microphone or system audio
+2. **Transcribe** — local Whisper models or the OpenAI Whisper API
+3. **Enrich** — an LLM extracts summaries, topics, entities, and action items from every recording
+4. **Ask** — an agent reasons across your entire history to answer questions, find connections, and take action
+
+## Get started
+
+**Requirements:** CMake and FFmpeg (`brew install cmake ffmpeg`). Ollama is optional, for Private mode.
+
 ```bash
-# Homebrew (recommended)
 brew tap giovannialberto/scriba
 brew install scriba
-
-# From source
-cargo install --git https://github.com/giovannialberto/scriba
-```
-
-### Whisper Models (Local Mode)
-You can let Scriba auto-download models on first use, or pre-place a GGML/GGUF model under `~/scriba_recordings/models/`.
-Examples: `ggml-base.bin`, `base.gguf`, `ggml-large-v3-turbo-q5_0.gguf`.
-
-### Usage
-```bash
-# Launch interactive dashboard
 scriba
-
-# Record and transcribe in CLI (choose model or API)
-scriba record --model turbo
-scriba record --local --model medium
-scriba record --api-key $OPENAI_API_KEY
-
-# Import external audio file and transcribe via CLI
-scriba transcribe /path/to/audio/file.mp3 -n "My call" --model large
-scriba transcribe /path/to/audio/file.wav --api-key $OPENAI_API_KEY
-
-# Initialize world context (first time)
-scriba world init
-
-# Enrich a recording with LLM (requires Ollama)
-scriba enrich <recording_name>
-
-# Run as MCP server for Claude Desktop integration
-scriba mcp
 ```
 
-## 📊 Dashboard Controls (TUI)
+On first run, Scriba walks you through an onboarding flow to choose your mode and configure your setup. Then **`Ctrl+R`** to record.
 
-### Main Dashboard
-| Key | Action |
-|-----|--------|
-| **R** | Record + Auto-transcribe |
-| **A** | Add external audio file & transcribe |
-| **T** | Transcribe selected recording |
-| **Enter** | View transcript |
-| **C** | Copy transcript to clipboard |
-| **P** | Play recording |
-| **/** | Search transcripts |
-| **D** | Delete recording |
-| **E** | Entity management view |
-| **S** | Settings |
-| **H** | Show help |
 
-### Transcript View
-| Key | Action |
-|-----|--------|
-| **T** | Re-transcribe with current model |
-| **C** | Copy transcript to clipboard |
-| **Esc** | Return to dashboard |
+## Ask Scriba
 
-### Entity View
-| Key | Action |
-|-----|--------|
-| **E** | Edit selected entity (name, type, context) |
-| **D** | Delete entity |
-| **M** | Merge entity into another |
-| **Enter** | View entity details |
-| **R** | Refresh entity list |
-| **Esc** | Return to dashboard |
+Ask *"what did we decide in last Tuesday's call?"* or *"who has mentioned the Q2 roadmap?"* and Scriba will search your transcripts, look up entities, and chain tool calls to get to a real answer. Ask from the home to query your entire history, or from within a transcript for recording-specific context.
 
-## 🗂️ File Organization
+<div align="center">
+<img src="docs/screenshots/scriba-chat.png" alt="Ask Scriba chat" width="700" />
+</div>
 
-All recordings are stored in `~/scriba_recordings/`:
-```
-~/scriba_recordings/
-├── 2025-08-26_14-30-25_meeting/
-│   ├── recording.mp3
-│   └── transcript.txt
-├── world.md          # Knowledge graph (auto-managed)
-└── scriba.db         # Recordings, entities, mentions
-```
+## MCP server
 
-## 🔧 Requirements
-
-- **Whisper model (Local)** - GGML/GGUF file under `~/scriba_recordings/models/` (auto-download supported)
-- **CMake** - Required to build whisper-rs (`brew install cmake` on macOS)
-- **FFmpeg** - For audio compression and resampling (`brew install ffmpeg`)
-- **Audio system** - Microphone for recording, speakers for playback
-- **Ollama** (optional) - For knowledge extraction and enrichment (see setup below)
-
-### Modes and Model Selection
-- Local mode uses Whisper models: `--model tiny|base|small|medium|large|turbo`.
-- API mode uses your OpenAI key: `--api-key $OPENAI_API_KEY` or configure in the dashboard settings.
-- Dashboard lets you toggle between Local and API, and cycle model sizes.
-- Turbo defaults to a GGUF build (`ggml-large-v3-turbo-q5_0.gguf`). You can override by placing a different model file in `~/scriba_recordings/models/`.
-
-## 🤖 MCP Server Integration
-
-Scriba includes a Model Context Protocol (MCP) server that allows AI assistants like Claude Desktop to access your transcripts directly.
-
-### Setup for Claude Desktop
-1. Run `scriba mcp` to start the MCP server
-2. Add this configuration to your Claude Desktop config file:
-   - **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
-   - **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+Scriba exposes your recordings to Claude Desktop via the Model Context Protocol:
 
 ```json
 {
   "mcpServers": {
-    "scriba": {
-      "command": "scriba",
-      "args": ["mcp"]
-    }
+    "scriba": { "command": "scriba", "args": ["mcp"] }
   }
 }
 ```
 
-### Available Tools
-- **list_transcripts** - Browse all recordings with metadata
-- **get_transcript** - Retrieve full transcript content by ID or name
-- **search_transcripts** - Full-text search across all transcripts
-- **get_recording_info** - Get detailed recording metadata
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS).
 
-## 🧠 Knowledge Extraction (Ollama)
+## License
 
-Scriba can extract summaries, topics, and entities from your transcripts using a local LLM via Ollama. This is entirely optional — Scriba works fine without it.
-
-### Setup
-
-```bash
-# 1. Install Ollama
-brew install ollama
-
-# 2. Start the Ollama server
-ollama serve
-
-# 3. Pull a model (llama3.2 is the default, mistral recommended for better results)
-ollama pull llama3.2
-# or
-ollama pull mistral
-```
-
-### First Run
-
-```bash
-# Seed your world context — tell Scriba who you are
-scriba world init
-# Follow the prompt, e.g.: "I'm Giovanni, CTO of Exein, a cybersecurity startup."
-
-# Enrich a recording
-scriba enrich <recording_name>
-```
-
-After enrichment, Scriba builds a knowledge graph of people, organizations, and projects mentioned across your recordings. View and manage entities from the TUI with `E`.
-
-### Configuration
-
-The enrichment model is configurable in `~/scriba_recordings/config.json`:
-
-```json
-{
-  "enrichment": {
-    "enabled": true,
-    "ollama_endpoint": "http://localhost:11434",
-    "ollama_model": "llama3.2"
-  }
-}
-```
-
-If Ollama is not running when you record or enrich, Scriba will skip enrichment gracefully and continue normally.
-
-## 🎯 Key Benefits
-
-- **80-90% file size reduction** with speech-optimized MP3 compression
-- **Responsive UX** with animated progress indicators for recording, importing, and transcribing
-- **Seamless workflow** - record, transcribe, re-transcribe, and manage from one interface
-- **Smart search** - find any recording by searching transcript text
-- **Model flexibility** - easily compare transcriptions using different Whisper models
-- **AI integration** - Direct access to transcripts from Claude Desktop and other MCP clients
-- **Cross-platform** - works on macOS, Linux, and Windows
-
-## 📄 License
-
-MIT License - see [LICENSE](LICENSE) file for details.
+[MIT](https://github.com/giovannialberto/scriba/blob/main/LICENSE) — Copyright (c) 2026 Giovanni Alberto Falcione
