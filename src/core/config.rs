@@ -58,9 +58,9 @@ impl LocalModel {
     /// All models available for selection in the UI.
     pub fn all_models() -> &'static [LocalModel] {
         &[
+            LocalModel::ParakeetTdt,
             LocalModel::WhisperTurbo,
             LocalModel::SenseVoice,
-            LocalModel::ParakeetTdt,
             LocalModel::WhisperTiny,
             LocalModel::WhisperBase,
             LocalModel::WhisperSmall,
@@ -71,7 +71,7 @@ impl LocalModel {
 
     /// The recommended default model for new users.
     pub fn recommended() -> Self {
-        LocalModel::WhisperTurbo
+        LocalModel::ParakeetTdt
     }
 }
 
@@ -110,6 +110,7 @@ impl std::str::FromStr for LocalModel {
 }
 
 /// Legacy type alias for backward compatibility with code that references LocalModelSize.
+#[deprecated(note = "use LocalModel instead")]
 pub type LocalModelSize = LocalModel;
 
 /// Main Scriba configuration.
@@ -563,7 +564,7 @@ impl Default for ScribaConfig {
     fn default() -> Self {
         Self {
             transcription: TranscriptionMode::Local {
-                model: LocalModel::WhisperTurbo,
+                model: LocalModel::ParakeetTdt,
             },
             audio_settings: AudioSettings {
                 sample_rate: 48000,
@@ -663,6 +664,8 @@ impl ScribaConfig {
     }
 
     /// Backward-compatible alias.
+    #[deprecated(note = "use get_local_model() instead")]
+    #[allow(deprecated)]
     pub fn get_local_model_size(&self) -> Option<LocalModel> {
         self.get_local_model()
     }
@@ -677,7 +680,7 @@ pub fn resolve_transcription_mode(
     config: &ScribaConfig,
 ) -> Result<TranscriptionMode> {
     if force_local {
-        let model = model.unwrap_or(LocalModel::WhisperTurbo);
+        let model = model.unwrap_or(LocalModel::ParakeetTdt);
         return Ok(TranscriptionMode::Local { model });
     }
 

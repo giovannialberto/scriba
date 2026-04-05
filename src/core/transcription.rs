@@ -13,6 +13,7 @@ use serde_json::Value;
 use sherpa_onnx::{OfflineRecognizer, OfflineRecognizerConfig, Wave};
 use std::io::{stdout, Write};
 use std::path::{Path, PathBuf};
+use std::io::BufReader;
 use std::process::Command;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -21,7 +22,6 @@ use super::config::{DiarizationConfig, LocalModel, ScribaConfig, TranscriptionMo
 use super::diarization::{self, DiarizedTranscript, TimedSegment, ensure_diarization_models};
 use super::files::FileManager;
 use crate::database::Database;
-use crate::enrichment::{WorldContext, WorldData};
 use crate::utils::BASE_PATH;
 
 /// OpenAI Whisper API maximum upload size (25 MB).
@@ -182,7 +182,7 @@ fn ensure_mono_16k_wav(input: &Path) -> Result<PathBuf> {
     let out = input
         .parent()
         .unwrap_or_else(|| Path::new("."))
-        .join("_tmp_whisper_16k.wav");
+        .join("_tmp_stt_16k.wav");
 
     let ffmpeg_path = find_ffmpeg().context("FFmpeg is required for audio processing")?;
 
@@ -374,6 +374,18 @@ struct ModelArchiveInfo {
     extracted_dir: &'static str,
 }
 
+/// Extract a `.tar.bz2` archive to a destination directory using pure Rust.
+/// Cross-platform: does not shell out to `tar`.
+fn extract_tar_bz2(archive_path: &Path, dest_dir: &Path) -> Result<()> {
+    let file = std::fs::File::open(archive_path)
+        .with_context(|| format!("Failed to open archive: {}", archive_path.display()))?;
+    let decoder = bzip2::read::BzDecoder::new(BufReader::new(file));
+    let mut archive = tar::Archive::new(decoder);
+    archive.unpack(dest_dir)
+        .with_context(|| format!("Failed to extract archive to {}", dest_dir.display()))?;
+    Ok(())
+}
+
 fn model_archive_info(model: LocalModel) -> ModelArchiveInfo {
     match model {
         LocalModel::WhisperTiny => ModelArchiveInfo {
@@ -451,20 +463,11 @@ pub(crate) async fn ensure_sherpa_model(model: LocalModel, quiet: bool) -> Resul
         .await
         .with_context(|| format!("Failed to download model from {}", info.url))?;
 
-    // Extract tar.bz2 using tar command
-    let output = Command::new("tar")
-        .args(["xjf", archive_path.to_string_lossy().as_ref()])
-        .current_dir(&models_dir)
-        .output()
-        .context("Failed to extract model archive (tar not found?)")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    // Extract tar.bz2 using pure Rust (cross-platform)
+    if let Err(e) = extract_tar_bz2(&archive_path, &models_dir) {
         let _ = std::fs::remove_file(&archive_path);
-        return Err(anyhow::anyhow!("Failed to extract model archive: {}", stderr));
+        return Err(e);
     }
-
-    // Clean up the archive
     let _ = std::fs::remove_file(&archive_path);
 
     if !quiet {
@@ -508,19 +511,12 @@ pub(crate) async fn download_model_with_progress(
         }
     }
 
-    // Extract
-    let output = Command::new("tar")
-        .args(["xjf", archive_path.to_string_lossy().as_ref()])
-        .current_dir(&models_dir)
-        .output()
-        .context("Failed to extract model archive")?;
-
-    let _ = std::fs::remove_file(&archive_path);
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow::anyhow!("Failed to extract model archive: {}", stderr));
+    // Extract (pure Rust, cross-platform)
+    if let Err(e) = extract_tar_bz2(&archive_path, &models_dir) {
+        let _ = std::fs::remove_file(&archive_path);
+        return Err(e);
     }
+    let _ = std::fs::remove_file(&archive_path);
 
     let _ = tx.send(100);
     Ok(())
@@ -553,159 +549,11 @@ async fn download_file_streaming(url: &str, dest: &Path, quiet: bool) -> Result<
     Ok(())
 }
 
-/// Approximate max characters for ~224 Whisper tokens.
-/// Kept for potential future use with sherpa-onnx Whisper prompt support.
-#[allow(dead_code)]
-const WHISPER_PROMPT_CHAR_LIMIT: usize = 670;
-
-/// Filter aliases to only include genuine spelling variants, not LLM annotations.
-#[allow(dead_code)]
-fn filter_aliases(aliases: &[String], canonical_name: &str) -> Vec<String> {
-    let canonical_lower = canonical_name.to_lowercase();
-    aliases
-        .iter()
-        .filter(|a| {
-            let lower = a.to_lowercase();
-            lower != canonical_lower && !a.contains('(') && a.len() <= 30
-        })
-        .cloned()
-        .collect()
-}
-
-#[allow(dead_code)]
-/// Build a Whisper initial prompt from structured world data.
-///
-/// Returns a natural-language contextual string that primes Whisper's decoder
-/// with proper nouns, roles, and relationships for better transcription accuracy.
-fn build_prompt_from_world_data(data: &WorldData) -> Option<String> {
-    let mut parts: Vec<String> = Vec::new();
-
-    // 1) Owner — contextual sentence about who owns this instance
-    if !data.owner.name.is_empty() {
-        let name = &data.owner.name;
-        let aliases = filter_aliases(&data.owner.aliases, name);
-        let role = &data.owner.role;
-        let org = &data.owner.organization;
-
-        let mut sentence = if !role.is_empty() && !org.is_empty() {
-            format!("{} is the {} at {}", name, role, org)
-        } else if !role.is_empty() {
-            format!("{} is a {}", name, role)
-        } else if !org.is_empty() {
-            format!("{} works at {}", name, org)
-        } else {
-            format!("{} is the owner of this recording", name)
-        };
-
-        if !aliases.is_empty() {
-            sentence.push_str(&format!(", also known as {}", aliases.join(", ")));
-        }
-
-        sentence.push_str(". It is likely that he is involved in this conversation.");
-        parts.push(sentence);
-    }
-
-    // 2) People — natural sentence with roles/relationships
-    if !data.people.is_empty() {
-        let people_descriptions: Vec<String> = data
-            .people
-            .iter()
-            .map(|p| {
-                let aliases = filter_aliases(&p.aliases, &p.name);
-                let mut desc = p.name.clone();
-                if !aliases.is_empty() {
-                    desc.push_str(&format!(" ({})", aliases.join(", ")));
-                }
-                if !p.relationship.is_empty() && !p.relationship.starts_with('{') {
-                    desc.push_str(&format!(", {}", p.relationship));
-                }
-                desc
-            })
-            .collect();
-        parts.push(format!(
-            "Common people he interacts with: {}.",
-            people_descriptions.join("; ")
-        ));
-    }
-
-    // 3) Organizations — with descriptions
-    if !data.organizations.is_empty() {
-        let org_descriptions: Vec<String> = data
-            .organizations
-            .iter()
-            .map(|o| {
-                let aliases = filter_aliases(&o.aliases, &o.name);
-                let mut desc = o.name.clone();
-                if !aliases.is_empty() {
-                    desc.push_str(&format!(" ({})", aliases.join(", ")));
-                }
-                if !o.description.is_empty() && !o.description.starts_with('{') {
-                    desc.push_str(&format!(", {}", o.description));
-                }
-                desc
-            })
-            .collect();
-        parts.push(format!(
-            "Organizations: {}.",
-            org_descriptions.join("; ")
-        ));
-    }
-
-    // 4) Projects and interests — domain vocabulary
-    let mut topics: Vec<String> = Vec::new();
-    for p in &data.projects {
-        topics.push(p.name.clone());
-    }
-    for i in &data.interests {
-        topics.push(i.clone());
-    }
-    if !topics.is_empty() {
-        parts.push(format!("Topics often discussed: {}.", topics.join(", ")));
-    }
-
-    if parts.is_empty() {
-        return None;
-    }
-
-    // Assemble with budget enforcement
-    let mut prompt = String::new();
-    for part in &parts {
-        let candidate = if prompt.is_empty() {
-            part.clone()
-        } else {
-            format!("{} {}", prompt, part)
-        };
-        if candidate.len() > WHISPER_PROMPT_CHAR_LIMIT {
-            break;
-        }
-        prompt = candidate;
-    }
-
-    // Strip null bytes (set_initial_prompt panics on them)
-    let prompt = prompt.replace('\0', "");
-
-    if prompt.is_empty() {
-        None
-    } else {
-        Some(prompt)
-    }
-}
-
-/// Load world context and build a context prompt for transcription.
-///
-/// Returns `None` if no world context exists or it cannot be parsed.
-/// Note: Currently used for world prompt building in tests; sherpa-onnx
-/// Whisper models may not support initial prompting.
-#[allow(dead_code)]
-fn build_world_context_prompt() -> Option<String> {
-    let world_ctx = WorldContext::load().ok()?;
-    let data = world_ctx.parsed()?;
-    build_prompt_from_world_data(&data)
-}
-
-/// Get the file name prefix used by sherpa-onnx model archives.
+/// Get the file name prefix used by sherpa-onnx Whisper model archives.
 /// e.g., WhisperTiny -> "tiny", WhisperLarge -> "large-v3"
-fn model_file_prefix(model: LocalModel) -> &'static str {
+///
+/// Only valid for Whisper-family models. Non-Whisper models use their own naming.
+fn whisper_file_prefix(model: LocalModel) -> &'static str {
     match model {
         LocalModel::WhisperTiny => "tiny",
         LocalModel::WhisperBase => "base",
@@ -713,8 +561,7 @@ fn model_file_prefix(model: LocalModel) -> &'static str {
         LocalModel::WhisperMedium => "medium",
         LocalModel::WhisperLarge => "large-v3",
         LocalModel::WhisperTurbo => "turbo",
-        LocalModel::SenseVoice => "model",
-        LocalModel::ParakeetTdt => "parakeet", // unused, Parakeet uses generic names
+        _ => unreachable!("whisper_file_prefix called for non-Whisper model"),
     }
 }
 
@@ -725,8 +572,6 @@ pub(crate) fn build_recognizer_config(model: LocalModel, model_dir: &Path) -> Of
         .map(|n| n.get() as i32)
         .unwrap_or(4);
 
-    let prefix = model_file_prefix(model);
-
     match model {
         LocalModel::WhisperTiny
         | LocalModel::WhisperBase
@@ -734,6 +579,7 @@ pub(crate) fn build_recognizer_config(model: LocalModel, model_dir: &Path) -> Of
         | LocalModel::WhisperMedium
         | LocalModel::WhisperLarge
         | LocalModel::WhisperTurbo => {
+            let prefix = whisper_file_prefix(model);
             // sherpa-onnx whisper archives use: {prefix}-encoder[.int8].onnx
             // Prefer non-quantized, fall back to int8 (some archives only have int8)
             let encoder = if model_dir.join(format!("{}-encoder.onnx", prefix)).exists() {
@@ -752,10 +598,12 @@ pub(crate) fn build_recognizer_config(model: LocalModel, model_dir: &Path) -> Of
                 Some(decoder.to_string_lossy().into_owned());
             config.model_config.tokens =
                 Some(model_dir.join(format!("{}-tokens.txt", prefix)).to_string_lossy().into_owned());
-            config.model_config.whisper.language = Some("en".into());
+            // No language set → auto-detect (Scriba is language-agnostic)
             config.model_config.whisper.task = Some("transcribe".into());
         }
         LocalModel::SenseVoice => {
+            // SenseVoice archives ship both model.onnx and model.int8.onnx.
+            // Prefer int8: it's the recommended variant (faster, similar quality).
             let model_file = if model_dir.join("model.int8.onnx").exists() {
                 "model.int8.onnx"
             } else {
@@ -770,6 +618,7 @@ pub(crate) fn build_recognizer_config(model: LocalModel, model_dir: &Path) -> Of
         }
         LocalModel::ParakeetTdt => {
             // Transducer architecture: encoder + decoder + joiner
+            // Prefer int8: this archive only ships int8 variants.
             let encoder = if model_dir.join("encoder.int8.onnx").exists() {
                 "encoder.int8.onnx"
             } else {
@@ -831,6 +680,10 @@ fn create_vad(vad_model_path: &Path) -> Result<sherpa_onnx::VoiceActivityDetecto
 
 /// Suppress sherpa-onnx C library stderr output (e.g. "Only waves less than 30 seconds").
 /// Returns a guard that restores stderr on drop.
+///
+/// NOTE: This redirects stderr process-wide. Any other thread writing to stderr
+/// while the guard is held will have its output silently discarded. The guard is
+/// short-lived (only during the sherpa-onnx transcription call).
 fn suppress_stderr() -> Option<gag::Hold> {
     gag::Hold::stderr().ok()
 }
@@ -853,9 +706,10 @@ fn run_sherpa_transcription(model: LocalModel, model_dir: &Path, wav_path: &Path
     let window_size = 512; // Silero VAD window size
     let mut all_text = String::new();
 
-    // Feed audio in small windows and drain detected segments incrementally
-    for chunk in samples.chunks(window_size) {
-        vad.accept_waveform(chunk);
+    let drain_text = |vad: &sherpa_onnx::VoiceActivityDetector,
+                          recognizer: &OfflineRecognizer,
+                          sample_rate: i32,
+                          all_text: &mut String| {
         while !vad.is_empty() {
             if let Some(segment) = vad.front() {
                 let stream = recognizer.create_stream();
@@ -873,27 +727,15 @@ fn run_sherpa_transcription(model: LocalModel, model_dir: &Path, wav_path: &Path
             }
             vad.pop();
         }
+    };
+
+    for chunk in samples.chunks(window_size) {
+        vad.accept_waveform(chunk);
+        drain_text(&vad, &recognizer, sample_rate, &mut all_text);
     }
 
-    // Flush any trailing speech
     vad.flush();
-    while !vad.is_empty() {
-        if let Some(segment) = vad.front() {
-            let stream = recognizer.create_stream();
-            stream.accept_waveform(sample_rate, segment.samples());
-            recognizer.decode(&stream);
-            if let Some(result) = stream.get_result() {
-                let text = result.text.trim();
-                if !text.is_empty() {
-                    if !all_text.is_empty() {
-                        all_text.push(' ');
-                    }
-                    all_text.push_str(text);
-                }
-            }
-        }
-        vad.pop();
-    }
+    drain_text(&vad, &recognizer, sample_rate, &mut all_text);
 
     Ok(all_text)
 }
@@ -923,7 +765,7 @@ fn run_sherpa_transcription_with_segments(
     let mut timed_segments = Vec::new();
 
     // Helper closure to process detected VAD segments
-    let mut drain_segments = |vad: &sherpa_onnx::VoiceActivityDetector,
+    let drain_segments = |vad: &sherpa_onnx::VoiceActivityDetector,
                               recognizer: &OfflineRecognizer,
                               sample_rate: i32,
                               all_text: &mut String,
@@ -1127,7 +969,7 @@ pub async fn transcribe_audio(
                 (text, None)
             };
 
-            if wav_path.file_name() == Some(std::ffi::OsStr::new("_tmp_whisper_16k.wav")) {
+            if wav_path.file_name() == Some(std::ffi::OsStr::new("_tmp_stt_16k.wav")) {
                 let _ = std::fs::remove_file(&wav_path);
             }
             if let Some(task) = progress_task {
@@ -1194,144 +1036,6 @@ pub async fn transcribe_audio(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::enrichment::world::{OrgInfo, OwnerInfo, PersonInfo, ProjectInfo};
-
-    #[test]
-    fn test_filter_aliases_removes_canonical_match() {
-        let aliases = vec!["giovanni".to_string()];
-        let result = filter_aliases(&aliases, "Giovanni");
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_filter_aliases_removes_annotations_with_parens() {
-        let aliases = vec![
-            "Gio".to_string(),
-            "Giovanni (in the owner's world)".to_string(),
-        ];
-        let result = filter_aliases(&aliases, "Giovanni");
-        assert_eq!(result, vec!["Gio"]);
-    }
-
-    #[test]
-    fn test_filter_aliases_removes_long_aliases() {
-        let aliases = vec![
-            "Exane".to_string(),
-            "This is an extremely long alias that should be filtered out".to_string(),
-        ];
-        let result = filter_aliases(&aliases, "Exein");
-        assert_eq!(result, vec!["Exane"]);
-    }
-
-    #[test]
-    fn test_filter_aliases_keeps_genuine_variants() {
-        let aliases = vec!["Exane".to_string(), "Saci".to_string()];
-        let result = filter_aliases(&aliases, "Exein");
-        assert_eq!(result, vec!["Exane", "Saci"]);
-    }
-
-    #[test]
-    fn test_build_prompt_empty_world() {
-        let data = WorldData::default();
-        assert!(build_prompt_from_world_data(&data).is_none());
-    }
-
-    #[test]
-    fn test_build_prompt_owner_only() {
-        let data = WorldData {
-            owner: OwnerInfo {
-                name: "Giovanni".to_string(),
-                aliases: vec!["Gio".to_string()],
-                role: "CTO".to_string(),
-                organization: "Exein".to_string(),
-                location: String::new(),
-            },
-            ..Default::default()
-        };
-        let prompt = build_prompt_from_world_data(&data).unwrap();
-        assert!(prompt.contains("Giovanni is the CTO at Exein"));
-        assert!(prompt.contains("also known as Gio"));
-        assert!(prompt.contains("likely that he is involved"));
-    }
-
-    #[test]
-    fn test_build_prompt_full_world() {
-        let data = WorldData {
-            owner: OwnerInfo {
-                name: "Giovanni".to_string(),
-                aliases: vec![],
-                role: "CTO".to_string(),
-                organization: "Exein".to_string(),
-                location: String::new(),
-            },
-            people: vec![
-                PersonInfo {
-                    name: "Gerardo".to_string(),
-                    relationship: "CFO of Exein".to_string(),
-                    aliases: vec!["Gerardo Gagliardo".to_string()],
-                },
-                PersonInfo {
-                    name: "Steve".to_string(),
-                    relationship: String::new(),
-                    aliases: vec![],
-                },
-            ],
-            organizations: vec![OrgInfo {
-                name: "Exein".to_string(),
-                description: "cybersecurity company".to_string(),
-                aliases: vec!["Exane".to_string()],
-            }],
-            projects: vec![ProjectInfo {
-                name: "ASPISEC".to_string(),
-                description: String::new(),
-            }],
-            interests: vec!["cybersecurity".to_string()],
-            beliefs: vec![],
-        };
-        let prompt = build_prompt_from_world_data(&data).unwrap();
-        assert!(prompt.contains("Giovanni is the CTO at Exein"));
-        assert!(prompt.contains("Common people he interacts with"));
-        assert!(prompt.contains("Gerardo (Gerardo Gagliardo), CFO of Exein"));
-        assert!(prompt.contains("Steve"));
-        assert!(prompt.contains("Exein (Exane), cybersecurity company"));
-        assert!(prompt.contains("ASPISEC"));
-        assert!(prompt.contains("cybersecurity"));
-    }
-
-    #[test]
-    fn test_build_prompt_respects_char_limit() {
-        let data = WorldData {
-            owner: OwnerInfo {
-                name: "Owner".to_string(),
-                ..Default::default()
-            },
-            people: (0..200)
-                .map(|i| PersonInfo {
-                    name: format!("Person{}", i),
-                    relationship: String::new(),
-                    aliases: vec![],
-                })
-                .collect(),
-            ..Default::default()
-        };
-        let prompt = build_prompt_from_world_data(&data).unwrap();
-        assert!(prompt.len() <= WHISPER_PROMPT_CHAR_LIMIT);
-    }
-
-    #[test]
-    fn test_build_prompt_strips_null_bytes() {
-        let data = WorldData {
-            owner: OwnerInfo {
-                name: "Test\0Name".to_string(),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let prompt = build_prompt_from_world_data(&data).unwrap();
-        assert!(!prompt.contains('\0'));
-        assert!(prompt.contains("TestName"));
-    }
-}
+// Whisper initial-prompt functions were removed during the sherpa-onnx migration.
+// sherpa-onnx's Whisper bindings do not currently support initial prompting.
+// If support is added upstream, context-priming can be reintroduced from git history.

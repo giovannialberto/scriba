@@ -90,7 +90,7 @@ enum Command {
         force_local: bool,
         #[structopt(
             long = "model",
-            help = "Local model (tiny|base|small|medium|large|turbo|sensevoice)"
+            help = "Local model (tiny|base|small|medium|large|turbo|sensevoice|parakeet)"
         )]
         model: Option<LocalModel>,
         #[structopt(
@@ -115,7 +115,7 @@ enum Command {
         force_local: bool,
         #[structopt(
             long = "model",
-            help = "Local model (tiny|base|small|medium|large|turbo|sensevoice)"
+            help = "Local model (tiny|base|small|medium|large|turbo|sensevoice|parakeet)"
         )]
         model: Option<LocalModel>,
         #[structopt(
@@ -184,7 +184,7 @@ enum ConfigCommand {
         json: bool,
     },
     SetLocal {
-        #[structopt(help = "Model (tiny|base|small|medium|large|turbo|sensevoice)")]
+        #[structopt(help = "Model (tiny|base|small|medium|large|turbo|sensevoice|parakeet)")]
         model: LocalModel,
     },
     SetApi {

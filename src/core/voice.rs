@@ -353,33 +353,50 @@ pub async fn start_voice_detector(
 
     stream.play()?;
 
-    // Spawn the processing thread that runs whisper on speech chunks
+    // Spawn a dedicated std::thread that owns the recognizer (not Send/Sync).
+    // This avoids recreating the recognizer for every voice chunk.
+    let model_dir = model_paths.dir.clone();
+    let (work_tx, work_rx) = std::sync::mpsc::channel::<(Vec<f32>, u32, tokio::sync::oneshot::Sender<Result<String>>)>();
+
+    std::thread::Builder::new()
+        .name("voice-recognizer".into())
+        .spawn(move || {
+            let config = super::transcription::build_recognizer_config(
+                LocalModel::WhisperTiny,
+                &model_dir,
+            );
+            let recognizer = match OfflineRecognizer::create(&config) {
+                Some(r) => r,
+                None => {
+                    // Drain requests with error if recognizer creation fails
+                    while let Ok((_, _, reply)) = work_rx.recv() {
+                        let _ = reply.send(Err(anyhow::anyhow!("Failed to create recognizer")));
+                    }
+                    return;
+                }
+            };
+            while let Ok((chunk, sr, reply)) = work_rx.recv() {
+                let result = run_sherpa_on_chunk(&recognizer, &chunk, sr);
+                let _ = reply.send(result);
+            }
+        })?;
+
+    // Async task: receives speech chunks from audio callback, dispatches to recognizer thread
     let proc_listening_state = listening_state.clone();
     let proc_shutdown = shutdown.clone();
 
     tokio::spawn(async move {
-        // Store model dir for creating recognizer in blocking threads
-        let model_dir = model_paths.dir.clone();
-
         while let Some((chunk, mode_at_capture)) = chunk_rx.recv().await {
             if proc_shutdown.load(Ordering::Relaxed) {
                 break;
             }
 
-            // Run recognition in a blocking thread
-            // OfflineRecognizer is not Send/Sync, so we create it per-chunk
-            let dir = model_dir.clone();
-            let sr = sample_rate;
-            let transcript = tokio::task::spawn_blocking(move || {
-                let config = super::transcription::build_recognizer_config(
-                    LocalModel::WhisperTiny,
-                    &dir,
-                );
-                let recognizer = OfflineRecognizer::create(&config)
-                    .ok_or_else(|| anyhow::anyhow!("Failed to create recognizer"))?;
-                run_sherpa_on_chunk(&recognizer, &chunk, sr)
-            })
-            .await;
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            if work_tx.send((chunk, sample_rate, reply_tx)).is_err() {
+                break; // recognizer thread exited
+            }
+
+            let transcript = reply_rx.await;
 
             // Reset listening state back from Processing
             if let Ok(mut ls) = proc_listening_state.try_lock() {

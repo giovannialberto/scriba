@@ -13,7 +13,7 @@ use crate::utils::BASE_PATH;
 // Re-export model paths for external async download
 pub use self::models::{ensure_diarization_models, DiarizationModelPaths};
 
-/// A whisper segment with timestamp and text.
+/// A timed transcript segment with timestamp and text.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimedSegment {
     pub start: f64, // seconds
@@ -49,8 +49,7 @@ pub struct DiarizedTranscript {
 mod models {
     use super::*;
     use futures_util::StreamExt;
-    use std::io::Write as _;
-    use std::process::Command;
+    use std::io::{BufReader, Write as _};
 
     /// Paths to the diarization models needed by sherpa-onnx.
     #[derive(Debug, Clone)]
@@ -83,6 +82,7 @@ mod models {
         }
 
         // Embedding model (3D-Speaker for speaker identification)
+        // Note: "recongition" typo in URL is upstream (sherpa-onnx release tag).
         let emb_path = dir.join("3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx");
         if !emb_path.exists() {
             let url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx";
@@ -96,17 +96,14 @@ mod models {
         })
     }
 
+    /// Extract a `.tar.bz2` archive to a destination directory using pure Rust.
     fn extract_archive(archive: &Path, dest_dir: &Path) -> Result<()> {
-        let output = Command::new("tar")
-            .args(["xjf", archive.to_string_lossy().as_ref()])
-            .current_dir(dest_dir)
-            .output()
-            .context("Failed to extract model archive (tar not found?)")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow::anyhow!("Failed to extract model archive: {}", stderr));
-        }
+        let file = std::fs::File::open(archive)
+            .with_context(|| format!("Failed to open archive: {}", archive.display()))?;
+        let decoder = bzip2::read::BzDecoder::new(BufReader::new(file));
+        let mut tar = tar::Archive::new(decoder);
+        tar.unpack(dest_dir)
+            .with_context(|| format!("Failed to extract archive to {}", dest_dir.display()))?;
         Ok(())
     }
 
@@ -192,15 +189,15 @@ pub fn diarize_audio(
     Ok(turns)
 }
 
-/// Merge Whisper timed segments with speaker turns by temporal overlap.
+/// Merge timed transcript segments with speaker turns by temporal overlap.
 ///
-/// For each whisper segment, finds the speaker turn with the maximum
+/// For each transcript segment, finds the speaker turn with the maximum
 /// temporal overlap and assigns that speaker.
 pub fn merge_segments(
-    whisper_segments: &[TimedSegment],
+    transcript_segments: &[TimedSegment],
     speaker_turns: &[SpeakerTurn],
 ) -> Vec<DiarizedSegment> {
-    whisper_segments
+    transcript_segments
         .iter()
         .map(|ws| {
             let speaker_label = find_best_speaker(ws.start, ws.end, speaker_turns);

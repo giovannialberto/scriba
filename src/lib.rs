@@ -19,6 +19,7 @@ pub mod tui;
 pub mod utils;
 
 // Re-export commonly used types for backward compatibility and convenience
+#[allow(deprecated)]
 pub use core::{
     AudioEncoder, AudioFormat, CompressionSettings, EnrichmentConfig, LocalModel, LocalModelSize,
     ScribaConfig, TranscriptionMode, WorkflowManager,

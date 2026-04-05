@@ -289,7 +289,7 @@ impl Dashboard {
                                 };
                                 new_cfg.enrichment.save_model_for_provider(&p, &model);
                             }
-                            let model = new_cfg.last_local_model.unwrap_or(LocalModel::WhisperTurbo);
+                            let model = new_cfg.last_local_model.unwrap_or(LocalModel::ParakeetTdt);
                             let ep = new_cfg.enrichment.last_ollama_endpoint.clone()
                                 .unwrap_or_else(|| "http://localhost:11434".to_string());
                             let mdl = new_cfg.enrichment.last_ollama_model.clone()
