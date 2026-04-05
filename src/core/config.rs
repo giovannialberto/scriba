@@ -126,11 +126,11 @@ pub struct ScribaConfig {
     /// Silence auto-stop settings.
     #[serde(default)]
     pub silence_auto_stop: SilenceAutoStopConfig,
-    /// Speaker diarization settings.
-    #[serde(default)]
+    /// Speaker diarization settings (reserved for future use).
+    #[serde(default, skip_serializing)]
     pub diarization: DiarizationConfig,
-    /// Voice-activated recording ("Scriba Forever") settings.
-    #[serde(default)]
+    /// Voice-activated recording settings (reserved for future use).
+    #[serde(default, skip_serializing)]
     pub voice: VoiceConfig,
     /// Preserved local model when switching from Private to Cloud mode.
     #[serde(default, alias = "last_local_model_size")]

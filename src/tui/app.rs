@@ -1,12 +1,9 @@
 use crate::core::{
     AudioPlayer, EnrichmentMode, RecordingResult, ScribaConfig, TranscriptionMode,
-    VoiceCommand, VoiceDetectorHandle, VoiceListeningState,
-    start_voice_detector,
 };
 use crate::database::{Database, Entity, Recording, RecordingStats};
 use crate::enrichment::{OllamaClient, WorldContext, WorldData};
 use crate::enrichment::chat_prompts;
-use crate::utils::generate_recording_name;
 use anyhow::Result;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseEventKind},
@@ -116,11 +113,6 @@ pub struct Dashboard {
 
     // Onboarding state
     pub(super) onboarding: Option<OnboardingState>,
-
-    // Voice mode state
-    pub(super) voice_command_rx: Option<mpsc::Receiver<VoiceCommand>>,
-    pub(super) voice_detector_handle: Option<VoiceDetectorHandle>,
-    pub(super) voice_mode_active: bool,
 
     // Chat state ("Ask Scriba")
     pub(super) chat: ChatState,
@@ -243,11 +235,6 @@ impl Dashboard {
             // Onboarding
             onboarding: None,
 
-            // Voice mode
-            voice_command_rx: None,
-            voice_detector_handle: None,
-            voice_mode_active: false,
-
             // Chat
             chat: ChatState::new(),
             global_chat_messages: Vec::new(),
@@ -286,11 +273,6 @@ impl Dashboard {
         }
 
         let result = self.run_app(&mut terminal).await;
-
-        // Shut down voice detector if active
-        if let Some(handle) = self.voice_detector_handle.take() {
-            handle.shutdown();
-        }
 
         // Restore terminal
         disable_raw_mode()?;
@@ -433,20 +415,6 @@ impl Dashboard {
                     self.audio_player = None;
                     self.show_message = false;
                     self.message.clear();
-                }
-            }
-
-            // Check for voice commands
-            if let Some(ref mut rx) = self.voice_command_rx {
-                if let Ok(cmd) = rx.try_recv() {
-                    match cmd {
-                        VoiceCommand::Record => {
-                            self.handle_voice_record_command().await;
-                        }
-                        VoiceCommand::Stop => {
-                            self.handle_voice_stop_command().await;
-                        }
-                    }
                 }
             }
 
@@ -1032,141 +1000,6 @@ impl Dashboard {
             .wrap(Wrap { trim: true });
 
         f.render_widget(help_paragraph, popup_area);
-    }
-
-    // -- Voice Mode --
-
-    pub(super) async fn toggle_voice_mode(&mut self) {
-        if self.voice_mode_active {
-            // Shut down voice detector
-            if let Some(handle) = self.voice_detector_handle.take() {
-                // If recording, stop it first
-                if handle.listening_state() == VoiceListeningState::Recording {
-                    let _ = handle.stop_recording();
-                }
-                handle.shutdown();
-            }
-            self.voice_command_rx = None;
-            self.voice_mode_active = false;
-            self.notification_message = Some(("Voice mode disabled".to_string(), 30));
-        } else {
-            // Start voice detector
-            let (tx, rx) = mpsc::channel(8);
-            match start_voice_detector(&self.config.voice, tx, self.config.audio_settings.input_device.as_deref()).await {
-                Ok(handle) => {
-                    self.voice_detector_handle = Some(handle);
-                    self.voice_command_rx = Some(rx);
-                    self.voice_mode_active = true;
-                    self.notification_message = Some((
-                        "Voice mode active -- say \"Scriba record\" to start".to_string(),
-                        60,
-                    ));
-                }
-                Err(e) => {
-                    self.notification_message = Some((
-                        format!("Failed to start voice mode: {}", e),
-                        60,
-                    ));
-                }
-            }
-        }
-    }
-
-    async fn handle_voice_record_command(&mut self) {
-        // Don't start if already recording
-        if self.recording_task.is_some() {
-            return;
-        }
-
-        let recording_name = generate_recording_name(None);
-
-        if let Some(ref handle) = self.voice_detector_handle {
-            if let Err(e) = handle.start_recording(&recording_name) {
-                self.notification_message = Some((
-                    format!("Voice record failed: {}", e),
-                    60,
-                ));
-                return;
-            }
-        }
-
-        self.notification_message = Some((
-            "Voice: Recording started! Say \"Scriba stop\" to finish.".to_string(),
-            60,
-        ));
-    }
-
-    async fn handle_voice_stop_command(&mut self) {
-        let result = if let Some(ref handle) = self.voice_detector_handle {
-            handle.stop_recording()
-        } else {
-            return;
-        };
-
-        match result {
-            Ok(Some((dir_name, wav_path))) => {
-                self.notification_message = Some((
-                    "Voice: Recording stopped. Transcribing...".to_string(),
-                    60,
-                ));
-
-                // Save to database
-                let dir_name_clone = dir_name.clone();
-                if let Ok(meta) = crate::core::FileManager::extract_audio_metadata(&wav_path) {
-                    let recording = Recording {
-                        id: None,
-                        directory_name: dir_name.clone(),
-                        display_name: None,
-                        created_at: chrono::Utc::now(),
-                        updated_at: chrono::Utc::now(),
-                        duration_seconds: meta.duration_seconds,
-                        file_size_bytes: meta.file_size_bytes,
-                        audio_format: meta.audio_format,
-                        sample_rate: meta.sample_rate,
-                        channels: meta.channels,
-                        has_transcript: false,
-                        transcript_status: "pending".to_string(),
-                        language_code: "auto".to_string(),
-                        model_used: "whisper.cpp".to_string(),
-                        tags: None,
-                        summary: None,
-                        key_points: None,
-                        action_items: None,
-                        speakers: None,
-                        sentiment_score: None,
-                        search_index: None,
-                        categories: None,
-                        confidence_score: None,
-                        audio_path: wav_path
-                            .file_name()
-                            .unwrap()
-                            .to_string_lossy()
-                            .to_string(),
-                        transcript_path: None,
-                    };
-                    let _ = self.db.insert_recording(&recording);
-                }
-
-                // Enqueue transcription pipeline
-                let transcription_mode = self.config.transcription.clone();
-                let _ = self.load_recordings();
-                let _ = self.load_stats();
-
-                self.enqueue_transcription(PendingTranscription::Retranscribe {
-                    recording_name: dir_name_clone,
-                    transcription_mode,
-                });
-            }
-            Ok(None) => {
-                self.notification_message = Some(("Voice: No recording to stop.".to_string(), 30));
-            }
-            Err(e) => {
-                self.notification_message = Some((
-                    format!("Voice stop failed: {}", e),
-                    60,
-                ));
-            }
-        }
     }
 
     // -------------------------------------------------------------------------

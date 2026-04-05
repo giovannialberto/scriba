@@ -18,8 +18,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
-use super::config::{DiarizationConfig, LocalModel, ScribaConfig, TranscriptionMode};
-use super::diarization::{self, DiarizedTranscript, TimedSegment, ensure_diarization_models};
+use super::config::{LocalModel, ScribaConfig, TranscriptionMode};
 use super::files::FileManager;
 use crate::database::Database;
 use crate::utils::BASE_PATH;
@@ -96,14 +95,10 @@ impl Default for TranscriptionProgress {
 }
 
 /// Persist transcript to file and update database.
-///
-/// When `diarized` is provided, also saves the diarization segments and speakers
-/// to the database.
 fn save_transcript_to_files_and_db(
     audio_path: &Path,
     transcript_text: &str,
     model_used: &str,
-    diarized: Option<&DiarizedTranscript>,
 ) -> Result<()> {
     let audio_dir = audio_path
         .parent()
@@ -130,16 +125,6 @@ fn save_transcript_to_files_and_db(
                 true,
                 model_used,
             );
-
-            // Save diarization data if available
-            if let Some(diarized) = diarized {
-                if let Ok(segments_json) = serde_json::to_string(&diarized.segments) {
-                    let _ = db.update_transcript_segments(recording_id, &segments_json);
-                }
-                if let Ok(speakers_json) = serde_json::to_string(&diarized.speakers) {
-                    let _ = db.update_recording_speakers(recording_id, &speakers_json);
-                }
-            }
         }
     }
 
@@ -740,78 +725,6 @@ fn run_sherpa_transcription(model: LocalModel, model_dir: &Path, wav_path: &Path
     Ok(all_text)
 }
 
-/// Run transcription with VAD and return both text and timed segments for diarization.
-fn run_sherpa_transcription_with_segments(
-    model: LocalModel,
-    model_dir: &Path,
-    wav_path: &Path,
-    vad_model_path: &Path,
-) -> Result<(String, Vec<TimedSegment>)> {
-    let config = build_recognizer_config(model, model_dir);
-
-    let recognizer = OfflineRecognizer::create(&config)
-        .ok_or_else(|| anyhow::anyhow!("Failed to create sherpa-onnx recognizer. Check model files in {}", model_dir.display()))?;
-
-    let wave = Wave::read(wav_path.to_string_lossy().as_ref())
-        .ok_or_else(|| anyhow::anyhow!("Failed to read WAV file: {}", wav_path.display()))?;
-
-    let samples = wave.samples();
-    let sample_rate = wave.sample_rate();
-
-    // Use VAD to segment long audio
-    let vad = create_vad(vad_model_path)?;
-    let window_size = 512;
-    let mut all_text = String::new();
-    let mut timed_segments = Vec::new();
-
-    // Helper closure to process detected VAD segments
-    let drain_segments = |vad: &sherpa_onnx::VoiceActivityDetector,
-                              recognizer: &OfflineRecognizer,
-                              sample_rate: i32,
-                              all_text: &mut String,
-                              timed_segments: &mut Vec<TimedSegment>| {
-        while !vad.is_empty() {
-            if let Some(segment) = vad.front() {
-                let segment_start_secs = segment.start() as f64 / sample_rate as f64;
-                let segment_duration_secs = segment.n() as f64 / sample_rate as f64;
-
-                let stream = recognizer.create_stream();
-                stream.accept_waveform(sample_rate, segment.samples());
-                recognizer.decode(&stream);
-
-                if let Some(result) = stream.get_result() {
-                    let text = result.text.trim().to_string();
-                    if !text.is_empty() {
-                        if !all_text.is_empty() {
-                            all_text.push(' ');
-                        }
-                        all_text.push_str(&text);
-
-                        timed_segments.push(TimedSegment {
-                            start: segment_start_secs,
-                            end: segment_start_secs + segment_duration_secs,
-                            text,
-                        });
-                    }
-                }
-            }
-            vad.pop();
-        }
-    };
-
-    // Feed audio in small windows and drain detected segments incrementally
-    for chunk in samples.chunks(window_size) {
-        vad.accept_waveform(chunk);
-        drain_segments(&vad, &recognizer, sample_rate, &mut all_text, &mut timed_segments);
-    }
-
-    // Flush any trailing speech
-    vad.flush();
-    drain_segments(&vad, &recognizer, sample_rate, &mut all_text, &mut timed_segments);
-
-    Ok((all_text, timed_segments))
-}
-
 async fn transcribe_with_openai_api(audio_path: &PathBuf, api_key: &str) -> Result<String> {
     let file_size = std::fs::metadata(audio_path)
         .context("Failed to read audio file metadata")?
@@ -843,14 +756,10 @@ async fn transcribe_with_openai_api(audio_path: &PathBuf, api_key: &str) -> Resu
 }
 
 /// Unified transcription function.
-///
-/// When `diarization` is Some and enabled, runs speaker diarization alongside
-/// transcription and produces speaker-labeled output.
 pub async fn transcribe_audio(
     input_path: &PathBuf,
     mode_override: Option<TranscriptionMode>,
     verbose: bool,
-    diarization: Option<&DiarizationConfig>,
 ) -> Result<()> {
     let audio_file_path = FileManager::resolve_audio_path(input_path)?;
     let config = ScribaConfig::load()?;
@@ -873,12 +782,7 @@ pub async fn transcribe_audio(
         println!("\n{}\n", mode_description);
     }
 
-    let diarize = diarization
-        .map(|d| d.enabled)
-        .unwrap_or(false);
-
-    // Transcription result: text, model name, optional diarized transcript
-    let (transcription_text, model_used, diarized) = match transcription_mode {
+    let (transcription_text, model_used) = match transcription_mode {
         TranscriptionMode::Local { model } => {
             // Suppress sherpa-onnx C library stderr warnings that would corrupt the TUI
             let _stderr_guard = suppress_stderr();
@@ -915,59 +819,8 @@ pub async fn transcribe_audio(
             let vad_model_path = ensure_vad_model().await
                 .context("Failed to download VAD model")?;
 
-            let (text, diarized_transcript) = if diarize {
-                let max_speakers = diarization
-                    .map(|d| d.max_speakers as usize)
-                    .unwrap_or(6);
-
-                // Transcribe with segments
-                let (text, timed_segments) =
-                    run_sherpa_transcription_with_segments(model, &model_paths.dir, &wav_path, &vad_model_path)
-                        .context("Local transcription failed")?;
-
-                if let Some(task) = &progress_task {
-                    task.abort();
-                }
-
-                if verbose {
-                    print!("\r{}", " ".repeat(80));
-                    print!("\r");
-                    stdout().flush().unwrap();
-                    println!("Running speaker diarization...");
-                }
-
-                // Download diarization models (async-safe) before sync diarization
-                let diarization_models = ensure_diarization_models().await
-                    .context("Failed to download diarization models")?;
-
-                // Run diarization on the same WAV
-                match diarization::diarize_audio(&wav_path, max_speakers, &diarization_models) {
-                    Ok(speaker_turns) => {
-                        let merged = diarization::merge_segments(&timed_segments, &speaker_turns);
-                        let transcript = diarization::build_diarized_transcript(merged);
-                        let labeled_text = diarization::format_diarized_text(&transcript);
-
-                        if verbose {
-                            println!(
-                                "Diarization complete: {} speakers detected",
-                                transcript.speakers.len()
-                            );
-                        }
-
-                        (labeled_text, Some(transcript))
-                    }
-                    Err(e) => {
-                        if verbose {
-                            eprintln!("Diarization failed (falling back to plain transcript): {}", e);
-                        }
-                        (text, None)
-                    }
-                }
-            } else {
-                let text = run_sherpa_transcription(model, &model_paths.dir, &wav_path, &vad_model_path)
-                    .context("Local transcription failed")?;
-                (text, None)
-            };
+            let text = run_sherpa_transcription(model, &model_paths.dir, &wav_path, &vad_model_path)
+                .context("Local transcription failed")?;
 
             if wav_path.file_name() == Some(std::ffi::OsStr::new("_tmp_stt_16k.wav")) {
                 let _ = std::fs::remove_file(&wav_path);
@@ -976,7 +829,7 @@ pub async fn transcribe_audio(
                 task.abort();
             }
             let model_name = format!("sherpa-{}", model);
-            (text, model_name, diarized_transcript)
+            (text, model_name)
         }
         TranscriptionMode::Api { api_key } => {
             let progress_task = if verbose {
@@ -1003,8 +856,7 @@ pub async fn transcribe_audio(
             if let Some(task) = progress_task {
                 task.abort();
             }
-            // API mode doesn't support diarization
-            (result, "whisper-1".to_string(), None)
+            (result, "whisper-1".to_string())
         }
     };
 
@@ -1019,7 +871,6 @@ pub async fn transcribe_audio(
         &audio_file_path,
         &transcription_text,
         &model_used,
-        diarized.as_ref(),
     )?;
 
     if verbose {

@@ -19,15 +19,15 @@ use super::chat::ACCENT;
 // ─── Settings index layout ───────────────────────────────────────────────────
 //
 // Index 0 is always the mode toggle. Mode-specific items follow (3 for Private,
-// 4 for Cloud), then 6 shared items (Recording, Diarization, Voice).
+// 4 for Cloud), then 2 shared items (Recording).
 
 const IDX_MODE: usize = 0;
-/// Number of mode-specific items in Private mode (Whisper Model, Ollama Model, Ollama Server).
+/// Number of mode-specific items in Private mode (STT Model, Ollama Model, Ollama Server).
 const PRIVATE_MODE_ITEMS: usize = 3;
 /// Number of mode-specific items in Cloud mode (Whisper API Key, LLM Provider, Model, Provider API Key).
 const CLOUD_MODE_ITEMS: usize = 4;
-/// Number of shared items (Auto-Stop, Timeout, Diarization, Max Speakers, Voice, Sensitivity).
-const SHARED_ITEMS: usize = 6;
+/// Number of shared items (Auto-Stop, Timeout).
+const SHARED_ITEMS: usize = 2;
 
 /// First shared-section index for a given mode.
 fn shared_offset(is_private: bool) -> usize {
@@ -381,7 +381,7 @@ impl Dashboard {
                         }
 
                     } else {
-                        // ── Shared sections (Recording, Diarization, Voice) ─
+                        // ── Shared sections (Recording) ─
                         match idx - shared_off {
                             0 => {
                                 // Toggle silence auto-stop
@@ -400,57 +400,6 @@ impl Dashboard {
                                         60 => 120,
                                         120 => 300,
                                         _ => 30,
-                                    };
-                                    if let Err(e) = self.config.save() {
-                                        self.message = format!("Failed to save setting: {}", e);
-                                        self.show_message = true;
-                                        self.return_to_view = Some(DashboardView::Settings);
-                                    }
-                                }
-                            }
-                            2 => {
-                                // Toggle speaker diarization
-                                self.config.diarization.enabled = !self.config.diarization.enabled;
-                                if let Err(e) = self.config.save() {
-                                    self.message = format!("Failed to save setting: {}", e);
-                                    self.show_message = true;
-                                    self.return_to_view = Some(DashboardView::Settings);
-                                }
-                            }
-                            3 => {
-                                // Cycle max speakers: 2 → 4 → 6 → 8
-                                if self.config.diarization.enabled {
-                                    self.config.diarization.max_speakers = match self.config.diarization.max_speakers {
-                                        2 => 4,
-                                        4 => 6,
-                                        6 => 8,
-                                        _ => 2,
-                                    };
-                                    if let Err(e) = self.config.save() {
-                                        self.message = format!("Failed to save setting: {}", e);
-                                        self.show_message = true;
-                                        self.return_to_view = Some(DashboardView::Settings);
-                                    }
-                                }
-                            }
-                            4 => {
-                                // Toggle voice mode
-                                self.toggle_voice_mode().await;
-                                self.config.voice.enabled = self.voice_mode_active;
-                                if let Err(e) = self.config.save() {
-                                    self.message = format!("Failed to save setting: {}", e);
-                                    self.show_message = true;
-                                    self.return_to_view = Some(DashboardView::Settings);
-                                }
-                            }
-                            5 => {
-                                // Cycle voice sensitivity: 0.005 → 0.01 → 0.02 → 0.05
-                                if self.voice_mode_active {
-                                    self.config.voice.vad_threshold = match self.config.voice.vad_threshold {
-                                        t if t <= 0.005 => 0.01,
-                                        t if t <= 0.01 => 0.02,
-                                        t if t <= 0.02 => 0.05,
-                                        _ => 0.005,
                                     };
                                     if let Err(e) = self.config.save() {
                                         self.message = format!("Failed to save setting: {}", e);
@@ -737,37 +686,6 @@ impl Dashboard {
         let timeout_style_override = if !silence_enabled { Some(val_disabled) } else { None };
         let timeout_hint = if silence_enabled { "\u{2190} Enter to cycle" } else { "(enable auto-stop first)" };
         setting_line!("Timeout", timeout_display, shared_off + 1, timeout_hint, timeout_style_override);
-
-        // ── DIARIZATION ─────────────────────────────────────────────
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![Span::raw("  "), Span::styled("DIARIZATION", section_style)]));
-
-        let diarization_enabled = self.config.diarization.enabled;
-        let diar_value = if diarization_enabled { "Enabled" } else { "Disabled" };
-        setting_line!("Speaker Diarization", diar_value, shared_off + 2, "\u{2190} Enter to toggle", None::<Style>);
-
-        let max_speakers = self.config.diarization.max_speakers;
-        let speakers_style_override = if !diarization_enabled { Some(val_disabled) } else { None };
-        let speakers_hint = if diarization_enabled { "\u{2190} Enter to cycle" } else { "(enable diarization first)" };
-        setting_line!("Max Speakers", max_speakers, shared_off + 3, speakers_hint, speakers_style_override);
-
-        // ── VOICE MODE ──────────────────────────────────────────────
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![Span::raw("  "), Span::styled("VOICE MODE", section_style)]));
-
-        let voice_enabled = self.voice_mode_active;
-        let voice_value = if voice_enabled { "Active" } else { "Off" };
-        setting_line!("Voice Activation", voice_value, shared_off + 4, "\u{2190} Enter to toggle", None::<Style>);
-
-        let sensitivity_label = match self.config.voice.vad_threshold {
-            t if t <= 0.005 => "Very High (0.005)",
-            t if t <= 0.01 => "High (0.01)",
-            t if t <= 0.02 => "Medium (0.02)",
-            _ => "Low (0.05)",
-        };
-        let sens_style_override = if !voice_enabled { Some(val_disabled) } else { None };
-        let sens_hint = if voice_enabled { "\u{2190} Enter to cycle" } else { "(enable voice mode first)" };
-        setting_line!("Sensitivity", sensitivity_label, shared_off + 5, sens_hint, sens_style_override);
 
         let body = Paragraph::new(lines).style(Style::default().fg(Color::White));
         f.render_widget(body, chunks[1]);
