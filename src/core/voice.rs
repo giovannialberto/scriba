@@ -1,22 +1,22 @@
 //! Voice-activated recording engine ("Scriba Forever" mode).
 //!
 //! Listens for wake phrases ("scriba record" / "scriba stop") using
-//! energy-based VAD + whisper-tiny, then emits commands to the TUI.
+//! energy-based VAD + sherpa-onnx whisper-tiny, then emits commands to the TUI.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use cpal::traits::{DeviceTrait, StreamTrait};
+use sherpa_onnx::OfflineRecognizer;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 use super::audio::{create_encoder, AudioEncoder, AudioFormat, CompressionSettings};
-use super::config::{LocalModelSize, VoiceConfig};
+use super::config::{LocalModel, VoiceConfig};
 use super::recording::{resolve_input_device, AudioLevelMonitor};
 use super::ring_buffer::RingBuffer;
-use super::transcription::{ensure_model_path_local, ensure_whisper_logs_suppressed};
+use super::transcription::ensure_sherpa_model;
 use crate::utils::BASE_PATH;
 
 /// Commands emitted by the voice detector.
@@ -166,9 +166,8 @@ pub async fn start_voice_detector(
     command_tx: mpsc::Sender<VoiceCommand>,
     input_device_name: Option<&str>,
 ) -> Result<VoiceDetectorHandle> {
-    // Ensure whisper-tiny model is available
-    let model_path = ensure_model_path_local(LocalModelSize::Tiny, true).await?;
-    ensure_whisper_logs_suppressed();
+    // Ensure whisper-tiny model is available for wake-word detection
+    let model_paths = ensure_sherpa_model(LocalModel::WhisperTiny, true).await?;
 
     let device = resolve_input_device(input_device_name)?;
     let device_config = device
@@ -359,28 +358,26 @@ pub async fn start_voice_detector(
     let proc_shutdown = shutdown.clone();
 
     tokio::spawn(async move {
-        // Load whisper-tiny model once
-        let ctx = match WhisperContext::new_with_params(
-            &model_path.to_string_lossy(),
-            WhisperContextParameters::default(),
-        ) {
-            Ok(ctx) => Arc::new(ctx),
-            Err(e) => {
-                eprintln!("Failed to load whisper-tiny for voice detection: {}", e);
-                return;
-            }
-        };
+        // Store model dir for creating recognizer in blocking threads
+        let model_dir = model_paths.dir.clone();
 
         while let Some((chunk, mode_at_capture)) = chunk_rx.recv().await {
             if proc_shutdown.load(Ordering::Relaxed) {
                 break;
             }
 
-            // Run whisper in a blocking thread
-            let ctx_clone = ctx.clone();
+            // Run recognition in a blocking thread
+            // OfflineRecognizer is not Send/Sync, so we create it per-chunk
+            let dir = model_dir.clone();
             let sr = sample_rate;
             let transcript = tokio::task::spawn_blocking(move || {
-                run_whisper_on_chunk(&ctx_clone, &chunk, sr)
+                let config = super::transcription::build_recognizer_config(
+                    LocalModel::WhisperTiny,
+                    &dir,
+                );
+                let recognizer = OfflineRecognizer::create(&config)
+                    .ok_or_else(|| anyhow::anyhow!("Failed to create recognizer"))?;
+                run_sherpa_on_chunk(&recognizer, &chunk, sr)
             })
             .await;
 
@@ -430,11 +427,11 @@ pub async fn start_voice_detector(
     })
 }
 
-/// Run whisper-tiny inference on a raw f32 audio chunk.
+/// Run sherpa-onnx inference on a raw f32 audio chunk.
 ///
-/// The chunk is at the device's native sample rate; whisper needs 16kHz mono.
+/// The chunk is at the device's native sample rate; sherpa-onnx needs 16kHz mono.
 /// We do a simple linear resampling here.
-fn run_whisper_on_chunk(ctx: &WhisperContext, samples: &[f32], sample_rate: u32) -> Result<String> {
+fn run_sherpa_on_chunk(recognizer: &OfflineRecognizer, samples: &[f32], sample_rate: u32) -> Result<String> {
     // Resample to 16kHz if needed
     let samples_16k = if sample_rate != 16000 {
         resample_to_16k(samples, sample_rate)
@@ -442,36 +439,14 @@ fn run_whisper_on_chunk(ctx: &WhisperContext, samples: &[f32], sample_rate: u32)
         samples.to_vec()
     };
 
-    let mut state = ctx
-        .create_state()
-        .context("Failed to create whisper state for voice detection")?;
+    let stream = recognizer.create_stream();
+    stream.accept_waveform(16000, &samples_16k);
+    recognizer.decode(&stream);
 
-    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-    params.set_print_progress(false);
-    params.set_print_special(false);
-    params.set_print_timestamps(false);
-    params.set_single_segment(true);
-    params.set_n_threads(2.min(num_cpus::get() as i32)); // Use fewer threads for quick detection
-    params.set_language(Some("en"));
+    let result = stream.get_result()
+        .ok_or_else(|| anyhow::anyhow!("Failed to get recognition result for voice chunk"))?;
 
-    state
-        .full(params, &samples_16k)
-        .context("Whisper inference failed for voice chunk")?;
-
-    let num_segments = state.full_n_segments();
-    let mut text = String::new();
-    for i in 0..num_segments {
-        if let Some(seg) = state.get_segment(i) {
-            if let Ok(segment_text) = seg.to_str() {
-                if !text.is_empty() {
-                    text.push(' ');
-                }
-                text.push_str(segment_text.trim());
-            }
-        }
-    }
-
-    Ok(text)
+    Ok(result.text.trim().to_string())
 }
 
 /// Simple linear resampling from source sample rate to 16kHz.

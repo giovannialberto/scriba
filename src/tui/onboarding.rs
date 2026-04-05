@@ -1,5 +1,5 @@
 use crate::core::{
-    CloudProvider, EnrichmentMode, LocalModelSize,
+    CloudProvider, EnrichmentMode, LocalModel,
     TranscriptionMode, initialize_world_from_seed,
 };
 use crate::database::Database;
@@ -75,11 +75,13 @@ pub(super) enum OnboardingTickResult {
     SaveWhisperKey(String),
 }
 
-pub(super) const WHISPER_MODELS: &[(LocalModelSize, &str, &str)] = &[
-    (LocalModelSize::Turbo, "Turbo (Recommended)", "~1.4 GB"),
-    (LocalModelSize::Large, "Large", "~2.9 GB"),
-    (LocalModelSize::Medium, "Medium", "~1.5 GB"),
-    (LocalModelSize::Small, "Small", "~466 MB"),
+pub(super) const WHISPER_MODELS: &[(LocalModel, &str, &str)] = &[
+    (LocalModel::WhisperTurbo, "Whisper Turbo (Recommended)", "~540 MB"),
+    (LocalModel::SenseVoice, "SenseVoice (Fast, Multilingual)", "~600 MB"),
+    (LocalModel::ParakeetTdt, "Parakeet TDT 0.6B (Best Italian)", "~465 MB"),
+    (LocalModel::WhisperLarge, "Whisper Large v3", "~3.1 GB"),
+    (LocalModel::WhisperMedium, "Whisper Medium", "~1.5 GB"),
+    (LocalModel::WhisperSmall, "Whisper Small", "~500 MB"),
 ];
 
 pub(super) struct OnboardingState {
@@ -918,14 +920,14 @@ impl Dashboard {
                                     ob.set_step_text("Setting up your models...", false);
 
                                     // Build download items
-                                    let whisper_size = WHISPER_MODELS[ob.whisper_model_selection].0;
-                                    let whisper_label = WHISPER_MODELS[ob.whisper_model_selection].1.to_string();
-                                    let whisper_already = crate::core::transcription::check_whisper_model(whisper_size);
+                                    let selected_model = WHISPER_MODELS[ob.whisper_model_selection].0;
+                                    let model_label = WHISPER_MODELS[ob.whisper_model_selection].1.to_string();
+                                    let model_already = crate::core::transcription::check_model_downloaded(selected_model);
 
                                     let mut items: Vec<(String, DownloadStatus)> = Vec::new();
                                     items.push((
-                                        format!("Downloading Whisper {}", whisper_label.replace(" (Recommended)", "")),
-                                        if whisper_already { DownloadStatus::Done } else { DownloadStatus::Pending },
+                                        format!("Downloading {}", model_label.replace(" (Recommended)", "").replace(" (Multilingual)", "")),
+                                        if model_already { DownloadStatus::Done } else { DownloadStatus::Pending },
                                     ));
 
                                     let ollama_model = if let EnrichmentMode::Local { ollama_model, .. } = &self.config.enrichment.mode {
@@ -955,12 +957,12 @@ impl Dashboard {
                                     let ollama_model_clone = ollama_model.clone();
 
                                     ob.download_task = Some(tokio::spawn(async move {
-                                        // Download Whisper model
-                                        if !whisper_already {
+                                        // Download model
+                                        if !model_already {
                                             let (wtx, mut wrx) = mpsc::unbounded_channel();
                                             let tx_w = tx.clone();
-                                            let whisper_handle = tokio::spawn(async move {
-                                                let result = crate::core::transcription::download_whisper_with_progress(whisper_size, wtx).await;
+                                            let model_handle = tokio::spawn(async move {
+                                                let result = crate::core::transcription::download_model_with_progress(selected_model, wtx).await;
                                                 if let Err(_) = result {
                                                     let _ = tx_w.send(DownloadProgress {
                                                         index: 0,
@@ -981,7 +983,7 @@ impl Dashboard {
                                                 }
                                             });
 
-                                            let _ = whisper_handle.await;
+                                            let _ = model_handle.await;
                                         }
 
                                         // Pull Ollama model
@@ -1020,8 +1022,8 @@ impl Dashboard {
                                 } else {
                                     // "Skip for now"
                                     // Save chosen whisper model to config
-                                    let whisper_size = WHISPER_MODELS[ob.whisper_model_selection].0;
-                                    self.config.transcription = TranscriptionMode::Local { model_size: whisper_size };
+                                    let selected = WHISPER_MODELS[ob.whisper_model_selection].0;
+                                    self.config.transcription = TranscriptionMode::Local { model: selected };
                                     let _ = self.config.save();
 
                                     ob.step = OnboardingStep::AskName;
@@ -1046,8 +1048,8 @@ impl Dashboard {
                             match key_code {
                                 KeyCode::Enter => {
                                     // Save whisper model to config
-                                    let whisper_size = WHISPER_MODELS[ob.whisper_model_selection].0;
-                                    self.config.transcription = TranscriptionMode::Local { model_size: whisper_size };
+                                    let selected = WHISPER_MODELS[ob.whisper_model_selection].0;
+                                    self.config.transcription = TranscriptionMode::Local { model: selected };
                                     let _ = self.config.save();
 
                                     ob.step = OnboardingStep::AskName;

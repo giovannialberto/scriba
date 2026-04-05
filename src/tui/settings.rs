@@ -1,5 +1,5 @@
 use crate::core::{
-    CloudProvider, EnrichmentMode, LocalModelSize, TranscriptionMode,
+    CloudProvider, EnrichmentMode, LocalModel, TranscriptionMode,
 };
 use crate::enrichment::OllamaClient;
 use anyhow::Result;
@@ -289,7 +289,7 @@ impl Dashboard {
                                 };
                                 new_cfg.enrichment.save_model_for_provider(&p, &model);
                             }
-                            let model_size = new_cfg.last_local_model_size.unwrap_or(LocalModelSize::Medium);
+                            let model = new_cfg.last_local_model.unwrap_or(LocalModel::WhisperTurbo);
                             let ep = new_cfg.enrichment.last_ollama_endpoint.clone()
                                 .unwrap_or_else(|| "http://localhost:11434".to_string());
                             let mdl = new_cfg.enrichment.last_ollama_model.clone()
@@ -298,8 +298,8 @@ impl Dashboard {
                                 ollama_endpoint: ep,
                                 ollama_model: mdl,
                             };
-                            // set_transcription_mode preserves last_api_key & last_local_model_size, then saves
-                            new_cfg.set_transcription_mode(TranscriptionMode::Local { model_size })?;
+                            // set_transcription_mode preserves last_api_key & last_local_model, then saves
+                            new_cfg.set_transcription_mode(TranscriptionMode::Local { model })?;
                         }
                         // Save succeeded — adopt the new config
                         self.config = new_cfg;
@@ -309,17 +309,12 @@ impl Dashboard {
                         // ── Mode-specific items ─────────────────────────
                         match (idx, is_private) {
                             (1, true) => {
-                                // Cycle Whisper model size
-                                if let TranscriptionMode::Local { model_size } = &self.config.transcription {
-                                    let new_model = match model_size {
-                                        LocalModelSize::Tiny => LocalModelSize::Base,
-                                        LocalModelSize::Base => LocalModelSize::Small,
-                                        LocalModelSize::Small => LocalModelSize::Medium,
-                                        LocalModelSize::Medium => LocalModelSize::Large,
-                                        LocalModelSize::Large => LocalModelSize::Turbo,
-                                        LocalModelSize::Turbo => LocalModelSize::Tiny,
-                                    };
-                                    let new_mode = TranscriptionMode::Local { model_size: new_model };
+                                // Cycle transcription model
+                                if let TranscriptionMode::Local { model } = &self.config.transcription {
+                                    let models = LocalModel::all_models();
+                                    let current_idx = models.iter().position(|m| m == model).unwrap_or(0);
+                                    let next_idx = (current_idx + 1) % models.len();
+                                    let new_mode = TranscriptionMode::Local { model: models[next_idx] };
                                     if let Err(e) = self.config.set_transcription_mode(new_mode) {
                                         self.message = format!("Failed to change model: {}", e);
                                         self.show_message = true;
@@ -637,8 +632,8 @@ impl Dashboard {
             lines.push(Line::from(vec![Span::raw("  "), Span::styled("PRIVATE", section_style)]));
 
             // Index 1: Whisper Model Size
-            if let TranscriptionMode::Local { model_size } = &self.config.transcription {
-                setting_line!("Whisper Model", model_size, 1, "\u{2190} Enter to cycle", None::<Style>);
+            if let TranscriptionMode::Local { model } = &self.config.transcription {
+                setting_line!("STT Model", model.display_name(), 1, "\u{2190} Enter to cycle", None::<Style>);
             }
 
             // Index 2: Ollama Model (picker)

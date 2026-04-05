@@ -1,4 +1,7 @@
 //! Transcription functionality for Scriba.
+//!
+//! Uses sherpa-onnx for local transcription (Whisper ONNX, SenseVoice, etc.)
+//! and the OpenAI API for cloud transcription.
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
@@ -7,16 +10,14 @@ use reqwest::{
     Client,
 };
 use serde_json::Value;
-use std::ffi::{c_char, c_void};
+use sherpa_onnx::{OfflineRecognizer, OfflineRecognizerConfig, Wave};
 use std::io::{stdout, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Once;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
-use super::config::{DiarizationConfig, LocalModelSize, ScribaConfig, TranscriptionMode};
+use super::config::{DiarizationConfig, LocalModel, ScribaConfig, TranscriptionMode};
 use super::diarization::{self, DiarizedTranscript, TimedSegment, ensure_diarization_models};
 use super::files::FileManager;
 use crate::database::Database;
@@ -25,25 +26,6 @@ use crate::utils::BASE_PATH;
 
 /// OpenAI Whisper API maximum upload size (25 MB).
 const OPENAI_MAX_FILE_SIZE: u64 = 25 * 1024 * 1024;
-
-extern "C" {
-    fn whisper_log_set(
-        callback: Option<unsafe extern "C" fn(i32, *const c_char, *mut c_void)>,
-        user_data: *mut c_void,
-    );
-}
-
-static INIT_WHISPER_LOG: Once = Once::new();
-
-unsafe extern "C" fn discard_whisper_log(_level: i32, _text: *const c_char, _ud: *mut c_void) {
-    // intentionally no-op to keep TUI clean
-}
-
-pub(crate) fn ensure_whisper_logs_suppressed() {
-    INIT_WHISPER_LOG.call_once(|| unsafe {
-        whisper_log_set(Some(discard_whisper_log), std::ptr::null_mut());
-    });
-}
 
 /// Progress indicator for transcription operations.
 pub struct TranscriptionProgress {
@@ -376,135 +358,143 @@ async fn transcribe_single_chunk(audio_path: &Path, api_key: &str) -> Result<Str
         .ok_or_else(|| anyhow::anyhow!("No 'text' field found in OpenAI response"))
 }
 
-async fn download_model_with_timeout(model_size: LocalModelSize) -> Result<PathBuf> {
-    ensure_model_path_local(model_size, true).await
+/// Paths to the files composing a sherpa-onnx model.
+pub(crate) struct SherpaModelPaths {
+    /// Directory containing the model files.
+    pub dir: PathBuf,
 }
 
-pub(crate) async fn ensure_model_path_local(size: LocalModelSize, quiet: bool) -> Result<PathBuf> {
-    let models_dir = BASE_PATH.join("models");
+/// Model archive info for downloading from sherpa-onnx releases.
+struct ModelArchiveInfo {
+    /// Archive filename (e.g. "sherpa-onnx-whisper-tiny.tar.bz2").
+    archive_name: &'static str,
+    /// Base URL for downloads.
+    url: &'static str,
+    /// Expected directory name inside the archive after extraction.
+    extracted_dir: &'static str,
+}
+
+fn model_archive_info(model: LocalModel) -> ModelArchiveInfo {
+    match model {
+        LocalModel::WhisperTiny => ModelArchiveInfo {
+            archive_name: "sherpa-onnx-whisper-tiny.tar.bz2",
+            url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-tiny.tar.bz2",
+            extracted_dir: "sherpa-onnx-whisper-tiny",
+        },
+        LocalModel::WhisperBase => ModelArchiveInfo {
+            archive_name: "sherpa-onnx-whisper-base.tar.bz2",
+            url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-base.tar.bz2",
+            extracted_dir: "sherpa-onnx-whisper-base",
+        },
+        LocalModel::WhisperSmall => ModelArchiveInfo {
+            archive_name: "sherpa-onnx-whisper-small.tar.bz2",
+            url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-small.tar.bz2",
+            extracted_dir: "sherpa-onnx-whisper-small",
+        },
+        LocalModel::WhisperMedium => ModelArchiveInfo {
+            archive_name: "sherpa-onnx-whisper-medium.tar.bz2",
+            url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-medium.tar.bz2",
+            extracted_dir: "sherpa-onnx-whisper-medium",
+        },
+        LocalModel::WhisperLarge => ModelArchiveInfo {
+            archive_name: "sherpa-onnx-whisper-large-v3.tar.bz2",
+            url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-large-v3.tar.bz2",
+            extracted_dir: "sherpa-onnx-whisper-large-v3",
+        },
+        LocalModel::WhisperTurbo => ModelArchiveInfo {
+            archive_name: "sherpa-onnx-whisper-turbo.tar.bz2",
+            url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-turbo.tar.bz2",
+            extracted_dir: "sherpa-onnx-whisper-turbo",
+        },
+        LocalModel::SenseVoice => ModelArchiveInfo {
+            archive_name: "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2",
+            url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2",
+            extracted_dir: "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
+        },
+        LocalModel::ParakeetTdt => ModelArchiveInfo {
+            archive_name: "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2",
+            url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2",
+            extracted_dir: "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8",
+        },
+    }
+}
+
+/// Check if the ONNX model is already downloaded locally.
+pub(crate) fn check_model_downloaded(model: LocalModel) -> bool {
+    let info = model_archive_info(model);
+    let model_dir = BASE_PATH.join("models").join("sherpa").join(info.extracted_dir);
+    model_dir.exists() && model_dir.is_dir()
+}
+
+/// Ensure the ONNX model is downloaded and return its paths.
+pub(crate) async fn ensure_sherpa_model(model: LocalModel, quiet: bool) -> Result<SherpaModelPaths> {
+    let models_dir = BASE_PATH.join("models").join("sherpa");
     std::fs::create_dir_all(&models_dir).ok();
 
-    let local_candidates: Vec<&str> = match size {
-        LocalModelSize::Tiny => vec!["ggml-tiny.bin", "tiny.gguf", "ggml-tiny-q5_0.gguf"],
-        LocalModelSize::Base => vec!["ggml-base.bin", "base.gguf", "ggml-base-q5_0.gguf"],
-        LocalModelSize::Small => vec!["ggml-small.bin", "small.gguf", "ggml-small-q5_0.gguf"],
-        LocalModelSize::Medium => vec!["ggml-medium.bin", "medium.gguf", "ggml-medium-q5_0.gguf"],
-        LocalModelSize::Large => vec![
-            "ggml-large-v3.bin",
-            "large-v3.gguf",
-            "ggml-large-v3-q5_0.gguf",
-        ],
-        LocalModelSize::Turbo => vec![
-            "ggml-large-v3-turbo.gguf",
-            "ggml-large-v3-turbo-q5_0.gguf",
-            "large-v3-turbo.gguf",
-            "ggml-large-v3-turbo.bin",
-        ],
-    };
+    let info = model_archive_info(model);
+    let model_dir = models_dir.join(info.extracted_dir);
 
-    for name in &local_candidates {
-        let p = models_dir.join(name);
-        if p.exists() {
-            return Ok(p);
-        }
+    if model_dir.exists() {
+        return Ok(SherpaModelPaths { dir: model_dir });
     }
 
-    // Download model if not found
-    match size {
-        LocalModelSize::Tiny => {
-            let name = "ggml-tiny.bin";
-            let url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin";
-            download_model(&models_dir, name, url, quiet).await
-        }
-        LocalModelSize::Base => {
-            let name = "ggml-base.bin";
-            let url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin";
-            download_model(&models_dir, name, url, quiet).await
-        }
-        LocalModelSize::Small => {
-            let name = "ggml-small.bin";
-            let url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin";
-            download_model(&models_dir, name, url, quiet).await
-        }
-        LocalModelSize::Medium => {
-            let name = "ggml-medium.bin";
-            let url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin";
-            download_model(&models_dir, name, url, quiet).await
-        }
-        LocalModelSize::Large => {
-            let name = "ggml-large-v3.bin";
-            let url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin";
-            download_model(&models_dir, name, url, quiet).await
-        }
-        LocalModelSize::Turbo => {
-            let candidates = vec![
-                ("ggml-large-v3-turbo-q5_0.gguf", "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.gguf"),
-                ("ggml-large-v3-turbo.gguf", "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.gguf"),
-                ("large-v3-turbo.gguf", "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/large-v3-turbo.gguf"),
-                ("ggml-large-v3-turbo.bin", "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin"),
-            ];
-            let mut last_err: Option<anyhow::Error> = None;
-            for (name, url) in candidates {
-                match download_model(&models_dir, name, url, quiet).await {
-                    Ok(path) => return Ok(path),
-                    Err(e) => last_err = Some(e),
-                }
-            }
-            Err(last_err.unwrap_or_else(|| {
-                anyhow::anyhow!("Failed to download turbo model from all known locations")
-            }))
-        }
+    if !quiet {
+        println!(
+            "Downloading {} model (this may take a while)...",
+            model.display_name()
+        );
     }
+
+    // Download and extract the tarball
+    let archive_path = models_dir.join(info.archive_name);
+    download_file_streaming(info.url, &archive_path, quiet)
+        .await
+        .with_context(|| format!("Failed to download model from {}", info.url))?;
+
+    // Extract tar.bz2 using tar command
+    let output = Command::new("tar")
+        .args(["xjf", archive_path.to_string_lossy().as_ref()])
+        .current_dir(&models_dir)
+        .output()
+        .context("Failed to extract model archive (tar not found?)")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let _ = std::fs::remove_file(&archive_path);
+        return Err(anyhow::anyhow!("Failed to extract model archive: {}", stderr));
+    }
+
+    // Clean up the archive
+    let _ = std::fs::remove_file(&archive_path);
+
+    if !quiet {
+        println!("Model downloaded to {}", model_dir.display());
+    }
+
+    Ok(SherpaModelPaths { dir: model_dir })
 }
 
-/// Check if a Whisper model is already downloaded locally.
-pub(crate) fn check_whisper_model(size: LocalModelSize) -> bool {
-    let models_dir = BASE_PATH.join("models");
-    let local_candidates: Vec<&str> = match size {
-        LocalModelSize::Tiny => vec!["ggml-tiny.bin", "tiny.gguf", "ggml-tiny-q5_0.gguf"],
-        LocalModelSize::Base => vec!["ggml-base.bin", "base.gguf", "ggml-base-q5_0.gguf"],
-        LocalModelSize::Small => vec!["ggml-small.bin", "small.gguf", "ggml-small-q5_0.gguf"],
-        LocalModelSize::Medium => vec!["ggml-medium.bin", "medium.gguf", "ggml-medium-q5_0.gguf"],
-        LocalModelSize::Large => vec![
-            "ggml-large-v3.bin", "large-v3.gguf", "ggml-large-v3-q5_0.gguf",
-        ],
-        LocalModelSize::Turbo => vec![
-            "ggml-large-v3-turbo.gguf", "ggml-large-v3-turbo-q5_0.gguf",
-            "large-v3-turbo.gguf", "ggml-large-v3-turbo.bin",
-        ],
-    };
-    local_candidates.iter().any(|name| models_dir.join(name).exists())
-}
-
-/// Download a Whisper model, sending progress (0–100) through the channel.
-pub(crate) async fn download_whisper_with_progress(
-    size: LocalModelSize,
+/// Download a model, sending progress (0-100) through the channel.
+pub(crate) async fn download_model_with_progress(
+    model: LocalModel,
     tx: tokio::sync::mpsc::UnboundedSender<u8>,
 ) -> Result<()> {
-    let models_dir = BASE_PATH.join("models");
+    let models_dir = BASE_PATH.join("models").join("sherpa");
     std::fs::create_dir_all(&models_dir).ok();
 
-    // If already exists, report done immediately
-    if check_whisper_model(size) {
+    if check_model_downloaded(model) {
         let _ = tx.send(100);
         return Ok(());
     }
 
-    let (name, url) = match size {
-        LocalModelSize::Tiny => ("ggml-tiny.bin", "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin"),
-        LocalModelSize::Base => ("ggml-base.bin", "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin"),
-        LocalModelSize::Small => ("ggml-small.bin", "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin"),
-        LocalModelSize::Medium => ("ggml-medium.bin", "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin"),
-        LocalModelSize::Large => ("ggml-large-v3.bin", "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin"),
-        LocalModelSize::Turbo => ("ggml-large-v3-turbo.bin", "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin"),
-    };
+    let info = model_archive_info(model);
+    let archive_path = models_dir.join(info.archive_name);
 
-    let dest = models_dir.join(name);
     let client = Client::new();
-    let resp = client.get(url).send().await?.error_for_status()?;
+    let resp = client.get(info.url).send().await?.error_for_status()?;
     let total = resp.content_length();
     let mut stream = resp.bytes_stream();
-    let mut file = std::fs::File::create(&dest).context("Failed to create model file")?;
+    let mut file = std::fs::File::create(&archive_path).context("Failed to create model file")?;
     let mut downloaded: u64 = 0;
 
     while let Some(chunk) = stream.next().await {
@@ -512,34 +502,28 @@ pub(crate) async fn download_whisper_with_progress(
         std::io::Write::write_all(&mut file, &chunk)?;
         downloaded += chunk.len() as u64;
         if let Some(total) = total {
-            let pct = ((downloaded as f64 / total as f64) * 100.0).min(100.0) as u8;
+            // Reserve last 5% for extraction
+            let pct = ((downloaded as f64 / total as f64) * 95.0).min(95.0) as u8;
             let _ = tx.send(pct);
         }
     }
+
+    // Extract
+    let output = Command::new("tar")
+        .args(["xjf", archive_path.to_string_lossy().as_ref()])
+        .current_dir(&models_dir)
+        .output()
+        .context("Failed to extract model archive")?;
+
+    let _ = std::fs::remove_file(&archive_path);
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!("Failed to extract model archive: {}", stderr));
+    }
+
     let _ = tx.send(100);
     Ok(())
-}
-
-async fn download_model(
-    models_dir: &Path,
-    name: &str,
-    url: &str,
-    quiet: bool,
-) -> Result<PathBuf> {
-    let dest = models_dir.join(name);
-    if !quiet {
-        println!(
-            "📥 Downloading Whisper model: {} (this may take a while)",
-            name
-        );
-    }
-    download_file_streaming(url, &dest, quiet)
-        .await
-        .with_context(|| format!("Failed to download model from {}", url))?;
-    if !quiet {
-        println!("✅ Model downloaded to {}", dest.display());
-    }
-    Ok(dest)
 }
 
 async fn download_file_streaming(url: &str, dest: &Path, quiet: bool) -> Result<()> {
@@ -570,9 +554,12 @@ async fn download_file_streaming(url: &str, dest: &Path, quiet: bool) -> Result<
 }
 
 /// Approximate max characters for ~224 Whisper tokens.
+/// Kept for potential future use with sherpa-onnx Whisper prompt support.
+#[allow(dead_code)]
 const WHISPER_PROMPT_CHAR_LIMIT: usize = 670;
 
 /// Filter aliases to only include genuine spelling variants, not LLM annotations.
+#[allow(dead_code)]
 fn filter_aliases(aliases: &[String], canonical_name: &str) -> Vec<String> {
     let canonical_lower = canonical_name.to_lowercase();
     aliases
@@ -585,6 +572,7 @@ fn filter_aliases(aliases: &[String], canonical_name: &str) -> Vec<String> {
         .collect()
 }
 
+#[allow(dead_code)]
 /// Build a Whisper initial prompt from structured world data.
 ///
 /// Returns a natural-language contextual string that primes Whisper's decoder
@@ -703,197 +691,283 @@ fn build_prompt_from_world_data(data: &WorldData) -> Option<String> {
     }
 }
 
-/// Load world context and build a Whisper initial prompt.
+/// Load world context and build a context prompt for transcription.
 ///
 /// Returns `None` if no world context exists or it cannot be parsed.
-fn build_whisper_world_prompt() -> Option<String> {
+/// Note: Currently used for world prompt building in tests; sherpa-onnx
+/// Whisper models may not support initial prompting.
+#[allow(dead_code)]
+fn build_world_context_prompt() -> Option<String> {
     let world_ctx = WorldContext::load().ok()?;
     let data = world_ctx.parsed()?;
     build_prompt_from_world_data(&data)
 }
 
-fn run_whisper_transcription(model_path: &Path, wav_path: &Path) -> Result<String> {
-    if !model_path.exists() {
-        return Err(anyhow::anyhow!(
-            "Whisper model file not found: {}",
-            model_path.display()
-        ));
+/// Get the file name prefix used by sherpa-onnx model archives.
+/// e.g., WhisperTiny -> "tiny", WhisperLarge -> "large-v3"
+fn model_file_prefix(model: LocalModel) -> &'static str {
+    match model {
+        LocalModel::WhisperTiny => "tiny",
+        LocalModel::WhisperBase => "base",
+        LocalModel::WhisperSmall => "small",
+        LocalModel::WhisperMedium => "medium",
+        LocalModel::WhisperLarge => "large-v3",
+        LocalModel::WhisperTurbo => "turbo",
+        LocalModel::SenseVoice => "model",
+        LocalModel::ParakeetTdt => "parakeet", // unused, Parakeet uses generic names
     }
-    if !wav_path.exists() {
-        return Err(anyhow::anyhow!(
-            "Audio file not found: {}",
-            wav_path.display()
-        ));
+}
+
+/// Build the sherpa-onnx recognizer config for a given model.
+pub(crate) fn build_recognizer_config(model: LocalModel, model_dir: &Path) -> OfflineRecognizerConfig {
+    let mut config = OfflineRecognizerConfig::default();
+    config.model_config.num_threads = std::thread::available_parallelism()
+        .map(|n| n.get() as i32)
+        .unwrap_or(4);
+
+    let prefix = model_file_prefix(model);
+
+    match model {
+        LocalModel::WhisperTiny
+        | LocalModel::WhisperBase
+        | LocalModel::WhisperSmall
+        | LocalModel::WhisperMedium
+        | LocalModel::WhisperLarge
+        | LocalModel::WhisperTurbo => {
+            // sherpa-onnx whisper archives use: {prefix}-encoder[.int8].onnx
+            // Prefer non-quantized, fall back to int8 (some archives only have int8)
+            let encoder = if model_dir.join(format!("{}-encoder.onnx", prefix)).exists() {
+                model_dir.join(format!("{}-encoder.onnx", prefix))
+            } else {
+                model_dir.join(format!("{}-encoder.int8.onnx", prefix))
+            };
+            let decoder = if model_dir.join(format!("{}-decoder.onnx", prefix)).exists() {
+                model_dir.join(format!("{}-decoder.onnx", prefix))
+            } else {
+                model_dir.join(format!("{}-decoder.int8.onnx", prefix))
+            };
+            config.model_config.whisper.encoder =
+                Some(encoder.to_string_lossy().into_owned());
+            config.model_config.whisper.decoder =
+                Some(decoder.to_string_lossy().into_owned());
+            config.model_config.tokens =
+                Some(model_dir.join(format!("{}-tokens.txt", prefix)).to_string_lossy().into_owned());
+            config.model_config.whisper.language = Some("en".into());
+            config.model_config.whisper.task = Some("transcribe".into());
+        }
+        LocalModel::SenseVoice => {
+            let model_file = if model_dir.join("model.int8.onnx").exists() {
+                "model.int8.onnx"
+            } else {
+                "model.onnx"
+            };
+            config.model_config.sense_voice.model =
+                Some(model_dir.join(model_file).to_string_lossy().into_owned());
+            config.model_config.sense_voice.language = Some("auto".into());
+            config.model_config.sense_voice.use_itn = true;
+            config.model_config.tokens =
+                Some(model_dir.join("tokens.txt").to_string_lossy().into_owned());
+        }
+        LocalModel::ParakeetTdt => {
+            // Transducer architecture: encoder + decoder + joiner
+            let encoder = if model_dir.join("encoder.int8.onnx").exists() {
+                "encoder.int8.onnx"
+            } else {
+                "encoder.onnx"
+            };
+            let decoder = if model_dir.join("decoder.int8.onnx").exists() {
+                "decoder.int8.onnx"
+            } else {
+                "decoder.onnx"
+            };
+            let joiner = if model_dir.join("joiner.int8.onnx").exists() {
+                "joiner.int8.onnx"
+            } else {
+                "joiner.onnx"
+            };
+            config.model_config.transducer.encoder =
+                Some(model_dir.join(encoder).to_string_lossy().into_owned());
+            config.model_config.transducer.decoder =
+                Some(model_dir.join(decoder).to_string_lossy().into_owned());
+            config.model_config.transducer.joiner =
+                Some(model_dir.join(joiner).to_string_lossy().into_owned());
+            config.model_config.tokens =
+                Some(model_dir.join("tokens.txt").to_string_lossy().into_owned());
+            config.model_config.model_type = Some("nemo_transducer".into());
+        }
     }
 
-    let params_ctx = WhisperContextParameters::default();
-    let model_path_str = model_path.to_string_lossy();
-    let ctx = match WhisperContext::new_with_params(&model_path_str, params_ctx) {
-        Ok(ctx) => ctx,
-        Err(e) => {
-            return Err(anyhow::anyhow!(
-                "Failed to load Whisper model '{}': {}. Check if model file is valid and you have enough memory",
-                model_path.display(),
-                e
-            ))
+    config
+}
+
+/// Ensure the Silero VAD model is downloaded and return its path.
+async fn ensure_vad_model() -> Result<PathBuf> {
+    let vad_dir = BASE_PATH.join("models").join("sherpa");
+    std::fs::create_dir_all(&vad_dir).ok();
+    let vad_path = vad_dir.join("silero_vad.onnx");
+    if !vad_path.exists() {
+        let url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx";
+        download_file_streaming(url, &vad_path, true).await
+            .context("Failed to download Silero VAD model")?;
+    }
+    Ok(vad_path)
+}
+
+/// Create a Silero VAD for segmenting long audio.
+fn create_vad(vad_model_path: &Path) -> Result<sherpa_onnx::VoiceActivityDetector> {
+    let mut vad_config = sherpa_onnx::VadModelConfig::default();
+    vad_config.silero_vad.model = Some(vad_model_path.to_string_lossy().into_owned());
+    vad_config.silero_vad.threshold = 0.5;
+    vad_config.silero_vad.min_silence_duration = 0.5;
+    vad_config.silero_vad.min_speech_duration = 0.25;
+    vad_config.silero_vad.window_size = 512;
+    vad_config.sample_rate = 16000;
+    vad_config.num_threads = 1;
+
+    // Buffer 30 seconds — we feed audio in small chunks and drain segments as they appear
+    sherpa_onnx::VoiceActivityDetector::create(&vad_config, 30.0)
+        .ok_or_else(|| anyhow::anyhow!("Failed to create Silero VAD"))
+}
+
+/// Suppress sherpa-onnx C library stderr output (e.g. "Only waves less than 30 seconds").
+/// Returns a guard that restores stderr on drop.
+fn suppress_stderr() -> Option<gag::Hold> {
+    gag::Hold::stderr().ok()
+}
+
+
+/// Run transcription using sherpa-onnx with VAD segmentation for long audio.
+fn run_sherpa_transcription(model: LocalModel, model_dir: &Path, wav_path: &Path, vad_model_path: &Path) -> Result<String> {
+    let config = build_recognizer_config(model, model_dir);
+
+    let recognizer = OfflineRecognizer::create(&config)
+        .ok_or_else(|| anyhow::anyhow!("Failed to create sherpa-onnx recognizer. Check model files in {}", model_dir.display()))?;
+
+    let wave = Wave::read(wav_path.to_string_lossy().as_ref())
+        .ok_or_else(|| anyhow::anyhow!("Failed to read WAV file: {}", wav_path.display()))?;
+
+    let samples = wave.samples();
+    let sample_rate = wave.sample_rate();
+
+    let vad = create_vad(vad_model_path)?;
+    let window_size = 512; // Silero VAD window size
+    let mut all_text = String::new();
+
+    // Feed audio in small windows and drain detected segments incrementally
+    for chunk in samples.chunks(window_size) {
+        vad.accept_waveform(chunk);
+        while !vad.is_empty() {
+            if let Some(segment) = vad.front() {
+                let stream = recognizer.create_stream();
+                stream.accept_waveform(sample_rate, segment.samples());
+                recognizer.decode(&stream);
+                if let Some(result) = stream.get_result() {
+                    let text = result.text.trim();
+                    if !text.is_empty() {
+                        if !all_text.is_empty() {
+                            all_text.push(' ');
+                        }
+                        all_text.push_str(text);
+                    }
+                }
+            }
+            vad.pop();
+        }
+    }
+
+    // Flush any trailing speech
+    vad.flush();
+    while !vad.is_empty() {
+        if let Some(segment) = vad.front() {
+            let stream = recognizer.create_stream();
+            stream.accept_waveform(sample_rate, segment.samples());
+            recognizer.decode(&stream);
+            if let Some(result) = stream.get_result() {
+                let text = result.text.trim();
+                if !text.is_empty() {
+                    if !all_text.is_empty() {
+                        all_text.push(' ');
+                    }
+                    all_text.push_str(text);
+                }
+            }
+        }
+        vad.pop();
+    }
+
+    Ok(all_text)
+}
+
+/// Run transcription with VAD and return both text and timed segments for diarization.
+fn run_sherpa_transcription_with_segments(
+    model: LocalModel,
+    model_dir: &Path,
+    wav_path: &Path,
+    vad_model_path: &Path,
+) -> Result<(String, Vec<TimedSegment>)> {
+    let config = build_recognizer_config(model, model_dir);
+
+    let recognizer = OfflineRecognizer::create(&config)
+        .ok_or_else(|| anyhow::anyhow!("Failed to create sherpa-onnx recognizer. Check model files in {}", model_dir.display()))?;
+
+    let wave = Wave::read(wav_path.to_string_lossy().as_ref())
+        .ok_or_else(|| anyhow::anyhow!("Failed to read WAV file: {}", wav_path.display()))?;
+
+    let samples = wave.samples();
+    let sample_rate = wave.sample_rate();
+
+    // Use VAD to segment long audio
+    let vad = create_vad(vad_model_path)?;
+    let window_size = 512;
+    let mut all_text = String::new();
+    let mut timed_segments = Vec::new();
+
+    // Helper closure to process detected VAD segments
+    let mut drain_segments = |vad: &sherpa_onnx::VoiceActivityDetector,
+                              recognizer: &OfflineRecognizer,
+                              sample_rate: i32,
+                              all_text: &mut String,
+                              timed_segments: &mut Vec<TimedSegment>| {
+        while !vad.is_empty() {
+            if let Some(segment) = vad.front() {
+                let segment_start_secs = segment.start() as f64 / sample_rate as f64;
+                let segment_duration_secs = segment.n() as f64 / sample_rate as f64;
+
+                let stream = recognizer.create_stream();
+                stream.accept_waveform(sample_rate, segment.samples());
+                recognizer.decode(&stream);
+
+                if let Some(result) = stream.get_result() {
+                    let text = result.text.trim().to_string();
+                    if !text.is_empty() {
+                        if !all_text.is_empty() {
+                            all_text.push(' ');
+                        }
+                        all_text.push_str(&text);
+
+                        timed_segments.push(TimedSegment {
+                            start: segment_start_secs,
+                            end: segment_start_secs + segment_duration_secs,
+                            text,
+                        });
+                    }
+                }
+            }
+            vad.pop();
         }
     };
 
-    let mut state = ctx.create_state().with_context(|| {
-        format!(
-            "Failed to create Whisper state for model: {}",
-            model_path.display()
-        )
-    })?;
-
-    let mut reader = hound::WavReader::open(wav_path)
-        .context("Failed to open normalized WAV for transcription")?;
-    let spec = reader.spec();
-
-    let mut samples_f32: Vec<f32> = Vec::new();
-    match spec.sample_format {
-        hound::SampleFormat::Float => {
-            for s in reader.samples::<f32>() {
-                samples_f32.push(s.unwrap_or(0.0));
-            }
-        }
-        hound::SampleFormat::Int => {
-            let max = (1i64 << (spec.bits_per_sample as i64 - 1)) as f32;
-            for s in reader.samples::<i32>() {
-                let v = s.unwrap_or(0) as f32 / max;
-                samples_f32.push(v);
-            }
-        }
+    // Feed audio in small windows and drain detected segments incrementally
+    for chunk in samples.chunks(window_size) {
+        vad.accept_waveform(chunk);
+        drain_segments(&vad, &recognizer, sample_rate, &mut all_text, &mut timed_segments);
     }
 
-    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-    params.set_print_progress(false);
-    params.set_print_special(false);
-    params.set_print_timestamps(false);
-    params.set_single_segment(false);
-    params.set_n_threads(num_cpus::get() as i32);
+    // Flush any trailing speech
+    vad.flush();
+    drain_segments(&vad, &recognizer, sample_rate, &mut all_text, &mut timed_segments);
 
-    if let Some(world_prompt) = build_whisper_world_prompt() {
-        params.set_initial_prompt(&world_prompt);
-    }
-
-    state
-        .full(params, &samples_f32)
-        .context("Whisper full() failed")?;
-
-    let num_segments = state.full_n_segments();
-    let mut text = String::new();
-    for i in 0..num_segments {
-        if let Some(seg) = state.get_segment(i) {
-            if let Ok(segment_text) = seg.to_str() {
-                if !text.is_empty() {
-                    text.push(' ');
-                }
-                text.push_str(segment_text.trim());
-            }
-        }
-    }
-
-    Ok(text)
-}
-
-/// Run whisper transcription and return both concatenated text and timed segments.
-fn run_whisper_transcription_with_segments(
-    model_path: &Path,
-    wav_path: &Path,
-) -> Result<(String, Vec<TimedSegment>)> {
-    if !model_path.exists() {
-        return Err(anyhow::anyhow!(
-            "Whisper model file not found: {}",
-            model_path.display()
-        ));
-    }
-    if !wav_path.exists() {
-        return Err(anyhow::anyhow!(
-            "Audio file not found: {}",
-            wav_path.display()
-        ));
-    }
-
-    let params_ctx = WhisperContextParameters::default();
-    let model_path_str = model_path.to_string_lossy();
-    let ctx = WhisperContext::new_with_params(&model_path_str, params_ctx).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to load Whisper model '{}': {}",
-            model_path.display(),
-            e
-        )
-    })?;
-
-    let mut state = ctx.create_state().with_context(|| {
-        format!(
-            "Failed to create Whisper state for model: {}",
-            model_path.display()
-        )
-    })?;
-
-    let mut reader = hound::WavReader::open(wav_path)
-        .context("Failed to open normalized WAV for transcription")?;
-    let spec = reader.spec();
-
-    let mut samples_f32: Vec<f32> = Vec::new();
-    match spec.sample_format {
-        hound::SampleFormat::Float => {
-            for s in reader.samples::<f32>() {
-                samples_f32.push(s.unwrap_or(0.0));
-            }
-        }
-        hound::SampleFormat::Int => {
-            let max = (1i64 << (spec.bits_per_sample as i64 - 1)) as f32;
-            for s in reader.samples::<i32>() {
-                let v = s.unwrap_or(0) as f32 / max;
-                samples_f32.push(v);
-            }
-        }
-    }
-
-    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-    params.set_print_progress(false);
-    params.set_print_special(false);
-    params.set_print_timestamps(false);
-    params.set_single_segment(false);
-    params.set_n_threads(num_cpus::get() as i32);
-
-    if let Some(world_prompt) = build_whisper_world_prompt() {
-        params.set_initial_prompt(&world_prompt);
-    }
-
-    state
-        .full(params, &samples_f32)
-        .context("Whisper full() failed")?;
-
-    let num_segments = state.full_n_segments();
-    let mut text = String::new();
-    let mut timed_segments = Vec::new();
-
-    for i in 0..num_segments {
-        if let Some(seg) = state.get_segment(i) {
-            if let Ok(segment_text) = seg.to_str() {
-                let trimmed = segment_text.trim();
-                if !text.is_empty() {
-                    text.push(' ');
-                }
-                text.push_str(trimmed);
-
-                // Timestamps are in centiseconds (10ms units)
-                let start = seg.start_timestamp() as f64 / 100.0;
-                let end = seg.end_timestamp() as f64 / 100.0;
-
-                timed_segments.push(TimedSegment {
-                    start,
-                    end,
-                    text: trimmed.to_string(),
-                });
-            }
-        }
-    }
-
-    Ok((text, timed_segments))
+    Ok((all_text, timed_segments))
 }
 
 async fn transcribe_with_openai_api(audio_path: &PathBuf, api_key: &str) -> Result<String> {
@@ -936,10 +1010,6 @@ pub async fn transcribe_audio(
     verbose: bool,
     diarization: Option<&DiarizationConfig>,
 ) -> Result<()> {
-    if !verbose {
-        ensure_whisper_logs_suppressed();
-    }
-
     let audio_file_path = FileManager::resolve_audio_path(input_path)?;
     let config = ScribaConfig::load()?;
     let transcription_mode = mode_override.unwrap_or_else(|| config.transcription.clone());
@@ -948,14 +1018,14 @@ pub async fn transcribe_audio(
 
     if verbose {
         let mode_description = match &transcription_mode {
-            TranscriptionMode::Local { model_size } => {
+            TranscriptionMode::Local { model } => {
                 format!(
-                    "🎤 → 📝 Transcribing locally using Whisper {} model...",
-                    model_size
+                    "Transcribing locally using {} model...",
+                    model.display_name()
                 )
             }
             TranscriptionMode::Api { .. } => {
-                "🎤 → ☁️ Transcribing using OpenAI Whisper API...".to_string()
+                "Transcribing using OpenAI Whisper API...".to_string()
             }
         };
         println!("\n{}\n", mode_description);
@@ -967,14 +1037,17 @@ pub async fn transcribe_audio(
 
     // Transcription result: text, model name, optional diarized transcript
     let (transcription_text, model_used, diarized) = match transcription_mode {
-        TranscriptionMode::Local { model_size } => {
+        TranscriptionMode::Local { model } => {
+            // Suppress sherpa-onnx C library stderr warnings that would corrupt the TUI
+            let _stderr_guard = suppress_stderr();
+
             let progress_task = if verbose {
                 let mut local_progress = progress;
                 Some(tokio::spawn(async move {
                     loop {
                         let message = match local_progress.start_time.elapsed().as_secs() {
                             0..=3 => Some("Preparing audio (16kHz mono)"),
-                            4..=8 => Some("Loading Whisper model"),
+                            4..=8 => Some("Loading model"),
                             9..=25 => Some("Running local transcription"),
                             _ => Some("Almost there, hang tight"),
                         };
@@ -987,13 +1060,18 @@ pub async fn transcribe_audio(
 
             let wav_path = ensure_mono_16k_wav(&audio_file_path)
                 .context("Failed to prepare 16kHz mono WAV for transcription")?;
-            let model_path = {
-                let download_future = download_model_with_timeout(model_size);
-                tokio::time::timeout(Duration::from_secs(300), download_future)
+
+            let model_paths = {
+                let download_future = ensure_sherpa_model(model, true);
+                tokio::time::timeout(Duration::from_secs(600), download_future)
                     .await
-                    .context("Model download timed out after 5 minutes")?
+                    .context("Model download timed out after 10 minutes")?
                     .context("Failed to download model")?
             };
+
+            // Ensure VAD model is available (small ~2MB download)
+            let vad_model_path = ensure_vad_model().await
+                .context("Failed to download VAD model")?;
 
             let (text, diarized_transcript) = if diarize {
                 let max_speakers = diarization
@@ -1002,8 +1080,8 @@ pub async fn transcribe_audio(
 
                 // Transcribe with segments
                 let (text, timed_segments) =
-                    run_whisper_transcription_with_segments(&model_path, &wav_path)
-                        .context("Local Whisper transcription failed")?;
+                    run_sherpa_transcription_with_segments(model, &model_paths.dir, &wav_path, &vad_model_path)
+                        .context("Local transcription failed")?;
 
                 if let Some(task) = &progress_task {
                     task.abort();
@@ -1044,8 +1122,8 @@ pub async fn transcribe_audio(
                     }
                 }
             } else {
-                let text = run_whisper_transcription(&model_path, &wav_path)
-                    .context("Local Whisper transcription failed")?;
+                let text = run_sherpa_transcription(model, &model_paths.dir, &wav_path, &vad_model_path)
+                    .context("Local transcription failed")?;
                 (text, None)
             };
 
@@ -1055,7 +1133,7 @@ pub async fn transcribe_audio(
             if let Some(task) = progress_task {
                 task.abort();
             }
-            let model_name = format!("whisper-{}", model_size);
+            let model_name = format!("sherpa-{}", model);
             (text, model_name, diarized_transcript)
         }
         TranscriptionMode::Api { api_key } => {

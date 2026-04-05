@@ -1,10 +1,11 @@
 //! Speaker diarization for Scriba.
 //!
-//! Uses pyannote-rs (ONNX-based) to identify distinct speakers in audio,
-//! then merges speaker labels with Whisper's timestamped transcript segments.
+//! Uses sherpa-onnx's offline speaker diarization to identify distinct speakers
+//! in audio, then merges speaker labels with timestamped transcript segments.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sherpa_onnx::Wave;
 use std::path::{Path, PathBuf};
 
 use crate::utils::BASE_PATH;
@@ -49,8 +50,9 @@ mod models {
     use super::*;
     use futures_util::StreamExt;
     use std::io::Write as _;
+    use std::process::Command;
 
-    /// Paths to the two ONNX models needed for diarization.
+    /// Paths to the diarization models needed by sherpa-onnx.
     #[derive(Debug, Clone)]
     pub struct DiarizationModelPaths {
         pub segmentation: PathBuf,
@@ -59,26 +61,31 @@ mod models {
 
     /// Get the path to diarization models directory.
     fn models_dir() -> PathBuf {
-        BASE_PATH.join("models")
+        BASE_PATH.join("models").join("sherpa").join("diarization")
     }
 
-    /// Ensure both diarization models are downloaded (async-safe).
+    /// Ensure diarization models are downloaded (async-safe).
     ///
     /// Must be called from an async context before `diarize_audio()`.
     pub async fn ensure_diarization_models() -> Result<DiarizationModelPaths> {
         let dir = models_dir();
         std::fs::create_dir_all(&dir).ok();
 
-        let seg_path = dir.join("segmentation-3.0.onnx");
+        // Segmentation model (pyannote segmentation 3.0 for sherpa-onnx)
+        let seg_path = dir.join("sherpa-onnx-pyannote-segmentation-3.0.onnx");
         if !seg_path.exists() {
-            let url = "https://github.com/thewh1teagle/pyannote-rs/releases/download/v0.2.0/segmentation-3.0.onnx";
-            download_model_async(url, &seg_path).await
+            let url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3.0.tar.bz2";
+            let archive = dir.join("sherpa-onnx-pyannote-segmentation-3.0.tar.bz2");
+            download_model_async(url, &archive).await
                 .with_context(|| format!("Failed to download segmentation model from {}", url))?;
+            extract_archive(&archive, &dir)?;
+            let _ = std::fs::remove_file(&archive);
         }
 
-        let emb_path = dir.join("wespeaker_en_voxceleb_CAM++.onnx");
+        // Embedding model (3D-Speaker for speaker identification)
+        let emb_path = dir.join("3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx");
         if !emb_path.exists() {
-            let url = "https://github.com/thewh1teagle/pyannote-rs/releases/download/v0.2.0/wespeaker_en_voxceleb_CAM++.onnx";
+            let url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx";
             download_model_async(url, &emb_path).await
                 .with_context(|| format!("Failed to download embedding model from {}", url))?;
         }
@@ -87,6 +94,20 @@ mod models {
             segmentation: seg_path,
             embedding: emb_path,
         })
+    }
+
+    fn extract_archive(archive: &Path, dest_dir: &Path) -> Result<()> {
+        let output = Command::new("tar")
+            .args(["xjf", archive.to_string_lossy().as_ref()])
+            .current_dir(dest_dir)
+            .output()
+            .context("Failed to extract model archive (tar not found?)")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow::anyhow!("Failed to extract model archive: {}", stderr));
+        }
+        Ok(())
     }
 
     /// Download a file using async reqwest (safe inside tokio runtime).
@@ -127,7 +148,7 @@ mod models {
     }
 }
 
-/// Run speaker diarization on a 16kHz mono WAV file.
+/// Run speaker diarization on a 16kHz mono WAV file using sherpa-onnx.
 ///
 /// Model paths must be provided (use `ensure_diarization_models()` from async
 /// code to download them before calling this sync function).
@@ -138,42 +159,33 @@ pub fn diarize_audio(
     max_speakers: usize,
     model_paths: &DiarizationModelPaths,
 ) -> Result<Vec<SpeakerTurn>> {
-    let wav_str = wav_path.to_string_lossy();
-    let (samples, sample_rate) = pyannote_rs::read_wav(&wav_str)
-        .map_err(|e| anyhow::anyhow!("Failed to read WAV file for diarization: {}", e))?;
+    let wave = Wave::read(wav_path.to_string_lossy().as_ref())
+        .ok_or_else(|| anyhow::anyhow!("Failed to read WAV file for diarization: {}", wav_path.display()))?;
 
-    let segments = pyannote_rs::get_segments(&samples, sample_rate, &model_paths.segmentation)
-        .map_err(|e| anyhow::anyhow!("Failed to run segmentation model: {}", e))?;
+    let mut config = sherpa_onnx::OfflineSpeakerDiarizationConfig::default();
+    config.segmentation.pyannote.model =
+        Some(model_paths.segmentation.to_string_lossy().into_owned());
+    config.embedding.model =
+        Some(model_paths.embedding.to_string_lossy().into_owned());
+    if max_speakers > 0 {
+        config.clustering.num_clusters = max_speakers as i32;
+    }
+    config.segmentation.num_threads = 2;
+    config.embedding.num_threads = 2;
 
-    let mut extractor = pyannote_rs::EmbeddingExtractor::new(&model_paths.embedding)
-        .map_err(|e| anyhow::anyhow!("Failed to load speaker embedding model: {}", e))?;
-    let mut manager = pyannote_rs::EmbeddingManager::new(max_speakers);
+    let diarizer = sherpa_onnx::OfflineSpeakerDiarization::create(&config)
+        .ok_or_else(|| anyhow::anyhow!("Failed to create sherpa-onnx speaker diarizer. Check model files."))?;
 
+    let result = diarizer.process(wave.samples())
+        .ok_or_else(|| anyhow::anyhow!("Speaker diarization failed"))?;
+
+    let segments = result.sort_by_start_time();
     let mut turns = Vec::new();
-
-    for segment_result in segments {
-        let segment = match segment_result {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-
-        let embedding = match extractor.compute(&segment.samples) {
-            Ok(e) => e.collect::<Vec<f32>>(),
-            Err(_) => continue,
-        };
-
-        let speaker = if let Some(idx) = manager.search_speaker(embedding.clone(), 0.5) {
-            idx
-        } else {
-            // search_speaker returns None when it creates a new speaker
-            // The new speaker ID is the current count - 1
-            manager.get_all_speakers().len().saturating_sub(1)
-        };
-
+    for segment in &segments {
         turns.push(SpeakerTurn {
-            start: segment.start,
-            end: segment.end,
-            speaker,
+            start: segment.start as f64,
+            end: segment.end as f64,
+            speaker: segment.speaker as usize,
         });
     }
 

@@ -2,7 +2,7 @@
 //!
 //! This module contains:
 //! - Audio recording and encoding
-//! - Transcription (local Whisper and OpenAI API)
+//! - Transcription (local sherpa-onnx and OpenAI API)
 //! - Configuration management
 //! - File operations
 //! - Workflow orchestration
@@ -24,7 +24,7 @@ pub mod workflow;
 pub use audio::{AudioEncoder, AudioFormat, CompressionSettings, merge_wav_files};
 pub use loopback::{detect_loopback_sources, start_loopback_capture};
 pub use playback::AudioPlayer;
-pub use config::{resolve_transcription_mode, CloudProvider, DiarizationConfig, EnrichmentConfig, EnrichmentMode, LocalModelSize, ModelDef, ScribaConfig, SilenceAutoStopConfig, TranscriptionMode, VoiceConfig};
+pub use config::{resolve_transcription_mode, CloudProvider, DiarizationConfig, EnrichmentConfig, EnrichmentMode, LocalModel, LocalModelSize, ModelDef, ScribaConfig, SilenceAutoStopConfig, TranscriptionMode, VoiceConfig};
 pub use files::FileManager;
 pub use recording::{record_audio, list_input_devices, resolve_input_device, AudioLevelMonitor, RecordOptions, RecordingResult};
 pub use transcription::{transcribe_audio, TranscriptionProgress};

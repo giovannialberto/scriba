@@ -2,11 +2,11 @@
 name = "scriba"
 version = "0.23.1"
 edition = "2021"
-description = "A CLI tool for recording and transcribing audio locally using Whisper (whisper-rs)"
+description = "A CLI tool for recording and transcribing audio locally using sherpa-onnx"
 authors = ["Giovanni Alberto Falcione"]
 license = "MIT"
 repository = "https://github.com/giovannialberto/scriba"
-keywords = ["audio", "transcription", "cli", "whisper", "openai"]
+keywords = ["audio", "transcription", "cli", "sherpa-onnx", "openai"]
 categories = ["command-line-utilities", "multimedia::audio"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -15,6 +15,7 @@ categories = ["command-line-utilities", "multimedia::audio"]
 [dependencies]
 structopt = "0.3"
 reqwest = { version = "0.11", features = ["multipart", "stream", "json"] }
+gag = "1.0"
 tokio = { version = "1", features = ["full"] }
 dotenv = "0.15.0"
 cpal = "0.15.2"
@@ -30,15 +31,12 @@ serde = { version = "1.0", features = ["derive"] }
 crossterm = "0.27"
 ratatui = "0.26"
 arboard = "3.3"
-whisper-rs = "0.15"
-num_cpus = "1.16"
+sherpa-onnx = "1.12"
 futures-util = "0.3"
 glob = "0.3"
 thiserror = "1.0"
 schemars = "0.8"
 async-trait = "0.1"
-pyannote-rs = "0.3"
-ort = "=2.0.0-rc.10"
 scraper = "0.22"
 textwrap = "0.16"
 rodio = "0.22"
