@@ -164,7 +164,7 @@ fn setup_recording_paths(
     let wav_file_path = BASE_PATH.join(output_path).join("recording.wav");
 
     let (final_file_path, audio_format_str, needs_conversion) =
-        if let Some(ref settings) = compression_settings {
+        if let Some(settings) = compression_settings {
             match settings.format {
                 AudioFormat::Mp3 => {
                     let mp3_path = BASE_PATH.join(output_path).join("recording.mp3");
@@ -419,8 +419,8 @@ fn record_core(
     }
 
     if needs_conversion {
-        if let Some(ref settings) = compression_settings {
-            convert_wav_to_mp3(&wav_file_path, &final_file_path, settings)
+        if let Some(settings) = compression_settings {
+            convert_wav_to_mp3(&wav_file_path, &final_file_path, &settings)
                 .context("Failed to convert WAV to MP3")?;
             let _ = std::fs::remove_file(&wav_file_path);
         }

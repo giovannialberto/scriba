@@ -144,7 +144,6 @@ pub(super) enum DashboardAction {
     Continue,
     Quit,
     RecordAndTranscribe,
-    AddExternalFile,
     TranscribeSelected,
 }
 
@@ -769,9 +768,6 @@ impl Dashboard {
         match action {
             DashboardAction::RecordAndTranscribe => {
                 self.execute_record_and_transcribe().await?;
-            }
-            DashboardAction::AddExternalFile => {
-                self.execute_add_external_file().await?;
             }
             DashboardAction::TranscribeSelected => {
                 self.execute_transcribe_selected().await?;

@@ -188,7 +188,8 @@ async fn handle_resources_list(id: Option<Value>) -> Value {
 /// Run the MCP server over stdio
 pub async fn run_mcp_server() -> Result<()> {
     // Hint to DB layer to skip heavy integrity checks in MCP mode
-    std::env::set_var("SCRIBA_MCP_MODE", "1");
+    // SAFETY: called once at MCP server startup before any threads are spawned.
+    unsafe { std::env::set_var("SCRIBA_MCP_MODE", "1") };
 
     let mut reader = BufReader::new(io::stdin());
     let mut writer = io::stdout();

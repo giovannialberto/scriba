@@ -1,15 +1,14 @@
 [package]
 name = "scriba"
 version = "0.24.0"
-edition = "2021"
-description = "A CLI tool for recording and transcribing audio locally using sherpa-onnx"
+edition = "2024"
+description = "A TUI for recording, transcribing, and enriching audio with LLM-powered insights"
 authors = ["Giovanni Alberto Falcione"]
 license = "MIT"
 repository = "https://github.com/giovannialberto/scriba"
 keywords = ["audio", "transcription", "cli", "sherpa-onnx", "openai"]
 categories = ["command-line-utilities", "multimedia::audio"]
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 
 [dependencies]
