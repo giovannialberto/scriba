@@ -78,10 +78,10 @@ pub(super) enum OnboardingTickResult {
 pub(super) const LOCAL_MODELS: &[(LocalModel, &str, &str)] = &[
     (LocalModel::ParakeetTdt, "Parakeet TDT 0.6B (Recommended)", "~465 MB"),
     (LocalModel::WhisperTurbo, "Whisper Turbo", "~540 MB"),
-    (LocalModel::SenseVoice, "SenseVoice (Fast, Multilingual)", "~600 MB"),
     (LocalModel::WhisperLarge, "Whisper Large v3", "~3.1 GB"),
-    (LocalModel::WhisperMedium, "Whisper Medium", "~1.5 GB"),
+    (LocalModel::WhisperMedium, "Whisper Medium", "~1.5 MB"),
     (LocalModel::WhisperSmall, "Whisper Small", "~500 MB"),
+    (LocalModel::SenseVoice, "SenseVoice", "~600 MB"),
 ];
 
 pub(super) struct OnboardingState {
@@ -1386,7 +1386,7 @@ impl Dashboard {
             let sel_bg = Color::Indexed(236);
 
             let mode_blocks: [(&str, &str); 2] = [
-                ("Private (Local)", "Whisper + Ollama on your machine. No data leaves your computer."),
+                ("Private (Local)", "Local STT + Ollama on your machine. No data leaves your computer."),
                 ("Cloud", "Whisper API + Anthropic/OpenAI/Google. Best quality. Needs an API key."),
             ];
             // Use the header text width so the highlight box spans the full content area

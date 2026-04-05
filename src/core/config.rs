@@ -642,7 +642,7 @@ impl ScribaConfig {
         self.save()
     }
 
-    /// Check if in Private mode (local Whisper + Ollama).
+    /// Check if in Private mode (local STT + Ollama).
     pub fn is_private_mode(&self) -> bool {
         matches!(self.transcription, TranscriptionMode::Local { .. })
     }
