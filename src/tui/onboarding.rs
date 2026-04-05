@@ -1,5 +1,5 @@
 use crate::core::{
-    CloudProvider, EnrichmentMode, LocalModelSize,
+    CloudProvider, EnrichmentMode, LocalModel,
     TranscriptionMode, initialize_world_from_seed,
 };
 use crate::database::Database;
@@ -75,11 +75,13 @@ pub(super) enum OnboardingTickResult {
     SaveWhisperKey(String),
 }
 
-pub(super) const WHISPER_MODELS: &[(LocalModelSize, &str, &str)] = &[
-    (LocalModelSize::Turbo, "Turbo (Recommended)", "~1.4 GB"),
-    (LocalModelSize::Large, "Large", "~2.9 GB"),
-    (LocalModelSize::Medium, "Medium", "~1.5 GB"),
-    (LocalModelSize::Small, "Small", "~466 MB"),
+pub(super) const LOCAL_MODELS: &[(LocalModel, &str, &str)] = &[
+    (LocalModel::ParakeetTdt, "Parakeet TDT 0.6B (Recommended)", "~465 MB"),
+    (LocalModel::WhisperTurbo, "Whisper Turbo", "~540 MB"),
+    (LocalModel::WhisperLarge, "Whisper Large v3", "~3.1 GB"),
+    (LocalModel::WhisperMedium, "Whisper Medium", "~1.5 MB"),
+    (LocalModel::WhisperSmall, "Whisper Small", "~500 MB"),
+    (LocalModel::SenseVoice, "SenseVoice", "~600 MB"),
 ];
 
 pub(super) struct OnboardingState {
@@ -842,7 +844,7 @@ impl Dashboard {
                                 ob.whisper_model_selection = ob.whisper_model_selection.saturating_sub(1);
                             }
                             KeyCode::Down | KeyCode::Char('j') => {
-                                ob.whisper_model_selection = (ob.whisper_model_selection + 1).min(WHISPER_MODELS.len() - 1);
+                                ob.whisper_model_selection = (ob.whisper_model_selection + 1).min(LOCAL_MODELS.len() - 1);
                             }
                             KeyCode::Enter => {
                                 if ob.ollama_reachable {
@@ -918,14 +920,14 @@ impl Dashboard {
                                     ob.set_step_text("Setting up your models...", false);
 
                                     // Build download items
-                                    let whisper_size = WHISPER_MODELS[ob.whisper_model_selection].0;
-                                    let whisper_label = WHISPER_MODELS[ob.whisper_model_selection].1.to_string();
-                                    let whisper_already = crate::core::transcription::check_whisper_model(whisper_size);
+                                    let selected_model = LOCAL_MODELS[ob.whisper_model_selection].0;
+                                    let model_label = LOCAL_MODELS[ob.whisper_model_selection].1.to_string();
+                                    let model_already = crate::core::transcription::check_model_downloaded(selected_model);
 
                                     let mut items: Vec<(String, DownloadStatus)> = Vec::new();
                                     items.push((
-                                        format!("Downloading Whisper {}", whisper_label.replace(" (Recommended)", "")),
-                                        if whisper_already { DownloadStatus::Done } else { DownloadStatus::Pending },
+                                        format!("Downloading {}", model_label.replace(" (Recommended)", "").replace(" (Multilingual)", "")),
+                                        if model_already { DownloadStatus::Done } else { DownloadStatus::Pending },
                                     ));
 
                                     let ollama_model = if let EnrichmentMode::Local { ollama_model, .. } = &self.config.enrichment.mode {
@@ -955,12 +957,12 @@ impl Dashboard {
                                     let ollama_model_clone = ollama_model.clone();
 
                                     ob.download_task = Some(tokio::spawn(async move {
-                                        // Download Whisper model
-                                        if !whisper_already {
+                                        // Download model
+                                        if !model_already {
                                             let (wtx, mut wrx) = mpsc::unbounded_channel();
                                             let tx_w = tx.clone();
-                                            let whisper_handle = tokio::spawn(async move {
-                                                let result = crate::core::transcription::download_whisper_with_progress(whisper_size, wtx).await;
+                                            let model_handle = tokio::spawn(async move {
+                                                let result = crate::core::transcription::download_model_with_progress(selected_model, wtx).await;
                                                 if let Err(_) = result {
                                                     let _ = tx_w.send(DownloadProgress {
                                                         index: 0,
@@ -981,7 +983,7 @@ impl Dashboard {
                                                 }
                                             });
 
-                                            let _ = whisper_handle.await;
+                                            let _ = model_handle.await;
                                         }
 
                                         // Pull Ollama model
@@ -1020,8 +1022,8 @@ impl Dashboard {
                                 } else {
                                     // "Skip for now"
                                     // Save chosen whisper model to config
-                                    let whisper_size = WHISPER_MODELS[ob.whisper_model_selection].0;
-                                    self.config.transcription = TranscriptionMode::Local { model_size: whisper_size };
+                                    let selected = LOCAL_MODELS[ob.whisper_model_selection].0;
+                                    self.config.transcription = TranscriptionMode::Local { model: selected };
                                     let _ = self.config.save();
 
                                     ob.step = OnboardingStep::AskName;
@@ -1046,8 +1048,8 @@ impl Dashboard {
                             match key_code {
                                 KeyCode::Enter => {
                                     // Save whisper model to config
-                                    let whisper_size = WHISPER_MODELS[ob.whisper_model_selection].0;
-                                    self.config.transcription = TranscriptionMode::Local { model_size: whisper_size };
+                                    let selected = LOCAL_MODELS[ob.whisper_model_selection].0;
+                                    self.config.transcription = TranscriptionMode::Local { model: selected };
                                     let _ = self.config.save();
 
                                     ob.step = OnboardingStep::AskName;
@@ -1384,7 +1386,7 @@ impl Dashboard {
             let sel_bg = Color::Indexed(236);
 
             let mode_blocks: [(&str, &str); 2] = [
-                ("Private (Local)", "Whisper + Ollama on your machine. No data leaves your computer."),
+                ("Private (Local)", "Local STT + Ollama on your machine. No data leaves your computer."),
                 ("Cloud", "Whisper API + Anthropic/OpenAI/Google. Best quality. Needs an API key."),
             ];
             // Use the header text width so the highlight box spans the full content area
@@ -1529,12 +1531,12 @@ impl Dashboard {
                 0 => {
                     // Whisper model selector
                     let header_width = visible.split('\n').map(|l| l.chars().count()).max().unwrap_or(0);
-                    let min_model_width = WHISPER_MODELS.iter()
+                    let min_model_width = LOCAL_MODELS.iter()
                         .map(|(_, name, size)| name.chars().count() + size.chars().count() + 4)
                         .max().unwrap_or(0);
                     let block_width = header_width.max(min_model_width);
 
-                    for (i, (_, name, size)) in WHISPER_MODELS.iter().enumerate() {
+                    for (i, (_, name, size)) in LOCAL_MODELS.iter().enumerate() {
                         // Name left-aligned, size right-aligned within block_width
                         let gap = block_width.saturating_sub(name.chars().count() + size.chars().count());
                         let label = format!("{}{}{}", name, " ".repeat(gap), size);
@@ -1580,8 +1582,10 @@ impl Dashboard {
                 2 => {
                     // Download confirmation — simple label: value pairs
                     let header_width = visible.split('\n').map(|l| l.chars().count()).max().unwrap_or(0);
-                    let whisper_name = format!("Whisper {}", WHISPER_MODELS[ob.whisper_model_selection].1
-                        .replace(" (Recommended)", ""));
+                    let model_name = LOCAL_MODELS[ob.whisper_model_selection].1
+                        .replace(" (Recommended)", "")
+                        .replace(" (Fast, Multilingual)", "")
+                        .replace(" (Fast, Accurate)", "");
 
                     let ollama_model = if ob.ollama_reachable {
                         Some(if let EnrichmentMode::Local { ollama_model, .. } = &self.config.enrichment.mode {
@@ -1596,20 +1600,20 @@ impl Dashboard {
                     // "  Transcription   Whisper Turbo"
                     // "  Enrichment      mistral:latest"
                     let label_col = "Transcription".len(); // widest label
-                    let whisper_line_len = 2 + label_col + 3 + whisper_name.len();
+                    let model_line_len = 2 + label_col + 3 + model_name.len();
                     let ollama_line_len = ollama_model.as_ref()
                         .map(|m| 2 + label_col + 3 + m.len()).unwrap_or(0);
-                    let block_width = header_width.max(whisper_line_len).max(ollama_line_len);
+                    let block_width = header_width.max(model_line_len).max(ollama_line_len);
 
                     let label_style = Style::default().fg(Color::DarkGray);
                     let value_style = Style::default().fg(Color::White);
 
                     {
                         let label_pad = " ".repeat(label_col - "Transcription".len());
-                        let right_pad = " ".repeat(block_width.saturating_sub(whisper_line_len));
+                        let right_pad = " ".repeat(block_width.saturating_sub(model_line_len));
                         lines.push(Line::from(vec![
                             Span::styled(format!("  Transcription{}   ", label_pad), label_style),
-                            Span::styled(format!("{}{}", whisper_name, right_pad), value_style),
+                            Span::styled(format!("{}{}", model_name, right_pad), value_style),
                         ]));
                     }
                     if let Some(ref model) = ollama_model {

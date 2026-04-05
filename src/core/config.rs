@@ -10,50 +10,108 @@ use std::path::PathBuf;
 /// Transcription mode configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TranscriptionMode {
-    Local { model_size: LocalModelSize },
+    Local {
+        /// Accepts both new `model` field and legacy `model_size` field from old configs.
+        #[serde(alias = "model_size")]
+        model: LocalModel,
+    },
     Api { api_key: String },
 }
 
-/// Available local Whisper model sizes.
+/// Available local transcription models.
+///
+/// Each variant has a `serde(alias)` matching the old `LocalModelSize` enum value
+/// so that existing config files (e.g. `"model_size": "Medium"`) deserialize correctly.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum LocalModelSize {
-    Tiny,
-    Base,
-    Small,
-    Medium,
-    Large,
-    Turbo,
+pub enum LocalModel {
+    #[serde(alias = "Tiny")]
+    WhisperTiny,
+    #[serde(alias = "Base")]
+    WhisperBase,
+    #[serde(alias = "Small")]
+    WhisperSmall,
+    #[serde(alias = "Medium")]
+    WhisperMedium,
+    #[serde(alias = "Large")]
+    WhisperLarge,
+    #[serde(alias = "Turbo")]
+    WhisperTurbo,
+    SenseVoice,
+    ParakeetTdt,
 }
 
-impl std::fmt::Display for LocalModelSize {
+impl LocalModel {
+    /// User-friendly display name for UI.
+    pub fn display_name(&self) -> &str {
+        match self {
+            LocalModel::WhisperTiny => "Whisper Tiny",
+            LocalModel::WhisperBase => "Whisper Base",
+            LocalModel::WhisperSmall => "Whisper Small",
+            LocalModel::WhisperMedium => "Whisper Medium",
+            LocalModel::WhisperLarge => "Whisper Large",
+            LocalModel::WhisperTurbo => "Whisper Turbo",
+            LocalModel::SenseVoice => "SenseVoice",
+            LocalModel::ParakeetTdt => "Parakeet TDT 0.6B",
+        }
+    }
+
+    /// All models available for selection in the UI.
+    pub fn all_models() -> &'static [LocalModel] {
+        &[
+            LocalModel::ParakeetTdt,
+            LocalModel::WhisperTurbo,
+            LocalModel::SenseVoice,
+            LocalModel::WhisperTiny,
+            LocalModel::WhisperBase,
+            LocalModel::WhisperSmall,
+            LocalModel::WhisperMedium,
+            LocalModel::WhisperLarge,
+        ]
+    }
+
+    /// The recommended default model for new users.
+    pub fn recommended() -> Self {
+        LocalModel::ParakeetTdt
+    }
+}
+
+impl std::fmt::Display for LocalModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
-            LocalModelSize::Tiny => "tiny",
-            LocalModelSize::Base => "base",
-            LocalModelSize::Small => "small",
-            LocalModelSize::Medium => "medium",
-            LocalModelSize::Large => "large",
-            LocalModelSize::Turbo => "turbo",
+            LocalModel::WhisperTiny => "tiny",
+            LocalModel::WhisperBase => "base",
+            LocalModel::WhisperSmall => "small",
+            LocalModel::WhisperMedium => "medium",
+            LocalModel::WhisperLarge => "large",
+            LocalModel::WhisperTurbo => "turbo",
+            LocalModel::SenseVoice => "sensevoice",
+            LocalModel::ParakeetTdt => "parakeet",
         };
         write!(f, "{}", s)
     }
 }
 
-impl std::str::FromStr for LocalModelSize {
+impl std::str::FromStr for LocalModel {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self> {
         match s.to_lowercase().as_str() {
-            "tiny" => Ok(LocalModelSize::Tiny),
-            "base" => Ok(LocalModelSize::Base),
-            "small" => Ok(LocalModelSize::Small),
-            "medium" => Ok(LocalModelSize::Medium),
-            "large" => Ok(LocalModelSize::Large),
-            "turbo" => Ok(LocalModelSize::Turbo),
-            _ => Err(anyhow::anyhow!("Invalid model size: {}", s)),
+            "tiny" | "whispertiny" => Ok(LocalModel::WhisperTiny),
+            "base" | "whisperbase" => Ok(LocalModel::WhisperBase),
+            "small" | "whispersmall" => Ok(LocalModel::WhisperSmall),
+            "medium" | "whispermedium" => Ok(LocalModel::WhisperMedium),
+            "large" | "whisperlarge" => Ok(LocalModel::WhisperLarge),
+            "turbo" | "whisperturbo" => Ok(LocalModel::WhisperTurbo),
+            "sensevoice" => Ok(LocalModel::SenseVoice),
+            "parakeet" | "parakeettdt" => Ok(LocalModel::ParakeetTdt),
+            _ => Err(anyhow::anyhow!("Invalid model: {}. Use: tiny, base, small, medium, large, turbo, sensevoice, parakeet", s)),
         }
     }
 }
+
+/// Legacy type alias for backward compatibility with code that references LocalModelSize.
+#[deprecated(note = "use LocalModel instead")]
+pub type LocalModelSize = LocalModel;
 
 /// Main Scriba configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,15 +126,15 @@ pub struct ScribaConfig {
     /// Silence auto-stop settings.
     #[serde(default)]
     pub silence_auto_stop: SilenceAutoStopConfig,
-    /// Speaker diarization settings.
-    #[serde(default)]
+    /// Speaker diarization settings (reserved for future use).
+    #[serde(default, skip_serializing)]
     pub diarization: DiarizationConfig,
-    /// Voice-activated recording ("Scriba Forever") settings.
-    #[serde(default)]
+    /// Voice-activated recording settings (reserved for future use).
+    #[serde(default, skip_serializing)]
     pub voice: VoiceConfig,
-    /// Preserved local model size when switching from Private to Cloud mode.
-    #[serde(default)]
-    pub last_local_model_size: Option<LocalModelSize>,
+    /// Preserved local model when switching from Private to Cloud mode.
+    #[serde(default, alias = "last_local_model_size")]
+    pub last_local_model: Option<LocalModel>,
     /// Preserved cloud provider when switching from Cloud to Private mode.
     #[serde(default)]
     pub last_cloud_provider: Option<CloudProvider>,
@@ -506,7 +564,7 @@ impl Default for ScribaConfig {
     fn default() -> Self {
         Self {
             transcription: TranscriptionMode::Local {
-                model_size: LocalModelSize::Medium,
+                model: LocalModel::ParakeetTdt,
             },
             audio_settings: AudioSettings {
                 sample_rate: 48000,
@@ -521,7 +579,7 @@ impl Default for ScribaConfig {
             silence_auto_stop: SilenceAutoStopConfig::default(),
             diarization: DiarizationConfig::default(),
             voice: VoiceConfig::default(),
-            last_local_model_size: None,
+            last_local_model: None,
             last_cloud_provider: None,
         }
     }
@@ -575,16 +633,16 @@ impl ScribaConfig {
                 self.last_api_key = Some(api_key.clone());
             }
         }
-        // Save current local model size if switching away from Local mode
-        if let TranscriptionMode::Local { model_size } = &self.transcription {
-            self.last_local_model_size = Some(*model_size);
+        // Save current local model if switching away from Local mode
+        if let TranscriptionMode::Local { model } = &self.transcription {
+            self.last_local_model = Some(*model);
         }
 
         self.transcription = mode;
         self.save()
     }
 
-    /// Check if in Private mode (local Whisper + Ollama).
+    /// Check if in Private mode (local STT + Ollama).
     pub fn is_private_mode(&self) -> bool {
         matches!(self.transcription, TranscriptionMode::Local { .. })
     }
@@ -597,12 +655,19 @@ impl ScribaConfig {
         }
     }
 
-    /// Get the local model size if in local mode.
-    pub fn get_local_model_size(&self) -> Option<LocalModelSize> {
+    /// Get the local model if in local mode.
+    pub fn get_local_model(&self) -> Option<LocalModel> {
         match &self.transcription {
-            TranscriptionMode::Local { model_size } => Some(*model_size),
+            TranscriptionMode::Local { model } => Some(*model),
             _ => None,
         }
+    }
+
+    /// Backward-compatible alias.
+    #[deprecated(note = "use get_local_model() instead")]
+    #[allow(deprecated)]
+    pub fn get_local_model_size(&self) -> Option<LocalModel> {
+        self.get_local_model()
     }
 }
 
@@ -610,21 +675,21 @@ impl ScribaConfig {
 /// Priority: force_local > api_key > model > config default
 pub fn resolve_transcription_mode(
     force_local: bool,
-    model: Option<LocalModelSize>,
+    model: Option<LocalModel>,
     api_key: Option<String>,
     config: &ScribaConfig,
 ) -> Result<TranscriptionMode> {
     if force_local {
-        let model_size = model.unwrap_or(LocalModelSize::Medium);
-        return Ok(TranscriptionMode::Local { model_size });
+        let model = model.unwrap_or(LocalModel::ParakeetTdt);
+        return Ok(TranscriptionMode::Local { model });
     }
 
     if let Some(key) = api_key {
         return Ok(TranscriptionMode::Api { api_key: key });
     }
 
-    if let Some(model_size) = model {
-        return Ok(TranscriptionMode::Local { model_size });
+    if let Some(model) = model {
+        return Ok(TranscriptionMode::Local { model });
     }
 
     // Use config default

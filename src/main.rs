@@ -1,7 +1,7 @@
 use anyhow::Result;
 use scriba::core::{
     resolve_transcription_mode, AudioFormat, CloudProvider, CompressionSettings, EnrichmentMode,
-    LocalModelSize, ScribaConfig, TranscriptionMode, WorkflowManager, initialize_world_from_seed,
+    LocalModel, ScribaConfig, TranscriptionMode, WorkflowManager, initialize_world_from_seed,
 };
 use scriba::database::Database;
 use scriba::enrichment::WorldContext;
@@ -90,9 +90,9 @@ enum Command {
         force_local: bool,
         #[structopt(
             long = "model",
-            help = "Local Whisper model size (tiny|base|small|medium|large|turbo)"
+            help = "Local model (tiny|base|small|medium|large|turbo|sensevoice|parakeet)"
         )]
-        model: Option<LocalModelSize>,
+        model: Option<LocalModel>,
         #[structopt(
             long = "api-key",
             help = "OpenAI API key for API-based transcription (overrides config)"
@@ -115,9 +115,9 @@ enum Command {
         force_local: bool,
         #[structopt(
             long = "model",
-            help = "Local Whisper model size (tiny|base|small|medium|large|turbo)"
+            help = "Local model (tiny|base|small|medium|large|turbo|sensevoice|parakeet)"
         )]
-        model: Option<LocalModelSize>,
+        model: Option<LocalModel>,
         #[structopt(
             long = "api-key",
             help = "OpenAI API key for API-based transcription (overrides config)"
@@ -184,8 +184,8 @@ enum ConfigCommand {
         json: bool,
     },
     SetLocal {
-        #[structopt(help = "Model size (tiny|base|small|medium|large|turbo)")]
-        model: LocalModelSize,
+        #[structopt(help = "Model (tiny|base|small|medium|large|turbo|sensevoice|parakeet)")]
+        model: LocalModel,
     },
     SetApi {
         #[structopt(help = "OpenAI API key")]
@@ -430,9 +430,9 @@ async fn main() -> Result<()> {
                             println!("{}", serde_json::to_string_pretty(&config)?);
                         } else {
                             match &config.transcription {
-                                TranscriptionMode::Local { model_size } => {
+                                TranscriptionMode::Local { model } => {
                                     println!("Transcription Mode: Local");
-                                    println!("Model Size: {}", model_size);
+                                    println!("Model: {}", model.display_name());
                                 }
                                 TranscriptionMode::Api { api_key: _ } => {
                                     println!("Transcription Mode: OpenAI API");
@@ -477,11 +477,11 @@ async fn main() -> Result<()> {
                     ConfigCommand::SetLocal { model } => {
                         let mut config = ScribaConfig::load()?;
                         config.set_transcription_mode(TranscriptionMode::Local {
-                            model_size: model,
+                            model,
                         })?;
                         println!(
-                            "✅ Updated transcription mode to local with {} model",
-                            model
+                            "Updated transcription mode to local with {} model",
+                            model.display_name()
                         );
                         Ok(())
                     }

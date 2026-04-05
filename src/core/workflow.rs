@@ -258,12 +258,7 @@ impl WorkflowManager {
         verbose: bool,
     ) -> Result<ManagedRecording> {
         let directory_path = PathBuf::from(&recording.directory_name);
-        let diarization_config = if self.config.diarization.enabled {
-            Some(&self.config.diarization)
-        } else {
-            None
-        };
-        transcribe_audio(&directory_path, Some(mode), verbose, diarization_config)
+        transcribe_audio(&directory_path, Some(mode), verbose)
             .await
             .context("Transcription failed")?;
 
@@ -507,61 +502,7 @@ impl WorkflowManager {
         }
 
         // Speaker identification: resolve generic labels to real names
-        if let Some(transcript_record) = self.db_manager.db.get_transcript_by_recording_id(recording_id)? {
-            if let Some(segments_json) = &transcript_record.segments {
-                if let Ok(segments) = serde_json::from_str::<Vec<crate::core::diarization::DiarizedSegment>>(segments_json) {
-                    let mut diarized = crate::core::diarization::build_diarized_transcript(segments);
-
-                    // Only attempt identification if speakers are still generic
-                    let has_generic = diarized.speakers.iter().any(|s| s.starts_with("Speaker "));
-                    if has_generic && !diarized.segments.is_empty() {
-                        if verbose {
-                            println!("  Identifying speakers...");
-                        }
-
-                        let diarized_text = crate::core::diarization::format_diarized_text(&diarized);
-                        match service
-                            .identify_speakers(
-                                &diarized_text,
-                                world_content.as_deref(),
-                                diarized.speakers.len(),
-                            )
-                            .await
-                        {
-                            Ok(name_map) => {
-                                let resolved_count = name_map.values().filter(|v| v.is_some()).count();
-                                if resolved_count > 0 {
-                                    crate::core::diarization::apply_speaker_names(&mut diarized, &name_map);
-
-                                    // Update DB with resolved names
-                                    if let Ok(seg_json) = serde_json::to_string(&diarized.segments) {
-                                        let _ = self.db_manager.db.update_transcript_segments(recording_id, &seg_json);
-                                    }
-                                    if let Ok(spk_json) = serde_json::to_string(&diarized.speakers) {
-                                        let _ = self.db_manager.db.update_recording_speakers(recording_id, &spk_json);
-                                    }
-
-                                    // Regenerate labeled transcript text
-                                    let labeled_text = crate::core::diarization::format_diarized_text(&diarized);
-                                    self.db_manager.db.upsert_transcript(recording_id, &labeled_text)?;
-                                    let _ = std::fs::write(transcript_path, &labeled_text);
-
-                                    if verbose {
-                                        println!("  Resolved {} of {} speakers to real names",
-                                            resolved_count, diarized.speakers.len());
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                if verbose {
-                                    eprintln!("  Speaker identification failed (non-fatal): {}", e);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // Speaker diarization removed — may be reintroduced in a future release.
 
         // Evolve world: LLM produces a delta, we apply it to entities first,
         // then rebuild world.md from entities (entities are the source of truth).

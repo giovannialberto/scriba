@@ -2,7 +2,7 @@
 //!
 //! This crate provides:
 //! - Audio recording with configurable compression
-//! - Transcription via local Whisper or OpenAI API
+//! - Transcription via local sherpa-onnx (Whisper, SenseVoice, etc.) or OpenAI API
 //! - SQLite database for storing recordings and transcripts
 //! - Interactive TUI dashboard
 //! - MCP server for AI assistant integration
@@ -19,9 +19,10 @@ pub mod tui;
 pub mod utils;
 
 // Re-export commonly used types for backward compatibility and convenience
+#[allow(deprecated)]
 pub use core::{
-    AudioEncoder, AudioFormat, CompressionSettings, EnrichmentConfig, LocalModelSize, ScribaConfig,
-    TranscriptionMode, WorkflowManager,
+    AudioEncoder, AudioFormat, CompressionSettings, EnrichmentConfig, LocalModel, LocalModelSize,
+    ScribaConfig, TranscriptionMode, WorkflowManager,
 };
 pub use database::{Database, Entity, Recording, RecordingStats, Transcript};
 pub use enrichment::{EnrichmentService, ExtractionResult, OllamaClient};
