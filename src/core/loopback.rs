@@ -86,7 +86,7 @@ mod platform {
                     return;
                 }
                 // Extract audio data from the CMSampleBuffer
-                if let Some(samples) = extract_audio_samples(sample_buffer) {
+                if let Some(samples) = unsafe { extract_audio_samples(sample_buffer) } {
                     if let Ok(mut guard) = self.ivars().encoder.try_lock() {
                         if let Some(enc) = guard.as_mut() {
                             let _ = enc.encode_samples(&samples);
@@ -109,23 +109,25 @@ mod platform {
     /// ScreenCaptureKit delivers audio as 32-bit float interleaved PCM.
     unsafe fn extract_audio_samples(sample_buffer: &CMSampleBuffer) -> Option<Vec<f32>> {
         // Get the block buffer containing the raw audio bytes
-        let block_buffer = sample_buffer.data_buffer()?;
+        let block_buffer = unsafe { sample_buffer.data_buffer()? };
 
         let mut total_length: usize = 0;
         let mut data_ptr: *mut i8 = std::ptr::null_mut();
 
-        let status = block_buffer.data_pointer(
-            0,
-            std::ptr::null_mut(), // length_at_offset (we don't need it)
-            &mut total_length,
-            &mut data_ptr,
-        );
+        let status = unsafe {
+            block_buffer.data_pointer(
+                0,
+                std::ptr::null_mut(), // length_at_offset (we don't need it)
+                &mut total_length,
+                &mut data_ptr,
+            )
+        };
 
         if status != 0 || data_ptr.is_null() || total_length == 0 {
             return None;
         }
 
-        let bytes = std::slice::from_raw_parts(data_ptr as *const u8, total_length);
+        let bytes = unsafe { std::slice::from_raw_parts(data_ptr as *const u8, total_length) };
         Some(bytes_to_f32_samples(bytes))
     }
 

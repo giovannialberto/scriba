@@ -266,7 +266,7 @@ impl ChatState {
                     }
                     ChatStreamEvent::Chunk(text) => {
                         // Append text to the last Text block, or create one
-                        if let Some(ChatBlock::Text(ref mut s)) = self.pending_blocks.last_mut() {
+                        if let Some(ChatBlock::Text(s)) = self.pending_blocks.last_mut() {
                             s.push_str(&text);
                         } else {
                             self.pending_blocks.push(ChatBlock::Text(text));
@@ -286,7 +286,7 @@ impl ChatState {
                     ChatStreamEvent::ToolResult { name, output_summary } => {
                         // Find last matching incomplete tool call in blocks
                         for block in self.pending_blocks.iter_mut().rev() {
-                            if let ChatBlock::ToolCall(ref mut tc) = block {
+                            if let ChatBlock::ToolCall(tc) = block {
                                 if tc.name == name && !tc.is_complete {
                                     tc.output_summary = output_summary.clone();
                                     tc.is_complete = true;

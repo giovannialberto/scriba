@@ -1073,13 +1073,13 @@ fn apply_enrichment_overrides(
     } else {
         // No provider override, but possibly api_key or model override
         if let Some(key) = api_key {
-            if let EnrichmentMode::Cloud { api_key: ref mut k, .. } = config.enrichment.mode {
+            if let EnrichmentMode::Cloud { api_key: k, .. } = &mut config.enrichment.mode {
                 *k = key.to_string();
             }
         }
         if let Some(m) = model {
             match &mut config.enrichment.mode {
-                EnrichmentMode::Cloud { model: ref mut mm, .. } => {
+                EnrichmentMode::Cloud { model: mm, .. } => {
                     *mm = Some(m.to_string());
                 }
                 EnrichmentMode::Local { ollama_model, .. } => {
