@@ -27,11 +27,33 @@ Run entirely **offline** with local STT models (Parakeet, Whisper, SenseVoice) +
 
 ## Get started
 
-**Requirements:** FFmpeg (`brew install ffmpeg`). Ollama is optional, for Private mode.
+**Requirements:** FFmpeg and (optionally) Ollama for Private mode.
+
+### macOS
 
 ```bash
+brew install ffmpeg
 brew tap giovannialberto/scriba
 brew install scriba
+```
+
+### Linux
+
+```bash
+# Install dependencies (Debian/Ubuntu)
+sudo apt install ffmpeg libasound2-dev
+
+# Install scriba
+curl -fsSL https://raw.githubusercontent.com/giovannialberto/scriba/main/install.sh | sh
+```
+
+For Fedora/RHEL: `sudo dnf install ffmpeg alsa-lib-devel`. For Arch: `sudo pacman -S ffmpeg alsa-lib`.
+
+You can also grab a binary directly from [Releases](https://github.com/giovannialberto/scriba/releases).
+
+### Run
+
+```bash
 scriba
 ```
 
@@ -58,7 +80,9 @@ Scriba exposes your recordings to Claude Desktop via the Model Context Protocol:
 }
 ```
 
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS).
+Add to your Claude Desktop config:
+- **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Linux:** `~/.config/Claude/claude_desktop_config.json`
 
 ## License
 

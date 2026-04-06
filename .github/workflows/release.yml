@@ -178,8 +178,8 @@ jobs:
             cp ../Formula/scriba.rb Formula/scriba.rb
             
             # Commit and push to tap
-            git config user.email "action@github.com"
-            git config user.name "GitHub Action"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add Formula/scriba.rb
             if git diff --cached --quiet; then
               echo "No tap formula changes to commit."

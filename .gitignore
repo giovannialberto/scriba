@@ -11,7 +11,6 @@ scriba.db-*
 
 # Rust build artifacts
 /target
-Cargo.lock
 
 # Debug files
 debug.log
