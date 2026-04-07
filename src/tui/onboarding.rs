@@ -84,6 +84,23 @@ pub(super) const LOCAL_MODELS: &[(LocalModel, &str, &str)] = &[
     (LocalModel::SenseVoice, "SenseVoice", "~600 MB"),
 ];
 
+/// Recommended Ollama models for knowledge extraction, suitable for self-hosting.
+pub(super) const RECOMMENDED_OLLAMA_MODELS: &[(&str, &str, &str)] = &[
+    ("mistral:latest", "Mistral 7B (Recommended)", "~4.1 GB"),
+    ("gemma3:4b", "Gemma 3 4B", "~3.3 GB"),
+    ("llama3.2:3b", "Llama 3.2 3B", "~2.0 GB"),
+    ("phi4-mini:latest", "Phi-4 Mini 3.8B", "~2.5 GB"),
+    ("qwen3:4b", "Qwen 3 4B", "~2.6 GB"),
+];
+
+#[derive(Clone, Debug)]
+pub(super) struct OllamaModelOption {
+    pub id: String,
+    pub label: String,
+    pub size: String,
+    pub installed: bool,
+}
+
 pub(super) struct OnboardingState {
     pub(super) step: OnboardingStep,
     pub(super) full_text: String,
@@ -121,7 +138,7 @@ pub(super) struct OnboardingState {
     pub(super) setup_phase: u8,
     pub(super) whisper_model_selection: usize,
     pub(super) ollama_model_selection: usize,
-    pub(super) ollama_available_models: Vec<String>,
+    pub(super) ollama_available_models: Vec<OllamaModelOption>,
     pub(super) ollama_models_fetched: bool,
     pub(super) download_task: Option<tokio::task::JoinHandle<()>>,
     pub(super) download_rx: Option<mpsc::UnboundedReceiver<DownloadProgress>>,
@@ -850,7 +867,19 @@ impl Dashboard {
                                 if ob.ollama_reachable {
                                     ob.setup_phase = 1;
                                     ob.set_step_text("Choose an Ollama model for knowledge extraction.\nThis is used to identify people, topics, and context.", false);
-                                    // Fetch available models if not already done
+                                    // Populate with recommended models immediately so the user is never stuck
+                                    if ob.ollama_available_models.is_empty() {
+                                        ob.ollama_available_models = RECOMMENDED_OLLAMA_MODELS.iter().map(|&(id, label, size)| {
+                                            OllamaModelOption {
+                                                id: id.to_string(),
+                                                label: label.to_string(),
+                                                size: size.to_string(),
+                                                installed: false,
+                                            }
+                                        }).collect();
+                                        ob.ollama_model_selection = 0;
+                                    }
+                                    // Fetch installed models to update status
                                     if !ob.ollama_models_fetched {
                                         ob.ollama_models_fetched = true;
                                         let endpoint = if let EnrichmentMode::Local { ollama_endpoint, .. } = &self.config.enrichment.mode {
@@ -887,11 +916,11 @@ impl Dashboard {
                             }
                             KeyCode::Enter => {
                                 // Set the selected model in config
-                                if let Some(model_name) = ob.ollama_available_models.get(ob.ollama_model_selection) {
-                                    let model_with_tag = if model_name.contains(':') {
-                                        model_name.clone()
+                                if let Some(option) = ob.ollama_available_models.get(ob.ollama_model_selection) {
+                                    let model_with_tag = if option.id.contains(':') {
+                                        option.id.clone()
                                     } else {
-                                        format!("{}:latest", model_name)
+                                        format!("{}:latest", option.id)
                                     };
                                     if let EnrichmentMode::Local { ollama_model, .. } = &mut self.config.enrichment.mode {
                                         *ollama_model = model_with_tag;
@@ -936,7 +965,10 @@ impl Dashboard {
                                         "mistral:latest".to_string()
                                     };
 
-                                    let need_ollama_pull = ob.ollama_reachable;
+                                    let need_ollama_pull = ob.ollama_reachable
+                                        && !ob.ollama_available_models.get(ob.ollama_model_selection)
+                                            .map(|m| m.installed)
+                                            .unwrap_or(false);
                                     if need_ollama_pull {
                                         items.push((
                                             format!("Pulling {}", ollama_model.split(':').next().unwrap_or(&ollama_model)),
@@ -1553,29 +1585,33 @@ impl Dashboard {
                 1 => {
                     // Ollama model selector
                     let header_width = visible.split('\n').map(|l| l.chars().count()).max().unwrap_or(0);
-                    if ob.ollama_available_models.is_empty() {
-                        let braille = ['\u{28F7}', '\u{28EF}', '\u{28DF}', '\u{28BF}', '\u{287F}', '\u{28FE}', '\u{28FD}', '\u{28FB}'];
-                        lines.push(Line::from(vec![
-                            Span::styled(format!("{} ", braille[ob.anim_frame % braille.len()]), Style::default().fg(ACCENT)),
-                            Span::styled("Loading models...", Style::default().fg(Color::DarkGray)),
-                        ]));
-                    } else {
-                        let block_width = header_width.max(
-                            ob.ollama_available_models.iter()
-                                .map(|m| m.chars().count() + 2)
-                                .max().unwrap_or(0)
-                        );
-                        for (i, model_name) in ob.ollama_available_models.iter().enumerate() {
-                            let display = model_name.clone();
-                            let pad = " ".repeat(block_width.saturating_sub(display.chars().count() + 2));
-                            if ob.ollama_model_selection == i {
-                                lines.push(Line::from(vec![
-                                    Span::styled("\u{25B8} ", Style::default().fg(ACCENT).bg(sel_bg)),
-                                    Span::styled(format!("{}{}", display, pad), Style::default().fg(Color::White).bg(sel_bg)),
-                                ]));
-                            } else {
-                                lines.push(Line::from(Span::styled(format!("  {}{}", display, pad), Style::default().fg(Color::DarkGray))));
+                    // Compute block width from label + size columns
+                    let block_width = header_width.max(
+                        ob.ollama_available_models.iter()
+                            .map(|m| {
+                                let status = if m.installed { " \u{2713}" } else { "" };
+                                m.label.chars().count() + status.len() + m.size.chars().count() + 2
+                            })
+                            .max().unwrap_or(0)
+                    );
+                    for (i, option) in ob.ollama_available_models.iter().enumerate() {
+                        let status_str = if option.installed { " \u{2713}" } else { "" };
+                        let name_part = format!("{}{}", option.label, status_str);
+                        let gap = block_width.saturating_sub(name_part.chars().count() + option.size.chars().count());
+                        if ob.ollama_model_selection == i {
+                            lines.push(Line::from(vec![
+                                Span::styled("\u{25B8} ", Style::default().fg(ACCENT).bg(sel_bg)),
+                                Span::styled(format!("{}{}{}", name_part, " ".repeat(gap), option.size), Style::default().fg(Color::White).bg(sel_bg)),
+                            ]));
+                        } else {
+                            let mut spans = vec![
+                                Span::styled(format!("  {}", option.label), Style::default().fg(Color::DarkGray)),
+                            ];
+                            if option.installed {
+                                spans.push(Span::styled(" \u{2713}", Style::default().fg(Color::Green)));
                             }
+                            spans.push(Span::styled(format!("{}{}", " ".repeat(gap), option.size), Style::default().fg(Color::DarkGray)));
+                            lines.push(Line::from(spans));
                         }
                     }
                 }
