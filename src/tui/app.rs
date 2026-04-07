@@ -426,11 +426,35 @@ impl Dashboard {
                         .unwrap_or(false);
 
                     if in_onboarding_model_setup {
-                        if let Ok(names) = &result {
-                            if let Some(ref mut ob) = self.onboarding {
-                                ob.ollama_available_models = names.clone();
-                                ob.ollama_model_selection = 0;
+                        let local_names: Vec<String> = match &result {
+                            Ok(names) => names.clone(),
+                            Err(_) => Vec::new(),
+                        };
+                        if let Some(ref mut ob) = self.onboarding {
+                            use super::onboarding::{RECOMMENDED_OLLAMA_MODELS, OllamaModelOption};
+                            let local_set: std::collections::HashSet<&str> = local_names.iter().map(|s| s.as_str()).collect();
+                            // Build list: recommended models first, then extra local models
+                            let mut options: Vec<OllamaModelOption> = RECOMMENDED_OLLAMA_MODELS.iter().map(|&(id, label, size)| {
+                                OllamaModelOption {
+                                    id: id.to_string(),
+                                    label: label.to_string(),
+                                    size: size.to_string(),
+                                    installed: local_set.contains(id),
+                                }
+                            }).collect();
+                            // Add locally installed models not in the recommended list
+                            for name in &local_names {
+                                if !RECOMMENDED_OLLAMA_MODELS.iter().any(|(id, _, _)| *id == name.as_str()) {
+                                    options.push(OllamaModelOption {
+                                        id: name.clone(),
+                                        label: name.clone(),
+                                        size: String::new(),
+                                        installed: true,
+                                    });
+                                }
                             }
+                            ob.ollama_available_models = options;
+                            ob.ollama_model_selection = 0;
                         }
                     } else {
                         let current_model = self.config.enrichment.model_name().to_string();
