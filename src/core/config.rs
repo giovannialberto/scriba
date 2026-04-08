@@ -138,6 +138,13 @@ pub struct ScribaConfig {
     /// Preserved cloud provider when switching from Cloud to Private mode.
     #[serde(default)]
     pub last_cloud_provider: Option<CloudProvider>,
+    /// Check for updates on launch (default: true).
+    #[serde(default = "default_true")]
+    pub check_for_updates: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Configuration for voice-activated recording ("Scriba Forever" mode).
@@ -581,6 +588,7 @@ impl Default for ScribaConfig {
             voice: VoiceConfig::default(),
             last_local_model: None,
             last_cloud_provider: None,
+            check_for_updates: true,
         }
     }
 }
