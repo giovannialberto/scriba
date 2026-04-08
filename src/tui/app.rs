@@ -552,8 +552,8 @@ impl Dashboard {
                 self.update_progress_message();
             }
 
-            // Tick progress frame for inline transcription animation (throttled)
-            if anim_tick && (self.active_transcription.is_some() || !self.transcription_queue.is_empty()) {
+            // Tick progress frame for inline transcription/update animation (throttled)
+            if anim_tick && (self.active_transcription.is_some() || !self.transcription_queue.is_empty() || self.update_in_progress) {
                 self.progress_frame = self.progress_frame.wrapping_add(1);
             }
 
