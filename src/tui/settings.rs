@@ -26,8 +26,8 @@ const IDX_MODE: usize = 0;
 const PRIVATE_MODE_ITEMS: usize = 3;
 /// Number of mode-specific items in Cloud mode (Whisper API Key, LLM Provider, Model, Provider API Key).
 const CLOUD_MODE_ITEMS: usize = 4;
-/// Number of shared items (Auto-Stop, Timeout).
-const SHARED_ITEMS: usize = 2;
+/// Number of shared items (Auto-Stop, Timeout, Check for Updates).
+const SHARED_ITEMS: usize = 3;
 
 /// First shared-section index for a given mode.
 fn shared_offset(is_private: bool) -> usize {
@@ -408,6 +408,15 @@ impl Dashboard {
                                     }
                                 }
                             }
+                            2 => {
+                                // Toggle check for updates
+                                self.config.check_for_updates = !self.config.check_for_updates;
+                                if let Err(e) = self.config.save() {
+                                    self.message = format!("Failed to save setting: {}", e);
+                                    self.show_message = true;
+                                    self.return_to_view = Some(DashboardView::Settings);
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -686,6 +695,13 @@ impl Dashboard {
         let timeout_style_override = if !silence_enabled { Some(val_disabled) } else { None };
         let timeout_hint = if silence_enabled { "\u{2190} Enter to cycle" } else { "(enable auto-stop first)" };
         setting_line!("Timeout", timeout_display, shared_off + 1, timeout_hint, timeout_style_override);
+
+        // ── GENERAL ─────────────────────────────────────────────────
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::raw("  "), Span::styled("GENERAL", section_style)]));
+
+        let updates_value = if self.config.check_for_updates { "Enabled" } else { "Disabled" };
+        setting_line!("Check for Updates", updates_value, shared_off + 2, "\u{2190} Enter to toggle", None::<Style>);
 
         let body = Paragraph::new(lines).style(Style::default().fg(Color::White));
         f.render_widget(body, chunks[1]);

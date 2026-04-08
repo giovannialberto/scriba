@@ -127,6 +127,13 @@ pub struct Dashboard {
 
     // Easter egg
     pub(super) owl_easter_egg_frame: Option<usize>,
+
+    // Update checker
+    pub(super) update_available: Option<String>,                // Some("0.26.0") when newer version exists
+    pub(super) update_check_rx: Option<mpsc::Receiver<Option<String>>>,
+    pub(super) update_in_progress: bool,
+    pub(super) update_task: Option<tokio::task::JoinHandle<Result<String, String>>>,
+    pub(super) update_completed: Option<Result<String, String>>,  // Ok(version) or Err(message)
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -246,6 +253,13 @@ impl Dashboard {
 
             // Easter egg
             owl_easter_egg_frame: None,
+
+            // Update checker
+            update_available: None,
+            update_check_rx: None,
+            update_in_progress: false,
+            update_task: None,
+            update_completed: None,
         })
     }
 
@@ -260,6 +274,17 @@ impl Dashboard {
         // Load initial data
         self.load_recordings()?;
         self.load_stats()?;
+
+        // Spawn async update check (non-blocking, silent on failure)
+        if self.config.check_for_updates {
+            let (tx, rx) = mpsc::channel(1);
+            self.update_check_rx = Some(rx);
+            let current_version = env!("CARGO_PKG_VERSION").to_string();
+            tokio::spawn(async move {
+                let result = check_for_update(&current_version).await;
+                let _ = tx.send(result).await;
+            });
+        }
 
         // Check if onboarding is needed (no world.md exists)
         if !WorldContext::exists() {
@@ -492,6 +517,36 @@ impl Dashboard {
                 }
             }
 
+            // Check for update version check completion
+            if let Some(ref mut rx) = self.update_check_rx {
+                if let Ok(result) = rx.try_recv() {
+                    if let Some(version) = result {
+                        self.update_available = Some(version);
+                    }
+                    self.update_check_rx = None;
+                }
+            }
+
+            // Check for update task completion
+            if let Some(ref task) = self.update_task {
+                if task.is_finished() {
+                    let completed = self.update_task.take().unwrap();
+                    self.update_in_progress = false;
+                    match completed.await {
+                        Ok(Ok(version)) => {
+                            self.update_available = None;
+                            self.update_completed = Some(Ok(version));
+                        }
+                        Ok(Err(msg)) => {
+                            self.update_completed = Some(Err(msg));
+                        }
+                        Err(_) => {
+                            self.update_completed = Some(Err("Update task failed".to_string()));
+                        }
+                    }
+                }
+            }
+
             // Update progress animation if active (throttled)
             if anim_tick && self.progress_animation.is_some() {
                 self.update_progress_message();
@@ -639,6 +694,29 @@ impl Dashboard {
 
         if self.show_file_dialog {
             return self.handle_file_dialog_keys(key_code).await;
+        }
+
+        // Update banner: u to update, Esc to dismiss
+        if self.update_available.is_some() && !self.update_in_progress {
+            match key_code {
+                KeyCode::Char('u') | KeyCode::Char('U') => {
+                    let version = self.update_available.as_ref().unwrap().clone();
+                    self.update_in_progress = true;
+                    self.update_task = Some(tokio::spawn(async move {
+                        perform_update(&version).await
+                    }));
+                    return Ok(DashboardAction::Continue);
+                }
+                KeyCode::Esc => {
+                    self.update_available = None;
+                    return Ok(DashboardAction::Continue);
+                }
+                _ => {} // other keys fall through
+            }
+        }
+        // Dismiss update completion message on any keypress
+        if self.update_completed.is_some() {
+            self.update_completed = None;
         }
 
         // Dismiss notification on any keypress (without consuming the key)
@@ -897,6 +975,57 @@ impl Dashboard {
                 .style(style)
                 .alignment(Alignment::Center);
             f.render_widget(para, aligned);
+            return;
+        }
+
+        // Update completion message
+        if let Some(ref result) = self.update_completed {
+            let (msg, style) = match result {
+                Ok(v) => (
+                    format!("Updated to v{} \u{2014} restart Scriba to use it", v),
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                ),
+                Err(e) => (
+                    format!("Update failed: {}", e),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+            };
+            let para = Paragraph::new(msg).style(style).alignment(Alignment::Center);
+            f.render_widget(para, aligned);
+            return;
+        }
+
+        // Update available banner
+        if let Some(ref version) = self.update_available {
+            if self.update_in_progress {
+                let braille = ['\u{28F7}', '\u{28EF}', '\u{28DF}', '\u{28BF}', '\u{287F}', '\u{28FE}', '\u{28FD}', '\u{28FB}'];
+                let frame = self.progress_frame;
+                let line = Line::from(vec![
+                    Span::styled(
+                        format!("{} ", braille[frame % braille.len()]),
+                        Style::default().fg(ACCENT),
+                    ),
+                    Span::styled(
+                        format!("Updating to v{}...", version),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]);
+                f.render_widget(Paragraph::new(line).alignment(Alignment::Center), aligned);
+            } else {
+                let line = Line::from(vec![
+                    Span::styled(
+                        format!("v{} available ", version),
+                        Style::default().fg(ACCENT),
+                    ),
+                    Span::styled("[", Style::default().fg(Color::DarkGray)),
+                    Span::styled("u", Style::default().fg(Color::White)),
+                    Span::styled("] Update  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("[", Style::default().fg(Color::DarkGray)),
+                    Span::styled("Esc", Style::default().fg(Color::White)),
+                    Span::styled("] Dismiss", Style::default().fg(Color::DarkGray)),
+                ]);
+                f.render_widget(Paragraph::new(line).alignment(Alignment::Center), aligned);
+            }
             return;
         }
 
@@ -1743,4 +1872,136 @@ impl Dashboard {
             );
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Update checker
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Check GitHub releases for a newer version. Returns `Some("X.Y.Z")` if available.
+async fn check_for_update(current_version: &str) -> Option<String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .ok()?;
+    let resp = client
+        .get("https://api.github.com/repos/giovannialberto/scriba/releases/latest")
+        .header("User-Agent", "scriba")
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let json: serde_json::Value = resp.json().await.ok()?;
+    let tag = json["tag_name"].as_str()?;
+    let latest = tag.strip_prefix('v').unwrap_or(tag);
+    if version_newer(latest, current_version) {
+        Some(latest.to_string())
+    } else {
+        None
+    }
+}
+
+/// Simple semver comparison: is `a` newer than `b`?
+fn version_newer(a: &str, b: &str) -> bool {
+    let parse = |v: &str| -> Vec<u32> {
+        v.split('.').filter_map(|s| s.parse().ok()).collect()
+    };
+    let va = parse(a);
+    let vb = parse(b);
+    va > vb
+}
+
+/// Perform the actual update. Returns the new version string on success.
+async fn perform_update(version: &str) -> Result<String, String> {
+    let version_tag = if version.starts_with('v') {
+        version.to_string()
+    } else {
+        format!("v{}", version)
+    };
+
+    // Check if installed via Homebrew
+    if cfg!(target_os = "macos") {
+        let brew_check = tokio::process::Command::new("brew")
+            .args(["list", "scriba"])
+            .output()
+            .await;
+        if let Ok(output) = brew_check {
+            if output.status.success() {
+                // Update via Homebrew
+                let result = tokio::process::Command::new("brew")
+                    .args(["upgrade", "scriba"])
+                    .output()
+                    .await
+                    .map_err(|e| format!("brew upgrade failed: {}", e))?;
+                if result.status.success() {
+                    return Ok(version.to_string());
+                }
+                return Err(String::from_utf8_lossy(&result.stderr).to_string());
+            }
+        }
+    }
+
+    // Direct binary replacement (macOS non-Homebrew + Linux)
+    let target = if cfg!(target_os = "macos") {
+        if cfg!(target_arch = "aarch64") {
+            "aarch64-apple-darwin"
+        } else {
+            "x86_64-apple-darwin"
+        }
+    } else if cfg!(target_os = "linux") {
+        "x86_64-unknown-linux-gnu"
+    } else {
+        return Err("Unsupported platform".to_string());
+    };
+
+    let url = format!(
+        "https://github.com/giovannialberto/scriba/releases/download/{}/scriba-{}",
+        version_tag, target
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let resp = client
+        .get(&url)
+        .header("User-Agent", "scriba")
+        .send()
+        .await
+        .map_err(|e| format!("Download failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("Download failed: HTTP {}", resp.status()));
+    }
+
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("Download failed: {}", e))?;
+
+    // Write to temp file, then replace current binary
+    let current_exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let tmp_path = current_exe.with_extension("update");
+
+    tokio::fs::write(&tmp_path, &bytes)
+        .await
+        .map_err(|e| format!("Failed to write update: {}", e))?;
+
+    // Make executable
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o755);
+        std::fs::set_permissions(&tmp_path, perms)
+            .map_err(|e| format!("Failed to set permissions: {}", e))?;
+    }
+
+    // Atomic replace
+    std::fs::rename(&tmp_path, &current_exe)
+        .map_err(|e| format!("Failed to replace binary: {}", e))?;
+
+    Ok(version.to_string())
 }
