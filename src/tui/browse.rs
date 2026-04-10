@@ -568,7 +568,7 @@ impl Dashboard {
         // Compute widths to fill gap
         let left_width: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
         let right_width: usize = right_spans.iter().map(|s| s.content.chars().count()).sum();
-        let gap = (footer_area.width as usize).saturating_sub(left_width + right_width);
+        let gap = (footer_area.width as usize).saturating_sub(left_width + right_width).max(2);
 
         let mut spans = left_spans;
         spans.push(Span::raw(" ".repeat(gap)));
@@ -602,7 +602,7 @@ impl Dashboard {
         let mut line_to_recording: Vec<Option<usize>> = Vec::new();
         let mut current_group: Option<String> = None;
 
-        let name_col_width = (area.width as usize).saturating_sub(2); // right margin matches left (2 chars)
+        let name_col_width = (area.width as usize).saturating_sub(4); // right margin matches left visual margin
 
         for (i, recording) in self.recordings.iter().enumerate() {
             let rec_date = recording.created_at.with_timezone(&chrono::Local).date_naive();
