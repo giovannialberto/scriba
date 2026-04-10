@@ -63,7 +63,12 @@ pub fn summarize_tool_result(name: &str, result: &str) -> String {
             if result.contains("not found") {
                 "not found".to_string()
             } else {
-                format!("{} chars", char_count)
+                let mentions = result.matches("\"recording_id\"").count();
+                if mentions > 0 {
+                    format!("{} mentions", mentions)
+                } else {
+                    "found".to_string()
+                }
             }
         }
         "get_recordings_for_entity" => {
@@ -116,12 +121,12 @@ pub fn summarize_input(name: &str, input: &Value) -> String {
             format!("id={}", id)
         }
         "get_entity" => {
-            let id = input
-                .get("id")
-                .and_then(|v| v.as_i64())
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "?".to_string());
-            format!("id={}", id)
+            if let Some(name) = input.get("name").and_then(|v| v.as_str()) {
+                format!("\"{}\"", name)
+            } else {
+                let id = input.get("id").and_then(|v| v.as_i64()).map(|v| v.to_string()).unwrap_or_else(|| "?".to_string());
+                format!("id={}", id)
+            }
         }
         "get_recordings_for_entity" => {
             let id = input
