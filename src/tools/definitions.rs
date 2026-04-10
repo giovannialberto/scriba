@@ -23,6 +23,10 @@ pub struct ListRecordingsParams {
     pub limit: Option<i64>,
     /// Number of items to skip.
     pub offset: Option<i64>,
+    /// Only include recordings from this date onward (ISO 8601, e.g. "2026-04-10").
+    pub from_date: Option<String>,
+    /// Only include recordings up to this date (ISO 8601, e.g. "2026-04-10").
+    pub to_date: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -47,6 +51,10 @@ pub struct SearchTranscriptsParams {
     pub query: String,
     /// Maximum results to return. Default: 10.
     pub limit: Option<i64>,
+    /// Only include recordings from this date onward (ISO 8601, e.g. "2026-04-10").
+    pub from_date: Option<String>,
+    /// Only include recordings up to this date (ISO 8601, e.g. "2026-04-10").
+    pub to_date: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -132,7 +140,7 @@ pub fn all_tool_schemas() -> Vec<ToolSchema> {
     vec![
         ToolSchema {
             name: "list_recordings",
-            description: "List all recordings with metadata (id, name, date, duration, summary snippet). Use this to see what recordings are available.",
+            description: "List all recordings with metadata (id, name, date, duration, summary snippet). Supports date filtering with from_date/to_date (ISO 8601). Use this to see what recordings are available.",
             input_schema: serde_json::to_value(schemars::schema_for!(ListRecordingsParams)).unwrap(),
         },
         ToolSchema {
@@ -147,7 +155,7 @@ pub fn all_tool_schemas() -> Vec<ToolSchema> {
         },
         ToolSchema {
             name: "search_transcripts",
-            description: "Full-text search across all transcripts. Returns matching recording IDs with snippets. Use this to find recordings about a topic.",
+            description: "Full-text search across all transcripts. Returns matching recording IDs with snippets. Supports date filtering with from_date/to_date (ISO 8601). Use this to find recordings about a topic.",
             input_schema: serde_json::to_value(schemars::schema_for!(SearchTranscriptsParams)).unwrap(),
         },
         ToolSchema {

@@ -163,13 +163,17 @@ Keep it concise and professional."#,
 /// Build the system prompt for the agent (global context).
 /// Much simpler than the flat prompt — the agent fetches data via tools.
 pub fn build_agent_global_prompt(owner_name: &str) -> String {
+    let today = chrono::Local::now().format("%A, %B %-d, %Y").to_string();
     format!(
         r#"You are Scriba, {owner}'s personal audio assistant. You record, transcribe, and remember everything.
+
+Today is {today}.
 
 You have access to tools to search and read recordings, transcripts, entities, and the owner's world context.
 
 ## How to work
 - ALWAYS use your tools to find information before answering — do not guess.
+- When the user refers to time ("today", "yesterday", "this week"), use the from_date/to_date filters on list_recordings or search_transcripts to narrow results.
 - When cross-correlating topics across recordings, search first, then read the relevant transcripts.
 - Think step by step. Use multiple tool calls if needed.
 - After gathering information, synthesize a clear, concise answer.
@@ -183,6 +187,7 @@ You have access to tools to search and read recordings, transcripts, entities, a
 - Be concise — 2-5 sentences unless the user asks for detail.
 - Never fabricate information about recordings or entities you haven't looked up."#,
         owner = owner_name,
+        today = today,
     )
 }
 
@@ -194,8 +199,11 @@ pub fn build_agent_recording_prompt(
     recording_name: &str,
     summary: &str,
 ) -> String {
+    let today = chrono::Local::now().format("%A, %B %-d, %Y").to_string();
     format!(
         r#"You are Scriba, {owner}'s personal audio assistant. You are currently helping with a specific recording.
+
+Today is {today}.
 
 ## Current Recording
 - ID: {id}
