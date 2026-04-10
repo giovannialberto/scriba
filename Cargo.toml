@@ -1,6 +1,6 @@
 [package]
 name = "scriba"
-version = "0.26.0"
+version = "0.26.1"
 edition = "2024"
 description = "A TUI for recording, transcribing, and enriching audio with LLM-powered insights"
 authors = ["Giovanni Alberto Falcione"]
