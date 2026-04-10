@@ -38,12 +38,18 @@ pub fn summarize_tool_result(name: &str, result: &str) -> String {
             if result.contains("not found") {
                 "not found".to_string()
             } else {
-                format!("{} chars", char_count)
+                // Show what metadata is available
+                let mut has = Vec::new();
+                if result.contains("\"summary\"") { has.push("summary"); }
+                if result.contains("\"topics\"") { has.push("topics"); }
+                if result.contains("\"key_points\"") { has.push("key points"); }
+                if result.contains("\"action_items\"") { has.push("actions"); }
+                if has.is_empty() { "metadata".to_string() } else { has.join(", ") }
             }
         }
         "get_transcript" => {
             let word_count = result.split_whitespace().count();
-            format!("{} words", word_count)
+            format!("transcript, {} words", word_count)
         }
         "search_transcripts" => {
             let count = result.matches("\"recording_id\"").count();
@@ -57,7 +63,12 @@ pub fn summarize_tool_result(name: &str, result: &str) -> String {
             if result.contains("not found") {
                 "not found".to_string()
             } else {
-                format!("{} chars", char_count)
+                let mentions = result.matches("\"recording_id\"").count();
+                if mentions > 0 {
+                    format!("{} mentions", mentions)
+                } else {
+                    "found".to_string()
+                }
             }
         }
         "get_recordings_for_entity" => {
@@ -91,7 +102,14 @@ pub fn summarize_input(name: &str, input: &Value) -> String {
     match name {
         "search_transcripts" => {
             let query = input.get("query").and_then(|v| v.as_str()).unwrap_or("?");
-            format!("\"{}\"", query)
+            let mut parts = vec![format!("\"{}\"", query)];
+            if let Some(from) = input.get("from_date").and_then(|v| v.as_str()) {
+                parts.push(format!("from {}", from));
+            }
+            if let Some(to) = input.get("to_date").and_then(|v| v.as_str()) {
+                parts.push(format!("to {}", to));
+            }
+            parts.join(", ")
         }
         "get_recording" | "get_transcript" => {
             let id = input
@@ -103,12 +121,12 @@ pub fn summarize_input(name: &str, input: &Value) -> String {
             format!("id={}", id)
         }
         "get_entity" => {
-            let id = input
-                .get("id")
-                .and_then(|v| v.as_i64())
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "?".to_string());
-            format!("id={}", id)
+            if let Some(name) = input.get("name").and_then(|v| v.as_str()) {
+                format!("\"{}\"", name)
+            } else {
+                let id = input.get("id").and_then(|v| v.as_i64()).map(|v| v.to_string()).unwrap_or_else(|| "?".to_string());
+                format!("id={}", id)
+            }
         }
         "get_recordings_for_entity" => {
             let id = input
@@ -119,11 +137,17 @@ pub fn summarize_input(name: &str, input: &Value) -> String {
             format!("entity_id={}", id)
         }
         "list_recordings" => {
-            if let Some(limit) = input.get("limit").and_then(|v| v.as_i64()) {
-                format!("limit={}", limit)
-            } else {
-                "all".to_string()
+            let mut parts = Vec::new();
+            if let Some(from) = input.get("from_date").and_then(|v| v.as_str()) {
+                parts.push(format!("from {}", from));
             }
+            if let Some(to) = input.get("to_date").and_then(|v| v.as_str()) {
+                parts.push(format!("to {}", to));
+            }
+            if let Some(limit) = input.get("limit").and_then(|v| v.as_i64()) {
+                parts.push(format!("limit={}", limit));
+            }
+            if parts.is_empty() { "all".to_string() } else { parts.join(", ") }
         }
         "list_entities" => {
             let mut parts = Vec::new();

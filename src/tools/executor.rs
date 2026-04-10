@@ -57,7 +57,7 @@ fn exec_list_recordings(input: &Value, db: &Database) -> ToolResult {
         Ok(p) => p,
         Err(e) => return ToolResult::err(format!("Invalid params: {}", e)),
     };
-    match db.list_recordings(params.limit, params.offset) {
+    match db.list_recordings_filtered(params.limit, params.offset, params.from_date.as_deref(), params.to_date.as_deref()) {
         Ok(recordings) => {
             let items: Vec<Value> = recordings
                 .iter()
@@ -150,7 +150,7 @@ fn exec_search_transcripts(input: &Value, db: &Database) -> ToolResult {
         Err(e) => return ToolResult::err(format!("Invalid params: {}", e)),
     };
     let limit = params.limit.or(Some(10));
-    match db.search_transcripts(&params.query, limit) {
+    match db.search_transcripts_filtered(&params.query, limit, params.from_date.as_deref(), params.to_date.as_deref()) {
         Ok(results) => {
             let items: Vec<Value> = results
                 .iter()

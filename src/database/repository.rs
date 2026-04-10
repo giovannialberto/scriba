@@ -350,20 +350,50 @@ impl Database {
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> Result<Vec<Recording>> {
-        let sql = match (limit, offset) {
-            (Some(l), Some(o)) => format!(
-                "SELECT * FROM recordings ORDER BY created_at DESC LIMIT {} OFFSET {}",
-                l, o
-            ),
-            (Some(l), None) => format!(
-                "SELECT * FROM recordings ORDER BY created_at DESC LIMIT {}",
-                l
-            ),
-            _ => "SELECT * FROM recordings ORDER BY created_at DESC".to_string(),
-        };
+        self.list_recordings_filtered(limit, offset, None, None)
+    }
+
+    pub fn list_recordings_filtered(
+        &self,
+        limit: Option<i64>,
+        offset: Option<i64>,
+        from_date: Option<&str>,
+        to_date: Option<&str>,
+    ) -> Result<Vec<Recording>> {
+        let mut sql = String::from("SELECT * FROM recordings");
+        let mut conditions: Vec<String> = Vec::new();
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(from) = from_date {
+            conditions.push(format!("created_at >= ?{}", params_vec.len() + 1));
+            params_vec.push(Box::new(format!("{} 00:00:00", from)));
+        }
+        if let Some(to) = to_date {
+            conditions.push(format!("created_at < ?{}", params_vec.len() + 1));
+            // Add one day to make to_date inclusive
+            if let Ok(d) = chrono::NaiveDate::parse_from_str(to, "%Y-%m-%d") {
+                let next_day = d + chrono::Duration::days(1);
+                params_vec.push(Box::new(format!("{} 00:00:00", next_day)));
+            } else {
+                params_vec.push(Box::new(format!("{} 23:59:59", to)));
+            }
+        }
+
+        if !conditions.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&conditions.join(" AND "));
+        }
+        sql.push_str(" ORDER BY created_at DESC");
+        if let Some(l) = limit {
+            sql.push_str(&format!(" LIMIT {}", l));
+        }
+        if let Some(o) = offset {
+            sql.push_str(&format!(" OFFSET {}", o));
+        }
 
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map([], row_to_recording)?;
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt.query_map(param_refs.as_slice(), row_to_recording)?;
 
         let mut recordings = Vec::new();
         for row in rows {
@@ -605,30 +635,47 @@ impl Database {
         query: &str,
         limit: Option<i64>,
     ) -> Result<Vec<(Recording, Transcript)>> {
-        let sql = match limit {
-            Some(l) => format!(
-                r#"
-                SELECT r.*, t.* FROM recordings r
-                JOIN transcripts t ON r.id = t.recording_id
-                JOIN transcripts_fts ON transcripts_fts.rowid = t.id
-                WHERE transcripts_fts MATCH ?1
-                ORDER BY rank
-                LIMIT {}
-            "#,
-                l
-            ),
-            None => r#"
-                SELECT r.*, t.* FROM recordings r
-                JOIN transcripts t ON r.id = t.recording_id
-                JOIN transcripts_fts ON transcripts_fts.rowid = t.id
-                WHERE transcripts_fts MATCH ?1
-                ORDER BY rank
-            "#
-            .to_string(),
-        };
+        self.search_transcripts_filtered(query, limit, None, None)
+    }
+
+    pub fn search_transcripts_filtered(
+        &self,
+        query: &str,
+        limit: Option<i64>,
+        from_date: Option<&str>,
+        to_date: Option<&str>,
+    ) -> Result<Vec<(Recording, Transcript)>> {
+        let mut sql = String::from(
+            r#"SELECT r.*, t.* FROM recordings r
+               JOIN transcripts t ON r.id = t.recording_id
+               JOIN transcripts_fts ON transcripts_fts.rowid = t.id
+               WHERE transcripts_fts MATCH ?1"#,
+        );
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        params_vec.push(Box::new(query.to_string()));
+
+        if let Some(from) = from_date {
+            sql.push_str(&format!(" AND r.created_at >= ?{}", params_vec.len() + 1));
+            params_vec.push(Box::new(format!("{} 00:00:00", from)));
+        }
+        if let Some(to) = to_date {
+            sql.push_str(&format!(" AND r.created_at < ?{}", params_vec.len() + 1));
+            if let Ok(d) = chrono::NaiveDate::parse_from_str(to, "%Y-%m-%d") {
+                let next_day = d + chrono::Duration::days(1);
+                params_vec.push(Box::new(format!("{} 00:00:00", next_day)));
+            } else {
+                params_vec.push(Box::new(format!("{} 23:59:59", to)));
+            }
+        }
+
+        sql.push_str(" ORDER BY rank");
+        if let Some(l) = limit {
+            sql.push_str(&format!(" LIMIT {}", l));
+        }
 
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map([query], row_to_recording_and_transcript)?;
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt.query_map(param_refs.as_slice(), row_to_recording_and_transcript)?;
 
         let mut results = Vec::new();
         for row in rows {
