@@ -547,6 +547,9 @@ impl Dashboard {
 
         let mut right_spans = vec![
             Span::styled("[", Style::default().fg(Color::DarkGray)),
+            Span::styled("T", Style::default().fg(Color::White)),
+            Span::styled("] Transcribe  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(Color::DarkGray)),
             Span::styled("Tab", Style::default().fg(Color::White)),
             Span::styled("] Home  ", Style::default().fg(Color::DarkGray)),
             Span::styled("[", Style::default().fg(Color::DarkGray)),
@@ -565,7 +568,7 @@ impl Dashboard {
         // Compute widths to fill gap
         let left_width: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
         let right_width: usize = right_spans.iter().map(|s| s.content.chars().count()).sum();
-        let gap = (footer_area.width as usize).saturating_sub(left_width + right_width);
+        let gap = (footer_area.width as usize).saturating_sub(left_width + right_width).max(2);
 
         let mut spans = left_spans;
         spans.push(Span::raw(" ".repeat(gap)));
@@ -599,7 +602,7 @@ impl Dashboard {
         let mut line_to_recording: Vec<Option<usize>> = Vec::new();
         let mut current_group: Option<String> = None;
 
-        let name_col_width = (area.width as usize).saturating_sub(16); // leave room for prefix + duration + time
+        let name_col_width = (area.width as usize).saturating_sub(3); // right margin matches left visual margin
 
         for (i, recording) in self.recordings.iter().enumerate() {
             let rec_date = recording.created_at.with_timezone(&chrono::Local).date_naive();
