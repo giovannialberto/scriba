@@ -547,6 +547,9 @@ impl Dashboard {
 
         let mut right_spans = vec![
             Span::styled("[", Style::default().fg(Color::DarkGray)),
+            Span::styled("T", Style::default().fg(Color::White)),
+            Span::styled("] Transcribe  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[", Style::default().fg(Color::DarkGray)),
             Span::styled("Tab", Style::default().fg(Color::White)),
             Span::styled("] Home  ", Style::default().fg(Color::DarkGray)),
             Span::styled("[", Style::default().fg(Color::DarkGray)),
@@ -599,7 +602,7 @@ impl Dashboard {
         let mut line_to_recording: Vec<Option<usize>> = Vec::new();
         let mut current_group: Option<String> = None;
 
-        let name_col_width = (area.width as usize).saturating_sub(16); // leave room for prefix + duration + time
+        let name_col_width = (area.width as usize).saturating_sub(2); // right margin matches left (2 chars)
 
         for (i, recording) in self.recordings.iter().enumerate() {
             let rec_date = recording.created_at.with_timezone(&chrono::Local).date_naive();
