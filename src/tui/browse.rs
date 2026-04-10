@@ -602,7 +602,7 @@ impl Dashboard {
         let mut line_to_recording: Vec<Option<usize>> = Vec::new();
         let mut current_group: Option<String> = None;
 
-        let name_col_width = (area.width as usize).saturating_sub(4); // right margin matches left visual margin
+        let name_col_width = (area.width as usize).saturating_sub(3); // right margin matches left visual margin
 
         for (i, recording) in self.recordings.iter().enumerate() {
             let rec_date = recording.created_at.with_timezone(&chrono::Local).date_naive();
