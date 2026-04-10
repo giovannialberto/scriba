@@ -366,16 +366,16 @@ impl Database {
 
         if let Some(from) = from_date {
             conditions.push(format!("created_at >= ?{}", params_vec.len() + 1));
-            params_vec.push(Box::new(format!("{}T00:00:00", from)));
+            params_vec.push(Box::new(format!("{} 00:00:00", from)));
         }
         if let Some(to) = to_date {
             conditions.push(format!("created_at < ?{}", params_vec.len() + 1));
             // Add one day to make to_date inclusive
             if let Ok(d) = chrono::NaiveDate::parse_from_str(to, "%Y-%m-%d") {
                 let next_day = d + chrono::Duration::days(1);
-                params_vec.push(Box::new(format!("{}T00:00:00", next_day)));
+                params_vec.push(Box::new(format!("{} 00:00:00", next_day)));
             } else {
-                params_vec.push(Box::new(format!("{}T23:59:59", to)));
+                params_vec.push(Box::new(format!("{} 23:59:59", to)));
             }
         }
 
@@ -656,15 +656,15 @@ impl Database {
 
         if let Some(from) = from_date {
             sql.push_str(&format!(" AND r.created_at >= ?{}", params_vec.len() + 1));
-            params_vec.push(Box::new(format!("{}T00:00:00", from)));
+            params_vec.push(Box::new(format!("{} 00:00:00", from)));
         }
         if let Some(to) = to_date {
             sql.push_str(&format!(" AND r.created_at < ?{}", params_vec.len() + 1));
             if let Ok(d) = chrono::NaiveDate::parse_from_str(to, "%Y-%m-%d") {
                 let next_day = d + chrono::Duration::days(1);
-                params_vec.push(Box::new(format!("{}T00:00:00", next_day)));
+                params_vec.push(Box::new(format!("{} 00:00:00", next_day)));
             } else {
-                params_vec.push(Box::new(format!("{}T23:59:59", to)));
+                params_vec.push(Box::new(format!("{} 23:59:59", to)));
             }
         }
 
