@@ -1174,14 +1174,7 @@ impl Dashboard {
     fn generate_suggestions(&self) -> Vec<String> {
         match &self.chat.context {
             ChatContext::Global => {
-                let mut suggestions = Vec::new();
-
-                // If no recordings yet, lead with recording prompt
-                if self.recordings.is_empty() {
-                    suggestions.push("Start a new recording".to_string());
-                }
-
-                suggestions.push("What have I been talking about recently?".to_string());
+                let mut suggestions = vec!["What have I been talking about recently?".to_string()];
 
                 // Top entity suggestion
                 if !self.entities.is_empty() {
@@ -1204,12 +1197,7 @@ impl Dashboard {
                     suggestions.push("Who have I been meeting with most?".to_string());
                 }
 
-                // Always offer recording as last option if there are already recordings
-                if !self.recordings.is_empty() {
-                    suggestions.push("Start a new recording".to_string());
-                }
-
-                suggestions.truncate(5);
+                suggestions.truncate(4);
                 suggestions
             }
             ChatContext::Recording { .. } => {
@@ -1299,7 +1287,11 @@ impl Dashboard {
         self.chat.home_recordings = home_recs;
         self.chat.selected_action = 0;
 
-        self.chat.placeholder = "Ask anything...".to_string();
+        self.chat.placeholder = if self.recordings.is_empty() {
+            "Type \u{201c}record\u{201d} or press Ctrl+R to start your first recording".to_string()
+        } else {
+            "Ask anything...".to_string()
+        };
     }
 
     fn init_global_chat(&mut self) {
@@ -1406,6 +1398,13 @@ impl Dashboard {
     }
 
     fn send_chat_message(&mut self) {
+        // Intercept recording intent early — before dismissing the home screen
+        if is_recording_intent(&self.chat.input_buffer) {
+            self.chat.input_buffer.clear();
+            self.pending_record_from_chat = true;
+            return;
+        }
+
         let user_msg = if self.chat.show_suggestions && !self.chat.suggestions.is_empty() {
             // Check if "Ask Scriba anything..." (last option) is selected
             if self.chat.selected_suggestion >= self.chat.suggestions.len() {
@@ -1426,15 +1425,6 @@ impl Dashboard {
         } else {
             return;
         };
-
-        // Intercept recording intent — trigger recording instead of chat
-        if is_recording_intent(&user_msg) {
-            self.chat.show_home_screen = false;
-            self.chat.show_suggestions = false;
-            self.chat.input_buffer.clear();
-            self.pending_record_from_chat = true;
-            return;
-        }
 
         // Add user message
         self.chat.messages.push(ChatMessage::text(ChatRole::User, user_msg.clone()));
