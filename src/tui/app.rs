@@ -128,6 +128,9 @@ pub struct Dashboard {
     // Easter egg
     pub(super) owl_easter_egg_frame: Option<usize>,
 
+    // Chat-triggered recording
+    pub(super) pending_record_from_chat: bool,
+
     // Update checker
     pub(super) update_available: Option<String>,                // Some("0.26.0") when newer version exists
     pub(super) update_check_rx: Option<mpsc::Receiver<Option<String>>>,
@@ -253,6 +256,9 @@ impl Dashboard {
 
             // Easter egg
             owl_easter_egg_frame: None,
+
+            // Chat-triggered recording
+            pending_record_from_chat: false,
 
             // Update checker
             update_available: None,
@@ -514,6 +520,16 @@ impl Dashboard {
                         }
                     }
                     self.ollama_models_rx = None;
+                }
+            }
+
+            // Handle chat-triggered recording
+            if self.pending_record_from_chat {
+                self.pending_record_from_chat = false;
+                if self.recording_task.is_some() {
+                    self.notification_message = Some(("Already recording \u{2014} press Esc to stop.".to_string(), 30));
+                } else {
+                    let _ = self.execute_record_and_transcribe().await;
                 }
             }
 
@@ -1158,7 +1174,14 @@ impl Dashboard {
     fn generate_suggestions(&self) -> Vec<String> {
         match &self.chat.context {
             ChatContext::Global => {
-                let mut suggestions = vec!["What have I been talking about recently?".to_string()];
+                let mut suggestions = Vec::new();
+
+                // If no recordings yet, lead with recording prompt
+                if self.recordings.is_empty() {
+                    suggestions.push("Start a new recording".to_string());
+                }
+
+                suggestions.push("What have I been talking about recently?".to_string());
 
                 // Top entity suggestion
                 if !self.entities.is_empty() {
@@ -1181,7 +1204,12 @@ impl Dashboard {
                     suggestions.push("Who have I been meeting with most?".to_string());
                 }
 
-                suggestions.truncate(4);
+                // Always offer recording as last option if there are already recordings
+                if !self.recordings.is_empty() {
+                    suggestions.push("Start a new recording".to_string());
+                }
+
+                suggestions.truncate(5);
                 suggestions
             }
             ChatContext::Recording { .. } => {
@@ -1398,6 +1426,15 @@ impl Dashboard {
         } else {
             return;
         };
+
+        // Intercept recording intent — trigger recording instead of chat
+        if is_recording_intent(&user_msg) {
+            self.chat.show_home_screen = false;
+            self.chat.show_suggestions = false;
+            self.chat.input_buffer.clear();
+            self.pending_record_from_chat = true;
+            return;
+        }
 
         // Add user message
         self.chat.messages.push(ChatMessage::text(ChatRole::User, user_msg.clone()));
@@ -1879,6 +1916,21 @@ impl Dashboard {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Check GitHub releases for a newer version. Returns `Some("X.Y.Z")` if available.
+/// Detect if the user's message is a request to start a recording.
+fn is_recording_intent(msg: &str) -> bool {
+    let normalized = msg.trim().to_lowercase();
+    matches!(
+        normalized.as_str(),
+        "record"
+            | "start recording"
+            | "start a recording"
+            | "start a new recording"
+            | "new recording"
+            | "begin recording"
+            | "start record"
+    )
+}
+
 async fn check_for_update(current_version: &str) -> Option<String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
