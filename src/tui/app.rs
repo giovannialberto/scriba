@@ -128,6 +128,9 @@ pub struct Dashboard {
     // Easter egg
     pub(super) owl_easter_egg_frame: Option<usize>,
 
+    // Chat-triggered recording
+    pub(super) pending_record_from_chat: bool,
+
     // Update checker
     pub(super) update_available: Option<String>,                // Some("0.26.0") when newer version exists
     pub(super) update_check_rx: Option<mpsc::Receiver<Option<String>>>,
@@ -253,6 +256,9 @@ impl Dashboard {
 
             // Easter egg
             owl_easter_egg_frame: None,
+
+            // Chat-triggered recording
+            pending_record_from_chat: false,
 
             // Update checker
             update_available: None,
@@ -514,6 +520,16 @@ impl Dashboard {
                         }
                     }
                     self.ollama_models_rx = None;
+                }
+            }
+
+            // Handle chat-triggered recording
+            if self.pending_record_from_chat {
+                self.pending_record_from_chat = false;
+                if self.recording_task.is_some() {
+                    self.notification_message = Some(("Already recording \u{2014} press Esc to stop.".to_string(), 30));
+                } else {
+                    let _ = self.execute_record_and_transcribe().await;
                 }
             }
 
@@ -1271,7 +1287,11 @@ impl Dashboard {
         self.chat.home_recordings = home_recs;
         self.chat.selected_action = 0;
 
-        self.chat.placeholder = "Ask anything...".to_string();
+        self.chat.placeholder = if self.recordings.is_empty() {
+            "Type \u{201c}record\u{201d} or press Ctrl+R to start your first recording".to_string()
+        } else {
+            "Ask anything...".to_string()
+        };
     }
 
     fn init_global_chat(&mut self) {
@@ -1378,6 +1398,13 @@ impl Dashboard {
     }
 
     fn send_chat_message(&mut self) {
+        // Intercept recording intent early — before dismissing the home screen
+        if is_recording_intent(&self.chat.input_buffer) {
+            self.chat.input_buffer.clear();
+            self.pending_record_from_chat = true;
+            return;
+        }
+
         let user_msg = if self.chat.show_suggestions && !self.chat.suggestions.is_empty() {
             // Check if "Ask Scriba anything..." (last option) is selected
             if self.chat.selected_suggestion >= self.chat.suggestions.len() {
@@ -1879,6 +1906,21 @@ impl Dashboard {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Check GitHub releases for a newer version. Returns `Some("X.Y.Z")` if available.
+/// Detect if the user's message is a request to start a recording.
+fn is_recording_intent(msg: &str) -> bool {
+    let normalized = msg.trim().to_lowercase();
+    matches!(
+        normalized.as_str(),
+        "record"
+            | "start recording"
+            | "start a recording"
+            | "start a new recording"
+            | "new recording"
+            | "begin recording"
+            | "start record"
+    )
+}
+
 async fn check_for_update(current_version: &str) -> Option<String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
