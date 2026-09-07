@@ -172,6 +172,22 @@ impl WorkflowManager {
                 .await?;
                 result.recording_name
             }
+            RecordingMode::Meeting { stop_rx, silence_timeout } => {
+                let result = record_audio(
+                    recording_path,
+                    RecordOptions {
+                        compression_settings: config.compression.clone(),
+                        stop_rx: Some(stop_rx),
+                        level_tx: None,
+                        verbose: true,
+                        silence_timeout,
+                        input_device,
+                        loopback_device,
+                    },
+                )
+                .await?;
+                result.recording_name
+            }
         };
 
         let recording_dir = BASE_PATH.join(&final_directory_name);
@@ -643,6 +659,31 @@ impl WorkflowManager {
         };
 
         let mode = RecordingMode::Tui { stop_rx, level_tx, silence_timeout };
+        self.complete_recording_workflow(config, mode).await
+    }
+
+    /// Record a meeting detected by `scriba watch`.
+    ///
+    /// The recording stops when `stop_rx` receives (the watcher saw the
+    /// meeting app release the mic) or after `silence_timeout` of continuous
+    /// silence as a fallback net, then optionally auto-transcribes. Returns
+    /// the finished recording.
+    pub async fn record_meeting(
+        &mut self,
+        name: Option<String>,
+        compression: Option<CompressionSettings>,
+        auto_transcribe: bool,
+        transcription_mode: Option<TranscriptionMode>,
+        stop_rx: mpsc::Receiver<()>,
+        silence_timeout: Option<Duration>,
+    ) -> Result<ManagedRecording> {
+        let config = RecordingConfig {
+            name,
+            compression,
+            auto_transcribe,
+            transcription_mode,
+        };
+        let mode = RecordingMode::Meeting { stop_rx, silence_timeout };
         self.complete_recording_workflow(config, mode).await
     }
 

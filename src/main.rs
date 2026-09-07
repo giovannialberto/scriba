@@ -1,7 +1,9 @@
 use anyhow::Result;
 use scriba::core::{
     resolve_transcription_mode, AudioFormat, CloudProvider, CompressionSettings, EnrichmentMode,
-    LocalModel, ScribaConfig, TranscriptionMode, WorkflowManager, initialize_world_from_seed,
+    LocalModel, MeetingEvent, MeetingWatcherConfig, ScribaConfig, TranscriptionMode,
+    WorkflowManager, initialize_world_from_seed, mic_in_use_by_others, notify_event,
+    run_meeting_watcher, watcher_excludes_self,
 };
 use scriba::database::Database;
 use scriba::enrichment::WorldContext;
@@ -10,7 +12,11 @@ use scriba::mcp::run_mcp_server;
 use scriba::tui::Dashboard;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use structopt::StructOpt;
+use tokio::sync::mpsc;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -134,6 +140,42 @@ enum Command {
     },
     /// Run the Model Context Protocol (MCP) server over stdio
     Mcp,
+    /// Run in the background, auto-detecting meetings via microphone activity.
+    /// Fires a desktop notification when a meeting starts and (optionally)
+    /// records it automatically, stopping the recording when the meeting ends.
+    ///
+    /// Detection works by watching whether a microphone is in use by another
+    /// process (e.g. Zoom or Google Meet opening the mic on join) — not by
+    /// listening to audio levels — so casual talking never triggers it.
+    Watch {
+        #[structopt(
+            long = "no-auto-record",
+            help = "Only fire a desktop notification when a meeting is detected; don't record"
+        )]
+        no_auto_record: bool,
+        #[structopt(
+            long = "no-transcribe",
+            help = "Skip transcription after an auto-recorded meeting"
+        )]
+        no_transcribe: bool,
+        #[structopt(
+            long = "min-silence-seconds",
+            help = "Fallback: seconds of silence to auto-stop a meeting recording if the mic-release signal is unavailable"
+        )]
+        min_silence_seconds: Option<u32>,
+        #[structopt(
+            long = "device",
+            help = "Input device / source name (Linux). On macOS all input devices are monitored"
+        )]
+        device: Option<String>,
+        #[structopt(long = "verbose", help = "Verbose logging from the watcher")]
+        verbose: bool,
+        #[structopt(
+            long = "once",
+            help = "Detect and (optionally) record a single meeting, then exit"
+        )]
+        once: bool,
+    },
     /// Run knowledge extraction on an existing recording
     Enrich {
         #[structopt(help = "Recording directory name to enrich")]
@@ -562,6 +604,24 @@ async fn main() -> Result<()> {
                 Command::Mcp => {
                     // Run MCP server on stdio
                     run_mcp_server().await
+                }
+                Command::Watch {
+                    no_auto_record,
+                    no_transcribe,
+                    min_silence_seconds,
+                    device,
+                    verbose,
+                    once,
+                } => {
+                    run_watch(
+                        no_auto_record,
+                        no_transcribe,
+                        min_silence_seconds,
+                        device,
+                        verbose,
+                        once,
+                    )
+                    .await
                 }
                 Command::Enrich { directory_name, enrichment_provider, enrichment_api_key, enrichment_model } => {
                     println!("🧠 Running knowledge extraction on: {}", directory_name);
@@ -1088,5 +1148,276 @@ fn apply_enrichment_overrides(
             }
         }
     }
+    Ok(())
+}
+
+/// Handle to a running meeting-watcher thread.
+struct WatcherHandle {
+    stop: Arc<AtomicBool>,
+    events: mpsc::Receiver<MeetingEvent>,
+    task: tokio::task::JoinHandle<Result<()>>,
+}
+
+fn spawn_watcher(config: MeetingWatcherConfig) -> WatcherHandle {
+    let (event_tx, events) = mpsc::channel::<MeetingEvent>(8);
+    let stop = Arc::new(AtomicBool::new(false));
+    let task = tokio::task::spawn_blocking({
+        let stop = stop.clone();
+        move || run_meeting_watcher(config, event_tx, stop)
+    });
+    WatcherHandle { stop, events, task }
+}
+
+/// The watcher's event channel closed: join the thread and surface why.
+async fn watcher_exit_error(watcher: &mut WatcherHandle) -> anyhow::Error {
+    match (&mut watcher.task).await {
+        Ok(Ok(())) => anyhow::anyhow!("meeting watcher exited unexpectedly"),
+        Ok(Err(e)) => e,
+        Err(e) => anyhow::anyhow!("meeting watcher task panicked: {e}"),
+    }
+}
+
+/// Background meeting watcher (`scriba watch`).
+///
+/// Detects the start of a meeting by watching whether a microphone is in use
+/// by another process (Zoom/Meet grab the mic on join). Fires a desktop
+/// notification, and — when auto-record is on — records the meeting.
+///
+/// Where the OS attributes mic use per process (macOS 14+, PulseAudio/
+/// PipeWire), the watcher keeps running during the recording with Scriba's own
+/// capture excluded, and the recording is stopped the moment the meeting app
+/// releases the mic; the silence timeout is only a fallback net. On older
+/// macOS the watcher can't tell Scriba's capture from the meeting's, so it is
+/// paused while recording and the silence timeout is the stop mechanism.
+async fn run_watch(
+    no_auto_record: bool,
+    no_transcribe: bool,
+    min_silence_seconds: Option<u32>,
+    device: Option<String>,
+    verbose: bool,
+    once: bool,
+) -> Result<()> {
+    let mut config = ScribaConfig::load()?;
+
+    // Apply CLI overrides to the meeting detection config (not persisted).
+    let md = &mut config.meeting_detection;
+    if no_auto_record {
+        md.auto_record = false;
+    }
+    if let Some(s) = min_silence_seconds {
+        md.min_silence_seconds = s;
+    }
+    if device.is_some() {
+        md.input_device = device;
+    }
+
+    if !config.meeting_detection.enabled {
+        eprintln!(
+            "Meeting detection is disabled in config. Enable it with `meeting_detection.enabled = true` in {}.",
+            ScribaConfig::config_path()?.display()
+        );
+        return Ok(());
+    }
+
+    let md = config.meeting_detection.clone();
+    let auto_record = md.auto_record;
+    let silence_fallback = Duration::from_secs(md.min_silence_seconds as u64);
+    let exclude_self = watcher_excludes_self();
+
+    println!("👀 Scriba meeting watcher is running...");
+    println!("   Detection watches whether another process is using a microphone.");
+    if auto_record && !exclude_self {
+        println!(
+            "   Note: this system can't attribute mic use per process, so recordings stop after {}s of silence instead of on mic release.",
+            md.min_silence_seconds
+        );
+    }
+    println!("   Press Ctrl+C to stop.");
+    if verbose {
+        println!(
+            "   auto_record={} exclude_self={} silence_fallback={}s",
+            auto_record, exclude_self, md.min_silence_seconds
+        );
+    }
+
+    let watcher_cfg = MeetingWatcherConfig {
+        input_device: md.input_device.clone(),
+        verbose,
+    };
+    let mut watcher = spawn_watcher(watcher_cfg.clone());
+
+    // Set when an auto-recording stopped (silence fallback) before the meeting
+    // app released the mic: the next MeetingEnded should still notify.
+    let mut pending_end_notify = false;
+
+    'outer: loop {
+        // Phase 1: wait for a meeting to start.
+        loop {
+            tokio::select! {
+                biased;
+                _ = tokio::signal::ctrl_c() => break 'outer,
+                evt = watcher.events.recv() => match evt {
+                    Some(MeetingEvent::MeetingStarted) => break,
+                    Some(MeetingEvent::MeetingEnded) => {
+                        if pending_end_notify {
+                            pending_end_notify = false;
+                            notify_event(MeetingEvent::MeetingEnded, true);
+                            if once {
+                                break 'outer;
+                            }
+                        }
+                    }
+                    None => return Err(watcher_exit_error(&mut watcher).await),
+                },
+            }
+        }
+
+        notify_event(MeetingEvent::MeetingStarted, auto_record);
+
+        // Notification-only mode: wait for the end, notify, loop.
+        if !auto_record {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = tokio::signal::ctrl_c() => break 'outer,
+                    evt = watcher.events.recv() => match evt {
+                        Some(MeetingEvent::MeetingEnded) => {
+                            notify_event(MeetingEvent::MeetingEnded, false);
+                            break;
+                        }
+                        Some(_) => {}
+                        None => return Err(watcher_exit_error(&mut watcher).await),
+                    },
+                }
+            }
+            if once {
+                break;
+            }
+            continue;
+        }
+
+        if !exclude_self {
+            // Our own capture would read as "mic in use": pause the watcher
+            // for the duration of the recording. The thread exits within one
+            // poll interval; no need to join it here.
+            watcher.stop.store(true, Ordering::Relaxed);
+        }
+
+        if verbose {
+            if exclude_self {
+                println!(
+                    "🎙️  Recording meeting (stops on mic release; silence fallback {}s)...",
+                    md.min_silence_seconds
+                );
+            } else {
+                println!(
+                    "🎙️  Recording meeting (auto-stop after {}s of silence)...",
+                    md.min_silence_seconds
+                );
+            }
+        }
+
+        let (stop_tx, stop_rx) = mpsc::channel::<()>(1);
+        let transcription_mode = if no_transcribe {
+            None
+        } else {
+            Some(config.transcription.clone())
+        };
+        let mut workflow = WorkflowManager::with_config(config.clone())?;
+        // The recording must run on its own task: `record_audio` blocks its
+        // task for the whole recording, so polling it inline would starve the
+        // watcher-event and Ctrl+C select arms.
+        let mut rec_task = tokio::spawn(async move {
+            workflow
+                .record_meeting(
+                    Some("Meeting".to_string()),
+                    Some(CompressionSettings::speech_optimized()),
+                    !no_transcribe,
+                    transcription_mode,
+                    stop_rx,
+                    Some(silence_fallback),
+                )
+                .await
+        });
+
+        let mut meeting_ended = false;
+        let mut interrupted = false;
+        let mut watcher_alive = exclude_self;
+        let rec_result = loop {
+            tokio::select! {
+                biased;
+                _ = tokio::signal::ctrl_c() => {
+                    if interrupted {
+                        eprintln!("Aborting.");
+                        std::process::exit(130);
+                    }
+                    interrupted = true;
+                    let _ = stop_tx.try_send(());
+                    println!("\n🛑 Stopping recording (Ctrl+C again to abort processing)...");
+                }
+                res = &mut rec_task => break res,
+                evt = watcher.events.recv(), if watcher_alive && !meeting_ended => match evt {
+                    Some(MeetingEvent::MeetingEnded) => {
+                        meeting_ended = true;
+                        if verbose {
+                            println!("📴 Meeting app released the mic — stopping recording.");
+                        }
+                        let _ = stop_tx.try_send(());
+                    }
+                    Some(_) => {}
+                    None => watcher_alive = false,
+                },
+            }
+        };
+
+        match rec_result {
+            Ok(Ok(_)) => {
+                if verbose {
+                    println!("✅ Meeting recording finished.");
+                }
+            }
+            Ok(Err(e)) => eprintln!("⚠️  Meeting recording failed: {e}"),
+            Err(e) => eprintln!("⚠️  Meeting recording task panicked: {e}"),
+        }
+
+        if interrupted {
+            break;
+        }
+
+        if exclude_self {
+            if meeting_ended {
+                notify_event(MeetingEvent::MeetingEnded, true);
+                if once {
+                    break;
+                }
+            } else {
+                // The silence fallback (or an error) ended the recording while
+                // the meeting app still holds the mic; notify once it lets go.
+                pending_end_notify = true;
+            }
+        } else {
+            // The watcher was paused, so poll for the mic release ourselves,
+            // giving our own just-closed stream a moment to disappear.
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            loop {
+                if !mic_in_use_by_others().unwrap_or(false) {
+                    break;
+                }
+                tokio::select! {
+                    biased;
+                    _ = tokio::signal::ctrl_c() => break 'outer,
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                }
+            }
+            notify_event(MeetingEvent::MeetingEnded, true);
+            if once {
+                break;
+            }
+            watcher = spawn_watcher(watcher_cfg.clone());
+        }
+    }
+
+    println!("\n👋 Stopping meeting watcher...");
+    watcher.stop.store(true, Ordering::Relaxed);
     Ok(())
 }

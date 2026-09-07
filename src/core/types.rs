@@ -27,6 +27,13 @@ pub enum RecordingMode {
         level_tx: tokio::sync::mpsc::Sender<f32>,
         silence_timeout: Option<Duration>,
     },
+    /// Meeting mode: stopped via `stop_rx` when the meeting watcher sees the
+    /// meeting app release the mic, with `silence_timeout` as a fallback net.
+    /// Used by `scriba watch` when a meeting is detected.
+    Meeting {
+        stop_rx: tokio::sync::mpsc::Receiver<()>,
+        silence_timeout: Option<Duration>,
+    },
 }
 
 /// Represents a managed recording with metadata and file operations.
