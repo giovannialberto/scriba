@@ -284,58 +284,6 @@ impl Dashboard {
         Ok(())
     }
 
-    pub(super) fn stop_progress_animation(&mut self) {
-        self.progress_animation = None;
-    }
-
-    pub(super) fn update_progress_message(&mut self) {
-        if let Some(base_msg) = &self.progress_animation {
-            let spinners = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-            let spinner = spinners[self.progress_frame % spinners.len()];
-
-            // If recording is active, show volume level instead of progress bar
-            if self.recording_task.is_some() {
-                let volume_bar = self.create_volume_bar(self.current_volume_level);
-                self.message = format!("{} {} [{}]", spinner, base_msg, volume_bar);
-            } else {
-                // Regular progress bar for transcription
-                let bar_width = 20;
-                let progress_pos = (self.progress_frame / 2) % (bar_width * 2);
-                let mut bar = vec!["▱"; bar_width];
-
-                if progress_pos < bar_width {
-                    for i in 0..=progress_pos.min(bar_width - 1) {
-                        bar[i] = "▰";
-                    }
-                } else {
-                    let reverse_pos = (bar_width * 2 - 1) - progress_pos;
-                    for i in reverse_pos..bar_width {
-                        bar[i] = "▰";
-                    }
-                }
-
-                let bar_str = bar.join("");
-                self.message = format!("{} {} [{}]", spinner, base_msg, bar_str);
-            }
-
-            self.progress_frame += 1;
-        }
-    }
-
-    pub(super) fn create_volume_bar(&self, level: f32) -> String {
-        let bar_width = 20;
-        // Scale the level (0.0 to 1.0) to bar width and apply some amplification for visibility
-        let scaled_level = (level * 50.0).min(1.0); // Amplify for visibility
-        let filled_chars = (scaled_level * bar_width as f32) as usize;
-
-        let mut bar = vec!["▱"; bar_width];
-        for i in 0..filled_chars.min(bar_width) {
-            bar[i] = "▰";
-        }
-
-        format!("{}|{}%", bar.join(""), (scaled_level * 100.0) as u8)
-    }
-
     /// Whether audio is being captured right now (manual or meeting). Only
     /// capture gets the strip; post-capture work is indicated on the
     /// recording's own row instead.

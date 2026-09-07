@@ -57,7 +57,6 @@ pub struct Dashboard {
     pub(super) delete_candidate: Option<Recording>,
     pub(super) audio_player: Option<AudioPlayer>, // Native rodio playback (replaces subprocess players)
     pub(super) last_transcribe_warning: Option<usize>, // Track which recording showed overwrite warning
-    pub(super) progress_animation: Option<String>,     // Base message for progress animation
     pub(super) progress_frame: usize,                  // Animation frame counter
     pub(super) active_transcription: Option<ActiveTranscription>, // Currently running transcription
     pub(super) transcription_queue: VecDeque<PendingTranscription>, // FIFO queue of pending transcriptions
@@ -190,7 +189,6 @@ impl Dashboard {
             delete_candidate: None,
             audio_player: None,
             last_transcribe_warning: None,
-            progress_animation: None,
             progress_frame: 0,
             active_transcription: None,
             transcription_queue: VecDeque::new(),
@@ -441,12 +439,10 @@ impl Dashboard {
                             }
                         }
                         Ok(Err(err)) => {
-                            self.stop_progress_animation();
                             self.message = format!("Recording failed: {}", err);
                             self.show_message = true;
                         }
                         Err(_) => {
-                            self.stop_progress_animation();
                             self.message = "Recording task failed.".to_string();
                             self.show_message = true;
                         }
@@ -616,11 +612,6 @@ impl Dashboard {
                         }
                     }
                 }
-            }
-
-            // Update progress animation if active (throttled)
-            if anim_tick && self.progress_animation.is_some() {
-                self.update_progress_message();
             }
 
             // Tick progress frame for inline transcription/update/recording animation (throttled)
@@ -832,7 +823,6 @@ impl Dashboard {
             // Special-case: allow confirming re-transcribe overwrite with T while message is visible
             if matches!(key_code, KeyCode::Char('t') | KeyCode::Char('T'))
                 && self.last_transcribe_warning.is_some()
-                && self.progress_animation.is_none()
             {
                 // Dismiss the warning and trigger the action
                 self.show_message = false;
@@ -840,8 +830,7 @@ impl Dashboard {
                 return Ok(DashboardAction::TranscribeSelected);
             }
 
-            // Don't close message if progress animation is active
-            if self.progress_animation.is_none() && matches!(key_code, KeyCode::Esc) {
+            if matches!(key_code, KeyCode::Esc) {
                 // Only Esc key closes the message popup (consistent behavior)
                 self.show_message = false;
                 self.message.clear();
