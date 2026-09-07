@@ -428,18 +428,21 @@ impl Dashboard {
     /// aligned Ctrl+R hint.
     pub(super) fn recording_strip_line(&self, width: usize, margin: &str) -> Line<'static> {
         let info = self.recording_guard.snapshot();
-        let (kind_label, source, started) = match &info {
+        let (kind_label, source, elapsed) = match &info {
             Some(i) => (
                 match i.kind {
                     RecordingKind::Manual => "Recording",
                     RecordingKind::Meeting => "Recording meeting",
                 },
                 i.source.clone(),
-                Some(i.started),
+                i.elapsed(),
             ),
-            None => ("Recording", None, self.recording_start_instant),
+            None => (
+                "Recording",
+                None,
+                self.recording_start_instant.map(|t| t.elapsed()).unwrap_or_default(),
+            ),
         };
-        let elapsed = started.map(|t| t.elapsed()).unwrap_or_default();
         let elapsed_str = format!("{:02}:{:02}", elapsed.as_secs() / 60, elapsed.as_secs() % 60);
         let dim = Style::default().fg(Color::DarkGray);
         let bold = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);

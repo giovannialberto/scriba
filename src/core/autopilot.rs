@@ -25,8 +25,8 @@ use tokio::sync::{Notify, mpsc, watch};
 use super::audio::CompressionSettings;
 use super::config::ScribaConfig;
 use super::meeting::{
-    MeetingEvent, MeetingWatcherConfig, capturing_processes, meeting_signal, notify_event,
-    run_meeting_watcher, watcher_excludes_self,
+    MeetingEvent, MeetingWatcherConfig, capturing_processes, friendly_process_name,
+    meeting_signal, notify_event, run_meeting_watcher, watcher_excludes_self,
 };
 use super::notify;
 use super::workflow::WorkflowManager;
@@ -55,9 +55,20 @@ pub struct RecordingInfo {
     /// App that triggered a meeting recording (e.g. "Arc"), when known.
     pub source: Option<String>,
     pub started: Instant,
+    /// When capture stopped (None while still recording). Freezes `elapsed`.
+    pub stopped: Option<Instant>,
     /// Recording directory once the captured audio has been saved (capture is
     /// over; finalization is running).
     pub directory: Option<String>,
+}
+
+impl RecordingInfo {
+    /// Capture duration so far; stops counting once capture ends.
+    pub fn elapsed(&self) -> Duration {
+        self.stopped
+            .unwrap_or_else(Instant::now)
+            .saturating_duration_since(self.started)
+    }
 }
 
 /// Shared "what is being recorded right now" between the autopilot and the
@@ -84,6 +95,7 @@ impl RecordingStatus {
             phase: RecordingPhase::Recording,
             source,
             started: Instant::now(),
+            stopped: None,
             directory: None,
         });
         self.set_level(0.0);
@@ -96,12 +108,18 @@ impl RecordingStatus {
         if let Some(info) = self.current.lock().unwrap().as_mut() {
             info.directory = Some(directory);
             info.phase = RecordingPhase::Processing;
+            if info.stopped.is_none() {
+                info.stopped = Some(Instant::now());
+            }
         }
     }
 
     pub fn set_phase(&self, phase: RecordingPhase) {
         if let Some(info) = self.current.lock().unwrap().as_mut() {
             info.phase = phase;
+            if phase == RecordingPhase::Processing && info.stopped.is_none() {
+                info.stopped = Some(Instant::now());
+            }
         }
     }
 
@@ -401,11 +419,17 @@ pub async fn run_autopilot(
             }
         }
 
-        // Which app triggered the detection (dialog / notification wording).
+        // Which app triggered the detection, as a display name ("Arc", not
+        // "company.thebrowser.browser.helper") for the panel, notifications
+        // and the TUI indicator.
         let trigger = capturing_processes(&watcher_cfg)
             .ok()
             .filter(|p| !p.is_empty())
-            .map(|p| p.join(", "));
+            .map(|p| {
+                let mut names: Vec<String> = p.iter().map(|n| friendly_process_name(n)).collect();
+                names.dedup();
+                names.join(", ")
+            });
 
         // Notification-only mode: announce start and end, never record.
         if !auto_record {

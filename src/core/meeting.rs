@@ -93,6 +93,14 @@ const BUILTIN_IGNORED: &[&str] = &[
     "com.apple.assistant",
 ];
 
+/// Human-friendly display name for a process identity reported by the
+/// watcher: bundle identifiers resolve to the app's name ("Arc"), with helper
+/// bundles ("….browser.helper") walked up to their host app. Anything that
+/// isn't a bundle id is returned unchanged. Cached; resolution may shell out.
+pub fn friendly_process_name(raw: &str) -> String {
+    platform::friendly_process_name(raw)
+}
+
 /// Case-insensitive substring match of a process name against the built-in
 /// and user-configured ignore lists.
 fn is_ignored(name: &str, ignored: &[String]) -> bool {
@@ -389,6 +397,52 @@ mod platform {
                 Ok(Vec::new())
             }
         }
+    }
+
+    /// Resolve a bundle id to the app's display name via Spotlight, preferring
+    /// the shallowest match so helper bundles report their host app
+    /// ("company.thebrowser.browser.helper" -> "Arc"). Cached per input.
+    pub fn friendly_process_name(raw: &str) -> String {
+        static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Some(name) = cache.lock().unwrap().get(raw) {
+            return name.clone();
+        }
+        let name = resolve_bundle_display_name(raw).unwrap_or_else(|| raw.to_string());
+        cache.lock().unwrap().insert(raw.to_string(), name.clone());
+        name
+    }
+
+    fn resolve_bundle_display_name(raw: &str) -> Option<String> {
+        if !raw.contains('.') || raw.contains(' ') {
+            return None;
+        }
+        let parts: Vec<&str> = raw.split('.').collect();
+        let mut best = None;
+        let mut depth = parts.len();
+        while depth >= 2 {
+            if let Some(name) = app_name_for_bundle_id(&parts[..depth].join(".")) {
+                best = Some(name);
+            }
+            depth -= 1;
+        }
+        best
+    }
+
+    /// `mdfind` lookup of an application bundle by identifier (case-insensitive).
+    fn app_name_for_bundle_id(bundle_id: &str) -> Option<String> {
+        let query = format!(
+            "kMDItemCFBundleIdentifier == '{}'c",
+            bundle_id.replace('\'', "")
+        );
+        let output = std::process::Command::new("mdfind").arg(query).output().ok()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let app_path = stdout.lines().find(|l| l.ends_with(".app"))?;
+        let stem = std::path::Path::new(app_path)
+            .file_stem()?
+            .to_string_lossy()
+            .to_string();
+        if stem.is_empty() { None } else { Some(stem) }
     }
 
     /// Human-readable name for a capturing process: bundle ID when the HAL
@@ -693,6 +747,11 @@ mod platform {
         "PulseAudio/PipeWire source-outputs (excluding Scriba)"
     }
 
+    /// pactl already reports `application.name` (e.g. "ZOOM VoiceEngine").
+    pub fn friendly_process_name(raw: &str) -> String {
+        raw.to_string()
+    }
+
     /// Names of processes (other than us, not ignored) capturing from a
     /// non-monitor source. When `name_filter` is set, only count sources
     /// whose name contains it.
@@ -919,6 +978,10 @@ mod platform {
 
     pub fn backend_description() -> &'static str {
         "unsupported platform"
+    }
+
+    pub fn friendly_process_name(raw: &str) -> String {
+        raw.to_string()
     }
 
     pub fn capturing_others(_filter: &Option<String>, _ignored: &[String]) -> Result<Vec<String>> {
