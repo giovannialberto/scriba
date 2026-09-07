@@ -29,7 +29,20 @@ Run entirely **offline** with local STT models (Parakeet, Whisper, SenseVoice) +
 
 **Requirements:** FFmpeg and (optionally) Ollama for Private mode.
 
-### macOS
+### Install
+
+macOS (Apple Silicon and Intel) and Linux (x86_64):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/giovannialberto/scriba/main/install.sh | sh
+```
+
+The script downloads the latest release, verifies its checksum, and installs `scriba` into `~/.local/bin` — no sudo. Set `SCRIBA_INSTALL_DIR` to change the location or `SCRIBA_VERSION` to pin a release. Scriba updates itself from the dashboard afterwards.
+
+FFmpeg: `brew install ffmpeg` on macOS; `sudo apt install ffmpeg` (Debian/Ubuntu), `sudo dnf install ffmpeg` (Fedora/RHEL), or `sudo pacman -S ffmpeg` (Arch) on Linux.
+
+<details>
+<summary>Alternatives: Homebrew, direct download</summary>
 
 ```bash
 brew install ffmpeg
@@ -38,19 +51,9 @@ brew trust --tap giovannialberto/scriba   # Homebrew 6+: allow formulae from thi
 brew install scriba
 ```
 
-### Linux
+Or grab a binary directly from [Releases](https://github.com/giovannialberto/scriba/releases).
 
-```bash
-# Install dependencies (Debian/Ubuntu)
-sudo apt install ffmpeg libasound2-dev
-
-# Install scriba
-curl -fsSL https://raw.githubusercontent.com/giovannialberto/scriba/main/install.sh | sh
-```
-
-For Fedora/RHEL: `sudo dnf install ffmpeg alsa-lib-devel`. For Arch: `sudo pacman -S ffmpeg alsa-lib`.
-
-You can also grab a binary directly from [Releases](https://github.com/giovannialberto/scriba/releases).
+</details>
 
 ### Run
 

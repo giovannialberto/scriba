@@ -2121,8 +2121,15 @@ async fn perform_update(version: &str) -> Result<String, String> {
         format!("v{}", version)
     };
 
-    // Check if installed via Homebrew
-    if cfg!(target_os = "macos") {
+    // Update through Homebrew only when this very binary was installed by it
+    // (script/direct installs self-replace below, even if brew also has a
+    // copy lying around).
+    let running_from_homebrew = std::env::current_exe()
+        .ok()
+        .and_then(|p| std::fs::canonicalize(p).ok())
+        .map(|p| p.to_string_lossy().contains("/Cellar/scriba/"))
+        .unwrap_or(false);
+    if cfg!(target_os = "macos") && running_from_homebrew {
         let brew_check = tokio::process::Command::new("brew")
             .args(["list", "scriba"])
             .output()
@@ -2198,6 +2205,33 @@ async fn perform_update(version: &str) -> Result<String, String> {
         .bytes()
         .await
         .map_err(|e| format!("Download failed: {}", e))?;
+
+    // Verify against the published checksum before touching the binary
+    // (same guarantee the install script gives).
+    let expected = client
+        .get(format!("{}.sha256", url))
+        .header("User-Agent", "scriba")
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+        .map_err(|e| format!("Checksum download failed: {}", e))?
+        .text()
+        .await
+        .map_err(|e| format!("Checksum download failed: {}", e))?;
+    let expected = expected.split_whitespace().next().unwrap_or("").to_lowercase();
+    let actual = {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>()
+    };
+    if expected.is_empty() || expected != actual {
+        return Err(format!(
+            "Checksum mismatch for {} (expected {}, got {})",
+            version_tag, expected, actual
+        ));
+    }
 
     // Write to temp file, then replace current binary
     let current_exe = std::env::current_exe().map_err(|e| e.to_string())?;
