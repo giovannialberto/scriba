@@ -244,7 +244,7 @@ pub struct MeetingDetectionConfig {
 }
 
 fn default_confirm_timeout() -> u32 {
-    30
+    15
 }
 
 fn default_min_silence() -> u32 {
