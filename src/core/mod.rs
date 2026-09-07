@@ -23,7 +23,7 @@ pub mod workflow;
 
 // Re-export commonly used types for convenience
 pub use audio::{AudioEncoder, AudioFormat, CompressionSettings, merge_wav_files};
-pub use autopilot::{run_autopilot, spawn_autopilot, AutopilotHandle, AutopilotOptions, RecordingGuard};
+pub use autopilot::{run_autopilot, spawn_autopilot, AutopilotHandle, AutopilotOptions, RecordingGuard, RecordingInfo, RecordingKind, RecordingPhase, RecordingStatus};
 pub use loopback::{detect_loopback_sources, start_loopback_capture};
 pub use playback::AudioPlayer;
 #[allow(deprecated)]

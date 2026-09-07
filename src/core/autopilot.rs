@@ -17,10 +17,10 @@
 //! recording while an auto-recording runs.
 
 use anyhow::Result;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
-use tokio::sync::{mpsc, watch};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tokio::sync::{Notify, mpsc, watch};
 
 use super::audio::CompressionSettings;
 use super::config::ScribaConfig;
@@ -31,9 +31,105 @@ use super::meeting::{
 use super::notify;
 use super::workflow::WorkflowManager;
 
-/// True while any Scriba recording (manual or automatic) is in progress.
-/// Shared between the autopilot and the TUI so the two never capture at once.
-pub type RecordingGuard = Arc<AtomicBool>;
+/// What kind of recording is in progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordingKind {
+    Manual,
+    Meeting,
+}
+
+/// Where the recording is in its lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordingPhase {
+    /// Audio is being captured.
+    Recording,
+    /// Capture stopped; encoding/transcription/enrichment in progress.
+    Processing,
+}
+
+/// Snapshot of the recording in progress.
+#[derive(Debug, Clone)]
+pub struct RecordingInfo {
+    pub kind: RecordingKind,
+    pub phase: RecordingPhase,
+    /// App that triggered a meeting recording (e.g. "Arc"), when known.
+    pub source: Option<String>,
+    pub started: Instant,
+}
+
+/// Shared "what is being recorded right now" between the autopilot and the
+/// TUI: a mutual-exclusion guard (never two captures at once) plus the state
+/// the TUI needs for a live, non-blocking recording indicator.
+#[derive(Default)]
+pub struct RecordingStatus {
+    current: Mutex<Option<RecordingInfo>>,
+    /// Latest mic level (0.0–1.0), stored as f32 bits.
+    level: AtomicU32,
+    stop: Notify,
+}
+
+impl RecordingStatus {
+    /// Claim the recording slot. Returns false if a recording is already in
+    /// progress.
+    pub fn try_begin(&self, kind: RecordingKind, source: Option<String>) -> bool {
+        let mut current = self.current.lock().unwrap();
+        if current.is_some() {
+            return false;
+        }
+        *current = Some(RecordingInfo {
+            kind,
+            phase: RecordingPhase::Recording,
+            source,
+            started: Instant::now(),
+        });
+        self.set_level(0.0);
+        true
+    }
+
+    pub fn set_phase(&self, phase: RecordingPhase) {
+        if let Some(info) = self.current.lock().unwrap().as_mut() {
+            info.phase = phase;
+        }
+    }
+
+    /// Release the slot.
+    pub fn end(&self) {
+        *self.current.lock().unwrap() = None;
+        self.set_level(0.0);
+    }
+
+    pub fn snapshot(&self) -> Option<RecordingInfo> {
+        self.current.lock().unwrap().clone()
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.current.lock().unwrap().is_some()
+    }
+
+    pub fn set_level(&self, level: f32) {
+        self.level.store(level.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn level(&self) -> f32 {
+        f32::from_bits(self.level.load(Ordering::Relaxed))
+    }
+
+    /// Ask whoever owns the current recording to stop it (the TUI's Ctrl+R
+    /// while a meeting is being auto-recorded). Only wakes a live waiter, so
+    /// a request with nothing recording is a no-op rather than a stale token.
+    pub fn request_stop(&self) {
+        self.stop.notify_waiters();
+    }
+
+    /// Resolves when [`RecordingStatus::request_stop`] is called while
+    /// awaiting.
+    pub async fn stop_requested(&self) {
+        self.stop.notified().await;
+    }
+}
+
+/// Shared handle to the [`RecordingStatus`].
+pub type RecordingGuard = Arc<RecordingStatus>;
 
 /// Runtime options for the autopilot (config supplies the detection settings).
 #[derive(Debug, Clone)]
@@ -351,9 +447,7 @@ pub async fn run_autopilot(
         // A manual recording is already running: never double-capture.
         let decision = match decision {
             MeetingDecision::Record
-                if recording_guard
-                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_err() =>
+                if !recording_guard.try_begin(RecordingKind::Meeting, trigger.clone()) =>
             {
                 if verbose {
                     say!(
@@ -420,7 +514,7 @@ pub async fn run_autopilot(
         let workflow = match WorkflowManager::with_config(config.clone()) {
             Ok(w) => w,
             Err(e) => {
-                recording_guard.store(false, Ordering::SeqCst);
+                recording_guard.end();
                 report_issue(quiet, &format!("Meeting recording could not start: {e}"));
                 if !wait_for_meeting_end(&mut watcher, &mut shutdown, quiet).await? {
                     break;
@@ -433,6 +527,14 @@ pub async fn run_autopilot(
         // The recording must run on its own task: `record_audio` blocks its
         // task for the whole recording, so polling it inline would starve the
         // watcher-event and shutdown select arms.
+        // Feed live mic levels to the shared status for the TUI indicator.
+        let (level_tx, mut level_rx) = mpsc::channel::<f32>(64);
+        let level_sink = recording_guard.clone();
+        tokio::spawn(async move {
+            while let Some(level) = level_rx.recv().await {
+                level_sink.set_level(level);
+            }
+        });
         let rec_verbose = !quiet;
         let mut rec_task = tokio::spawn(async move {
             workflow
@@ -442,6 +544,7 @@ pub async fn run_autopilot(
                     transcribe,
                     transcription_mode,
                     stop_rx,
+                    Some(level_tx),
                     silence_net,
                     rec_verbose,
                 )
@@ -450,19 +553,29 @@ pub async fn run_autopilot(
 
         let mut meeting_ended = false;
         let mut interrupted = false;
+        let mut user_stopped = false;
         let mut watcher_alive = exclude_self;
         let rec_result = loop {
             tokio::select! {
                 biased;
                 _ = wait_shutdown(&mut shutdown), if !interrupted => {
                     interrupted = true;
+                    recording_guard.set_phase(RecordingPhase::Processing);
                     let _ = stop_tx.try_send(());
                     say!("🛑 Stopping meeting recording...");
                 }
                 res = &mut rec_task => break res,
+                _ = recording_guard.stop_requested(), if !user_stopped && !meeting_ended => {
+                    // Stopped from the TUI (Ctrl+R); the meeting itself may
+                    // go on, so the end notification waits for the mic release.
+                    user_stopped = true;
+                    recording_guard.set_phase(RecordingPhase::Processing);
+                    let _ = stop_tx.try_send(());
+                }
                 evt = watcher.events.recv(), if watcher_alive && !meeting_ended => match evt {
                     Some(MeetingEvent::MeetingEnded) => {
                         meeting_ended = true;
+                        recording_guard.set_phase(RecordingPhase::Processing);
                         // Notify right away — finalization (encode, DB,
                         // transcription) can take a while.
                         notify_event(MeetingEvent::MeetingEnded, true, None);
@@ -476,7 +589,7 @@ pub async fn run_autopilot(
                 },
             }
         };
-        recording_guard.store(false, Ordering::SeqCst);
+        recording_guard.end();
 
         match rec_result {
             Ok(Ok(_)) => {

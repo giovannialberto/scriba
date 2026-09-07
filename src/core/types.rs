@@ -33,6 +33,8 @@ pub enum RecordingMode {
     /// inside the TUI (stdout would corrupt the ratatui screen).
     Meeting {
         stop_rx: tokio::sync::mpsc::Receiver<()>,
+        /// Live mic level feed for the TUI's recording indicator.
+        level_tx: Option<tokio::sync::mpsc::Sender<f32>>,
         silence_timeout: Option<Duration>,
         verbose: bool,
     },

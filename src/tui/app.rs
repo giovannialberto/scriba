@@ -1,7 +1,7 @@
 use crate::core::{
     AudioPlayer, AutopilotHandle, AutopilotOptions, EnrichmentMode, RecordingGuard,
-    RecordingResult, ScribaConfig, TranscriptionMode, rebuild_world_from_entities,
-    spawn_autopilot,
+    RecordingKind, RecordingResult, RecordingStatus, ScribaConfig, TranscriptionMode,
+    rebuild_world_from_entities, spawn_autopilot,
 };
 use crate::database::{Database, Entity, Recording, RecordingStats};
 use crate::enrichment::{OllamaClient, WorldContext, WorldData};
@@ -23,7 +23,6 @@ use ratatui::{
 use std::collections::VecDeque;
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -197,7 +196,7 @@ impl Dashboard {
             notification_message: None,
             recording_task: None,
             autopilot: None,
-            recording_guard: Arc::new(AtomicBool::new(false)),
+            recording_guard: Arc::new(RecordingStatus::default()),
             recording_mode: None,
             recording_stop_tx: None,
             recording_level_rx: None,
@@ -341,7 +340,7 @@ impl Dashboard {
         // Wind down the meeting watcher; if it is mid-recording this stops the
         // capture and finalizes it before the process exits.
         if let Some(handle) = self.autopilot.take() {
-            if self.recording_guard.load(AtomicOrdering::SeqCst) {
+            if self.recording_guard.is_active() {
                 println!("⏳ Finishing meeting recording...");
             }
             if let Err(e) = handle.join().await {
@@ -398,7 +397,7 @@ impl Dashboard {
                 if task.is_finished() {
                     let completed_task = self.recording_task.take().unwrap();
                     let recording_mode = self.recording_mode.take();
-                    self.recording_guard.store(false, AtomicOrdering::SeqCst);
+                    self.recording_guard.end();
 
                     // Clean up channels
                     self.recording_stop_tx = None;
@@ -421,10 +420,12 @@ impl Dashboard {
 
                             // Recording completed successfully
                             if let Some(RecordingMode::RecordAndTranscribe) = recording_mode {
-                                // Dismiss recording modal -- transcription runs non-blocking
-                                self.stop_progress_animation();
-                                self.show_message = false;
-                                self.message.clear();
+                                if !auto_stopped {
+                                    self.notification_message = Some((
+                                        "Recording saved \u{2014} transcribing\u{2026}".to_string(),
+                                        40,
+                                    ));
+                                }
                                 let _ = self.load_recordings();
                                 let _ = self.load_stats();
 
@@ -436,9 +437,8 @@ impl Dashboard {
                                 });
                             } else {
                                 // Recording only mode - complete
-                                self.stop_progress_animation();
-                                self.message = "Recording complete.".to_string();
-                                self.show_message = true;
+                                self.notification_message =
+                                    Some(("Recording saved.".to_string(), 40));
                                 // Reload data to show new recording
                                 let _ = self.load_recordings();
                                 let _ = self.load_stats();
@@ -590,7 +590,7 @@ impl Dashboard {
             if self.pending_record_from_chat {
                 self.pending_record_from_chat = false;
                 if self.recording_task.is_some() {
-                    self.notification_message = Some(("Already recording \u{2014} press Esc to stop.".to_string(), 30));
+                    self.notification_message = Some(("Already recording \u{2014} Ctrl+R stops it.".to_string(), 30));
                 } else {
                     let _ = self.execute_record_and_transcribe().await;
                 }
@@ -631,9 +631,34 @@ impl Dashboard {
                 self.update_progress_message();
             }
 
-            // Tick progress frame for inline transcription/update animation (throttled)
-            if anim_tick && (self.active_transcription.is_some() || !self.transcription_queue.is_empty() || self.update_in_progress) {
+            // Tick progress frame for inline transcription/update/recording animation (throttled)
+            if anim_tick
+                && (self.active_transcription.is_some()
+                    || !self.transcription_queue.is_empty()
+                    || self.update_in_progress
+                    || self.recording_indicator_visible())
+            {
                 self.progress_frame = self.progress_frame.wrapping_add(1);
+            }
+
+            // Meeting auto-recordings publish their mic level through the shared
+            // status; sample it into the same waveform manual recordings use.
+            if anim_tick {
+                match self.recording_guard.snapshot() {
+                    Some(info) if info.kind == RecordingKind::Meeting => {
+                        let level = self.recording_guard.level();
+                        self.current_volume_level = level;
+                        if self.volume_history.len() >= 48 {
+                            self.volume_history.pop_front();
+                        }
+                        self.volume_history.push_back(level);
+                    }
+                    None if self.recording_task.is_none() && !self.volume_history.is_empty() => {
+                        self.volume_history.clear();
+                        self.current_volume_level = 0.0;
+                    }
+                    _ => {}
+                }
             }
 
             // Auto-dismiss notification countdown (throttled)
@@ -748,16 +773,6 @@ impl Dashboard {
                 self.message.clear();
                 return Ok(DashboardAction::Continue);
             }
-        }
-
-        // If recording is active and Escape is pressed, stop recording
-        if self.recording_task.is_some() && matches!(key_code, KeyCode::Esc) {
-            // Send stop signal to recording task
-            if let Some(stop_tx) = self.recording_stop_tx.take() {
-                let _ = stop_tx.send(()).await;
-            }
-            // The recording task will handle cleanup and completion
-            return Ok(DashboardAction::Continue);
         }
 
         // Dismiss easter egg on any keypress
@@ -948,7 +963,7 @@ impl Dashboard {
     async fn handle_dashboard_action(&mut self, action: DashboardAction) -> Result<()> {
         match action {
             DashboardAction::RecordAndTranscribe => {
-                self.execute_record_and_transcribe().await?;
+                self.toggle_recording().await?;
             }
             DashboardAction::TranscribeSelected => {
                 self.execute_transcribe_selected().await?;
@@ -959,13 +974,28 @@ impl Dashboard {
     }
 
     fn ui(&mut self, f: &mut Frame) {
+        let full = f.size();
+
+        // Non-blocking recording indicator above every view while a manual or
+        // meeting recording is in progress.
+        let area = if self.recording_indicator_visible() && full.height > 6 {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(2), Constraint::Min(1)])
+                .split(full);
+            self.render_recording_strip(f, chunks[0]);
+            chunks[1]
+        } else {
+            full
+        };
+
         match self.current_view {
-            DashboardView::Main => self.render_main_dashboard(f),
-            DashboardView::Browse => self.render_browse_view(f),
-            DashboardView::Help => self.render_help(f, f.size()),
-            DashboardView::Settings => self.render_settings(f, f.size()),
-            DashboardView::Entities => self.render_entities_view(f, f.size()),
-            DashboardView::Onboarding => self.render_onboarding(f, f.size()),
+            DashboardView::Main => self.render_main_dashboard(f, area),
+            DashboardView::Browse => self.render_browse_view(f, area),
+            DashboardView::Help => self.render_help(f, area),
+            DashboardView::Settings => self.render_settings(f, area),
+            DashboardView::Entities => self.render_entities_view(f, area),
+            DashboardView::Onboarding => self.render_onboarding(f, area),
         }
 
         // Easter egg overlay (renders on top of everything)
@@ -974,13 +1004,8 @@ impl Dashboard {
         }
     }
 
-    fn render_main_dashboard(&mut self, f: &mut Frame) {
-        let size = f.size();
-
-        if self.recording_task.is_some() {
-            self.render_recording_view(f, size);
-            return;
-        }
+    fn render_main_dashboard(&mut self, f: &mut Frame, area: Rect) {
+        let size = area;
 
         if self.show_file_dialog {
             self.render_file_dialog_popup(f, size);
@@ -1145,7 +1170,10 @@ impl Dashboard {
             Span::styled("] Browse  ", Style::default().fg(Color::DarkGray)),
             Span::styled("[", Style::default().fg(Color::DarkGray)),
             Span::styled("Ctrl+R", Style::default().fg(Color::White)),
-            Span::styled("] Record  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                if self.recording_indicator_visible() { "] Stop  " } else { "] Record  " },
+                Style::default().fg(Color::DarkGray),
+            ),
             Span::styled("[", Style::default().fg(Color::DarkGray)),
             Span::styled("?", Style::default().fg(Color::White)),
             Span::styled("] Help ", Style::default().fg(Color::DarkGray)),
@@ -1189,7 +1217,7 @@ impl Dashboard {
             Line::from("SCRIBA HELP"),
             Line::from(""),
             Line::from("Global Shortcuts:"),
-            Line::from("  Ctrl+R     - Record audio (Esc to stop)"),
+            Line::from("  Ctrl+R     - Start / stop recording (manual or meeting)"),
             Line::from("  Tab        - Browse recordings"),
             Line::from("  Ctrl+S     - Settings"),
             Line::from("  Ctrl+W     - World (entities)"),

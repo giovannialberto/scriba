@@ -384,13 +384,6 @@ impl Dashboard {
     }
 
     pub(super) async fn execute_add_external_file(&mut self) -> Result<()> {
-        // Check if already recording (transcription can run concurrently)
-        if self.recording_task.is_some() {
-            self.message = "Recording already in progress".to_string();
-            self.show_message = true;
-            return Ok(());
-        }
-
         // Show file dialog for importing audio file
         self.show_file_dialog = true;
         self.file_dialog_stage = FileDialogStage::FilePath;
@@ -433,13 +426,8 @@ impl Dashboard {
         Ok(())
     }
 
-    pub(super) fn render_browse_view(&mut self, f: &mut Frame) {
-        let size = f.size();
-
-        if self.recording_task.is_some() {
-            self.render_recording_view(f, size);
-            return;
-        }
+    pub(super) fn render_browse_view(&mut self, f: &mut Frame, area: ratatui::layout::Rect) {
+        let size = area;
 
         if self.show_file_dialog {
             self.render_file_dialog_popup(f, size);

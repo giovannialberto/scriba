@@ -1,11 +1,11 @@
 use crate::core::{
-    CompressionSettings, RecordOptions,
-    TranscriptionMode, WorkflowManager, record_audio,
+    CompressionSettings, RecordOptions, RecordingKind, RecordingPhase, TranscriptionMode,
+    WorkflowManager, record_audio,
 };
 use crate::utils::generate_recording_name;
 use anyhow::Result;
 use ratatui::{
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
@@ -125,15 +125,14 @@ impl Dashboard {
     pub(super) async fn execute_record_and_transcribe(&mut self) -> Result<()> {
         // Check if already recording (transcription can run concurrently)
         if self.recording_task.is_some() {
-            self.message = "Recording already in progress".to_string();
-            self.show_message = true;
+            self.notification_message =
+                Some(("Already recording \u{2014} Ctrl+R stops it.".to_string(), 30));
             return Ok(());
         }
 
-        // Show immediate progress animation
-        self.progress_animation = Some("Recording... (Press Esc to stop)".to_string());
+        // Non-blocking: the recording strip above the current view shows
+        // progress; the user keeps navigating.
         self.progress_frame = 0;
-        self.show_message = true;
         self.recording_mode = Some(RecordingMode::RecordAndTranscribe);
         self.recording_start_instant = Some(std::time::Instant::now());
 
@@ -212,21 +211,15 @@ impl Dashboard {
 
     pub(super) async fn start_recording_task(&mut self, recording_name: String) -> Result<()> {
         // Never double-capture: the meeting autopilot may be auto-recording.
-        if self
+        if !self
             .recording_guard
-            .compare_exchange(
-                false,
-                true,
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-            )
-            .is_err()
+            .try_begin(RecordingKind::Manual, None)
         {
             self.recording_mode = None;
-            self.message =
-                "A meeting is being auto-recorded — wait for it to finish before recording manually."
-                    .to_string();
-            self.show_message = true;
+            self.notification_message = Some((
+                "A meeting is being auto-recorded \u{2014} Ctrl+R stops it.".to_string(),
+                40,
+            ));
             return Ok(());
         }
 
@@ -343,113 +336,138 @@ impl Dashboard {
         format!("{}|{}%", bar.join(""), (scaled_level * 100.0) as u8)
     }
 
-    pub(super) fn render_recording_view(&self, f: &mut Frame, area: ratatui::layout::Rect) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(2),  // Header
-                Constraint::Min(6),    // Body
-                Constraint::Length(2),  // Footer
-            ])
-            .split(area);
+    /// Whether a recording (manual or meeting) should be shown in the strip.
+    pub(super) fn recording_indicator_visible(&self) -> bool {
+        self.recording_task.is_some() || self.recording_guard.is_active()
+    }
 
-        // ── Header ──────────────────────────────────────────────────
-        let header_line = Line::from(vec![
-            Span::raw("  "),
-            Span::styled("Recording", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-        ]);
-        f.render_widget(Paragraph::new(header_line), Rect { x: chunks[0].x, y: chunks[0].y, width: chunks[0].width, height: 1 });
-        let sep = "\u{2500}".repeat(chunks[0].width as usize);
+    /// Ctrl+R: start a manual recording, or stop whichever recording (manual
+    /// or meeting) is in progress.
+    pub(super) async fn toggle_recording(&mut self) -> Result<()> {
+        if self.recording_task.is_some() {
+            if let Some(stop_tx) = self.recording_stop_tx.take() {
+                let _ = stop_tx.send(()).await;
+            }
+            return Ok(());
+        }
+        if let Some(info) = self.recording_guard.snapshot()
+            && info.kind == RecordingKind::Meeting
+        {
+            if info.phase == RecordingPhase::Recording {
+                self.recording_guard.request_stop();
+                self.notification_message =
+                    Some(("Stopping meeting recording\u{2026}".to_string(), 30));
+            } else {
+                self.notification_message =
+                    Some(("Meeting recording is being processed.".to_string(), 30));
+            }
+            return Ok(());
+        }
+        self.execute_record_and_transcribe().await
+    }
+
+    /// Non-blocking recording indicator: one content line plus a separator,
+    /// rendered above whichever view is active. Pulsing dot, elapsed time,
+    /// live waveform, and the source app for meeting recordings.
+    pub(super) fn render_recording_strip(&self, f: &mut Frame, area: Rect) {
+        let aligned = Rect {
+            x: area.x + 2,
+            width: area.width.saturating_sub(4),
+            ..area
+        };
+        let info = self.recording_guard.snapshot();
+        let (kind_label, source, phase, started) = match &info {
+            Some(i) => (
+                match i.kind {
+                    RecordingKind::Manual => "Recording",
+                    RecordingKind::Meeting => "Recording meeting",
+                },
+                i.source.clone(),
+                i.phase,
+                Some(i.started),
+            ),
+            None => ("Recording", None, RecordingPhase::Recording, self.recording_start_instant),
+        };
+        let elapsed = started.map(|t| t.elapsed()).unwrap_or_default();
+        let elapsed_str = format!("{:02}:{:02}", elapsed.as_secs() / 60, elapsed.as_secs() % 60);
+        let dim = Style::default().fg(Color::DarkGray);
+        let bold = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
+
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        match phase {
+            RecordingPhase::Recording => {
+                // Pulsing red dot (~1s period at the 100ms animation tick).
+                let dot_on = (self.progress_frame / 5) % 2 == 0;
+                let dot_color = if dot_on { Color::Red } else { Color::Indexed(88) };
+                spans.push(Span::styled("\u{25CF} ", Style::default().fg(dot_color)));
+                spans.push(Span::styled(kind_label, bold));
+                if let Some(src) = &source {
+                    spans.push(Span::styled(format!(" \u{00B7} {src}"), Style::default().fg(ACCENT)));
+                }
+                spans.push(Span::styled(format!("  {elapsed_str}  "), dim));
+                spans.extend(self.waveform_spans(24));
+            }
+            RecordingPhase::Processing => {
+                let spinners = ["\u{280B}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283C}", "\u{2834}", "\u{2826}", "\u{2827}", "\u{2807}", "\u{280F}"];
+                spans.push(Span::styled(
+                    format!("{} ", spinners[self.progress_frame % spinners.len()]),
+                    Style::default().fg(ACCENT),
+                ));
+                spans.push(Span::styled("Processing recording", bold));
+                if let Some(src) = &source {
+                    spans.push(Span::styled(format!(" \u{00B7} {src}"), Style::default().fg(ACCENT)));
+                }
+                spans.push(Span::styled(format!("  {elapsed_str}  transcribing\u{2026}"), dim));
+            }
+        }
+
+        // Right-aligned stop hint while capturing.
+        let hint: Vec<Span<'static>> = if phase == RecordingPhase::Recording {
+            vec![
+                Span::styled("[", dim),
+                Span::styled("Ctrl+R", Style::default().fg(Color::White)),
+                Span::styled("] Stop", dim),
+            ]
+        } else {
+            Vec::new()
+        };
+        let left_width: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+        let right_width: usize = hint.iter().map(|s| s.content.chars().count()).sum();
+        let gap = (aligned.width as usize).saturating_sub(left_width + right_width);
+        spans.push(Span::raw(" ".repeat(gap)));
+        spans.extend(hint);
         f.render_widget(
-            Paragraph::new(sep).style(Style::default().fg(Color::Indexed(237))),
-            Rect { x: chunks[0].x, y: chunks[0].y + 1, width: chunks[0].width, height: 1 },
+            Paragraph::new(Line::from(spans)),
+            Rect { x: aligned.x, y: aligned.y, width: aligned.width, height: 1 },
         );
+        if area.height > 1 {
+            let sep = "\u{2500}".repeat(aligned.width as usize);
+            f.render_widget(
+                Paragraph::new(sep).style(Style::default().fg(Color::Indexed(237))),
+                Rect { x: aligned.x, y: aligned.y + 1, width: aligned.width, height: 1 },
+            );
+        }
+    }
 
-        // ── Body (vertically centered) ─────────────────────────────
-        let body = chunks[1];
-        // 3 lines: spinner, blank, waveform
-        let content_height: u16 = 3;
-        let v_offset = body.height.saturating_sub(content_height) / 2;
-
-        // Spinner + elapsed time
-        let spinners = ["\u{280B}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283C}", "\u{2834}", "\u{2826}", "\u{2827}", "\u{2807}", "\u{280F}"];
-        let spinner = spinners[self.progress_frame % spinners.len()];
-        let elapsed = self.recording_start_instant
-            .map(|t| t.elapsed())
-            .unwrap_or_default();
-        let mins = elapsed.as_secs() / 60;
-        let secs = elapsed.as_secs() % 60;
-        let elapsed_str = format!("{}m {:02}s", mins, secs);
-
-        let spinner_line = Line::from(vec![
-            Span::styled(format!("{}  Recording \u{00B7} {}", spinner, elapsed_str), Style::default().fg(Color::White)),
-        ]);
-        let spinner_y = body.y + v_offset;
-        f.render_widget(
-            Paragraph::new(spinner_line).alignment(Alignment::Center),
-            Rect { x: body.x, y: spinner_y, width: body.width, height: 1 },
-        );
-
-        // Scrolling waveform using block-height characters
+    /// Recent mic levels as block-height characters, newest on the right.
+    fn waveform_spans(&self, width: usize) -> Vec<Span<'static>> {
         let wave_chars = [' ', '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}'];
-        let wave_width: usize = 40;
-
-        let mut spans: Vec<Span> = Vec::with_capacity(wave_width);
         let hist_len = self.volume_history.len();
-        for i in 0..wave_width {
-            let level = if i < wave_width.saturating_sub(hist_len) {
+        let mut spans = Vec::with_capacity(width);
+        for i in 0..width {
+            let level = if i < width.saturating_sub(hist_len) {
                 0.0_f32
             } else {
-                let idx = hist_len.saturating_sub(wave_width.saturating_sub(i));
-                // Average with neighbors for a smoother look
+                let idx = hist_len.saturating_sub(width.saturating_sub(i));
                 let raw = self.volume_history.get(idx).copied().unwrap_or(0.0);
                 let prev = if idx > 0 { self.volume_history.get(idx - 1).copied().unwrap_or(raw) } else { raw };
                 (raw * 0.7 + prev * 0.3).min(1.0)
             };
             let scaled = (level * 50.0).min(1.0);
-            let char_idx = (scaled * (wave_chars.len() - 1) as f32).round() as usize;
-            let ch = wave_chars[char_idx.min(wave_chars.len() - 1)];
-            // Dim bars vs bright bars based on intensity
-            let color = if char_idx <= 1 {
-                Color::Indexed(237) // dark gray for silence
-            } else {
-                ACCENT
-            };
-            spans.push(Span::styled(String::from(ch), Style::default().fg(color)));
+            let char_idx = ((scaled * (wave_chars.len() - 1) as f32).round() as usize).min(wave_chars.len() - 1);
+            let color = if char_idx <= 1 { Color::Indexed(237) } else { ACCENT };
+            spans.push(Span::styled(String::from(wave_chars[char_idx]), Style::default().fg(color)));
         }
-
-        let wave_line = Line::from(spans);
-        let wave_y = spinner_y + 2;
-        if wave_y < body.y + body.height {
-            f.render_widget(
-                Paragraph::new(wave_line).alignment(Alignment::Center),
-                Rect { x: body.x, y: wave_y, width: body.width, height: 1 },
-            );
-        }
-
-        // ── Footer ─────────────────────────────────────────────────
-        let sep2 = "\u{2500}".repeat(chunks[2].width as usize);
-        f.render_widget(
-            Paragraph::new(sep2).style(Style::default().fg(Color::Indexed(237))),
-            Rect { x: chunks[2].x, y: chunks[2].y, width: chunks[2].width, height: 1 },
-        );
-        let footer_area = Rect { x: chunks[2].x, y: chunks[2].y + 1, width: chunks[2].width, height: 1 };
-        let version = env!("CARGO_PKG_VERSION");
-        let left_spans = vec![
-            Span::styled(" \u{25B8} ", Style::default().fg(ACCENT)),
-            Span::styled(format!("scriba \u{00B7} v{}", version), Style::default().fg(Color::DarkGray)),
-        ];
-        let right_spans = vec![
-            Span::styled("[", Style::default().fg(Color::DarkGray)),
-            Span::styled("Esc", Style::default().fg(Color::White)),
-            Span::styled("] Stop ", Style::default().fg(Color::DarkGray)),
-        ];
-        let left_w: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
-        let right_w: usize = right_spans.iter().map(|s| s.content.chars().count()).sum();
-        let gap = (footer_area.width as usize).saturating_sub(left_w + right_w);
-        let mut spans = left_spans;
-        spans.push(Span::raw(" ".repeat(gap)));
-        spans.extend(right_spans);
-        f.render_widget(Paragraph::new(Line::from(spans)), footer_area);
+        spans
     }
 }

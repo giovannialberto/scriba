@@ -1,7 +1,7 @@
 use anyhow::Result;
 use scriba::core::{
     resolve_transcription_mode, AudioFormat, AutopilotOptions, CloudProvider, CompressionSettings,
-    EnrichmentMode, LocalModel, ScribaConfig, TranscriptionMode, WorkflowManager,
+    EnrichmentMode, LocalModel, RecordingStatus, ScribaConfig, TranscriptionMode, WorkflowManager,
     initialize_world_from_seed, run_autopilot, watcher_excludes_self,
 };
 use scriba::database::Database;
@@ -12,7 +12,6 @@ use scriba::tui::Dashboard;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use structopt::StructOpt;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -1244,7 +1243,7 @@ async fn run_watch(
             quiet: false,
         },
         shutdown_rx,
-        Arc::new(AtomicBool::new(false)),
+        Arc::new(RecordingStatus::default()),
     )
     .await
 }

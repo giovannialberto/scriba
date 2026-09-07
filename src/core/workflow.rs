@@ -178,13 +178,13 @@ impl WorkflowManager {
                 .await?;
                 result.recording_name
             }
-            RecordingMode::Meeting { stop_rx, silence_timeout, verbose } => {
+            RecordingMode::Meeting { stop_rx, level_tx, silence_timeout, verbose } => {
                 let result = record_audio(
                     recording_path,
                     RecordOptions {
                         compression_settings: config.compression.clone(),
                         stop_rx: Some(stop_rx),
-                        level_tx: None,
+                        level_tx,
                         verbose,
                         silence_timeout,
                         input_device,
@@ -684,6 +684,7 @@ impl WorkflowManager {
         auto_transcribe: bool,
         transcription_mode: Option<TranscriptionMode>,
         stop_rx: mpsc::Receiver<()>,
+        level_tx: Option<mpsc::Sender<f32>>,
         silence_timeout: Option<Duration>,
         verbose: bool,
     ) -> Result<ManagedRecording> {
@@ -693,7 +694,7 @@ impl WorkflowManager {
             auto_transcribe,
             transcription_mode,
         };
-        let mode = RecordingMode::Meeting { stop_rx, silence_timeout, verbose };
+        let mode = RecordingMode::Meeting { stop_rx, level_tx, silence_timeout, verbose };
         self.complete_recording_workflow(config, mode).await
     }
 
