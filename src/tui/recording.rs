@@ -336,9 +336,15 @@ impl Dashboard {
         format!("{}|{}%", bar.join(""), (scaled_level * 100.0) as u8)
     }
 
-    /// Whether a recording (manual or meeting) should be shown in the strip.
+    /// Whether audio is being captured right now (manual or meeting). Only
+    /// capture gets the strip; post-capture work is indicated on the
+    /// recording's own row instead.
     pub(super) fn recording_indicator_visible(&self) -> bool {
-        self.recording_task.is_some() || self.recording_guard.is_active()
+        self.recording_task.is_some()
+            || self
+                .recording_guard
+                .snapshot()
+                .is_some_and(|i| i.phase == RecordingPhase::Recording)
     }
 
     /// Ctrl+R: start a manual recording, or stop whichever recording (manual
@@ -419,64 +425,44 @@ impl Dashboard {
 
     /// The recording indicator as a single line: pulsing dot, kind (with the
     /// source app for meetings), elapsed time, live waveform, and a right-
-    /// aligned Ctrl+R hint; a spinner while finalization runs.
+    /// aligned Ctrl+R hint.
     pub(super) fn recording_strip_line(&self, width: usize, margin: &str) -> Line<'static> {
         let info = self.recording_guard.snapshot();
-        let (kind_label, source, phase, started) = match &info {
+        let (kind_label, source, started) = match &info {
             Some(i) => (
                 match i.kind {
                     RecordingKind::Manual => "Recording",
                     RecordingKind::Meeting => "Recording meeting",
                 },
                 i.source.clone(),
-                i.phase,
                 Some(i.started),
             ),
-            None => ("Recording", None, RecordingPhase::Recording, self.recording_start_instant),
+            None => ("Recording", None, self.recording_start_instant),
         };
         let elapsed = started.map(|t| t.elapsed()).unwrap_or_default();
         let elapsed_str = format!("{:02}:{:02}", elapsed.as_secs() / 60, elapsed.as_secs() % 60);
         let dim = Style::default().fg(Color::DarkGray);
         let bold = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
 
-        let mut spans: Vec<Span<'static>> = vec![Span::raw(margin.to_string())];
-        match phase {
-            RecordingPhase::Recording => {
-                // Pulsing red dot (~1s period at the 100ms animation tick).
-                let dot_on = (self.progress_frame / 5) % 2 == 0;
-                let dot_color = if dot_on { Color::Red } else { Color::Indexed(88) };
-                spans.push(Span::styled("\u{25CF} ", Style::default().fg(dot_color)));
-                spans.push(Span::styled(kind_label, bold));
-                if let Some(src) = &source {
-                    spans.push(Span::styled(format!(" \u{00B7} {src}"), Style::default().fg(ACCENT)));
-                }
-                spans.push(Span::styled(format!("  {elapsed_str}  "), dim));
-                spans.extend(self.waveform_spans(24));
-            }
-            RecordingPhase::Processing => {
-                let spinners = ["\u{280B}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283C}", "\u{2834}", "\u{2826}", "\u{2827}", "\u{2807}", "\u{280F}"];
-                spans.push(Span::styled(
-                    format!("{} ", spinners[self.progress_frame % spinners.len()]),
-                    Style::default().fg(ACCENT),
-                ));
-                spans.push(Span::styled("Processing recording", bold));
-                if let Some(src) = &source {
-                    spans.push(Span::styled(format!(" \u{00B7} {src}"), Style::default().fg(ACCENT)));
-                }
-                spans.push(Span::styled(format!("  {elapsed_str}  transcribing\u{2026}"), dim));
-            }
+        // Pulsing red dot (~1s period at the 100ms animation tick).
+        let dot_on = (self.progress_frame / 5) % 2 == 0;
+        let dot_color = if dot_on { Color::Red } else { Color::Indexed(88) };
+        let mut spans: Vec<Span<'static>> = vec![
+            Span::raw(margin.to_string()),
+            Span::styled("\u{25CF} ", Style::default().fg(dot_color)),
+            Span::styled(kind_label, bold),
+        ];
+        if let Some(src) = &source {
+            spans.push(Span::styled(format!(" \u{00B7} {src}"), Style::default().fg(ACCENT)));
         }
+        spans.push(Span::styled(format!("  {elapsed_str}  "), dim));
+        spans.extend(self.waveform_spans(24));
 
-        // Right-aligned stop hint while capturing.
-        let hint: Vec<Span<'static>> = if phase == RecordingPhase::Recording {
-            vec![
-                Span::styled("[", dim),
-                Span::styled("Ctrl+R", Style::default().fg(Color::White)),
-                Span::styled("] Stop", dim),
-            ]
-        } else {
-            Vec::new()
-        };
+        let hint: Vec<Span<'static>> = vec![
+            Span::styled("[", dim),
+            Span::styled("Ctrl+R", Style::default().fg(Color::White)),
+            Span::styled("] Stop", dim),
+        ];
         let left_width: usize = spans.iter().map(|s| s.content.chars().count()).sum();
         let right_width: usize = hint.iter().map(|s| s.content.chars().count()).sum();
         let gap = width.saturating_sub(left_width + right_width);

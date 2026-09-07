@@ -461,10 +461,6 @@ impl Dashboard {
                     let name = completed.recording_name;
                     match completed.task.await {
                         Ok(Ok(())) => {
-                            self.notification_message = Some((
-                                format!("Transcription complete: {}", name),
-                                30,
-                            ));
                             let _ = self.load_recordings();
                             let _ = self.load_stats();
                         }

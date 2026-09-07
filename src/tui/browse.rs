@@ -510,21 +510,13 @@ impl Dashboard {
             format!("{}m", total_m)
         };
 
-        let mut left_spans = vec![
+        let left_spans = vec![
             Span::styled(" \u{25B8} ", Style::default().fg(ACCENT)),
             Span::styled(
                 format!("scriba \u{00B7} v{} \u{00B7} {} recordings \u{00B7} {}", version, rec_count, duration_str),
                 Style::default().fg(Color::DarkGray),
             ),
         ];
-
-        // Transcribing indicator
-        if self.active_transcription.is_some() {
-            left_spans.push(Span::styled(
-                " \u{00B7} Transcribing...",
-                Style::default().fg(Color::Yellow),
-            ));
-        }
 
         // Right side: shortcuts + page indicator (only shown when >1 page)
         let total_pages = if self.page_size > 0 {
