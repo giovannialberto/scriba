@@ -2121,8 +2121,15 @@ async fn perform_update(version: &str) -> Result<String, String> {
         format!("v{}", version)
     };
 
-    // Check if installed via Homebrew
-    if cfg!(target_os = "macos") {
+    // Update through Homebrew only when this very binary was installed by it
+    // (script/direct installs self-replace below, even if brew also has a
+    // copy lying around).
+    let running_from_homebrew = std::env::current_exe()
+        .ok()
+        .and_then(|p| std::fs::canonicalize(p).ok())
+        .map(|p| p.to_string_lossy().contains("/Cellar/scriba/"))
+        .unwrap_or(false);
+    if cfg!(target_os = "macos") && running_from_homebrew {
         let brew_check = tokio::process::Command::new("brew")
             .args(["list", "scriba"])
             .output()
