@@ -2206,6 +2206,33 @@ async fn perform_update(version: &str) -> Result<String, String> {
         .await
         .map_err(|e| format!("Download failed: {}", e))?;
 
+    // Verify against the published checksum before touching the binary
+    // (same guarantee the install script gives).
+    let expected = client
+        .get(format!("{}.sha256", url))
+        .header("User-Agent", "scriba")
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+        .map_err(|e| format!("Checksum download failed: {}", e))?
+        .text()
+        .await
+        .map_err(|e| format!("Checksum download failed: {}", e))?;
+    let expected = expected.split_whitespace().next().unwrap_or("").to_lowercase();
+    let actual = {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>()
+    };
+    if expected.is_empty() || expected != actual {
+        return Err(format!(
+            "Checksum mismatch for {} (expected {}, got {})",
+            version_tag, expected, actual
+        ));
+    }
+
     // Write to temp file, then replace current binary
     let current_exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let tmp_path = current_exe.with_extension("update");
