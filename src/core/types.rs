@@ -27,6 +27,20 @@ pub enum RecordingMode {
         level_tx: tokio::sync::mpsc::Sender<f32>,
         silence_timeout: Option<Duration>,
     },
+    /// Meeting mode: stopped via `stop_rx` when the meeting watcher sees the
+    /// meeting app release the mic, with `silence_timeout` as a fallback net.
+    /// Used by the meeting autopilot; `verbose` must be false when it runs
+    /// inside the TUI (stdout would corrupt the ratatui screen).
+    Meeting {
+        stop_rx: tokio::sync::mpsc::Receiver<()>,
+        /// Live mic level feed for the TUI's recording indicator.
+        level_tx: Option<tokio::sync::mpsc::Sender<f32>>,
+        /// Receives the recording directory as soon as the raw audio is saved
+        /// (before transcription), so hosts can surface the new recording.
+        saved_tx: Option<tokio::sync::oneshot::Sender<String>>,
+        silence_timeout: Option<Duration>,
+        verbose: bool,
+    },
 }
 
 /// Represents a managed recording with metadata and file operations.

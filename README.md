@@ -59,6 +59,21 @@ scriba
 
 On first run, Scriba walks you through an onboarding flow to choose your mode and configure your setup. Then **`Ctrl+R`** to record.
 
+## Meeting detection
+
+Scriba notices when a meeting starts — Zoom, Meet, Teams, or any app that opens your microphone — and offers to record it. No audio is analyzed for this: it watches which process holds the mic, so talking at your desk never triggers it.
+
+- A notification card asks **Record** or **Ignore** the moment a call begins (unanswered cards are ignored — nothing is recorded without your consent).
+- Recording stops by itself the instant you leave the call, then transcription and enrichment run in the background.
+- While recording, a live indicator shows the app, elapsed time, and mic level; the recording appears in your list the moment it stops, with a spinner until the transcript is ready.
+- **`Ctrl+R`** stops any recording in progress; the **Meeting Watch** toggle in Settings turns detection off entirely.
+
+Detection runs whenever the dashboard is open, at effectively zero CPU cost. You can also run it standalone with `scriba watch` (see `scriba watch --help` for options such as `--no-confirm`).
+
+Fine-tuning lives under `meeting_detection` in `~/scriba_recordings/config.json`: `confirm_timeout_seconds`, `cooldown_seconds`, and `ignored_processes` — a list of app/bundle-id substrings whose mic use should never count as a meeting (useful if you run another recording tool alongside Scriba).
+
+Supported on macOS 14+ (per-app attribution via Core Audio) and Linux with PulseAudio/PipeWire.
+
 
 ## Ask Scriba
 

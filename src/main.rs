@@ -1,7 +1,8 @@
 use anyhow::Result;
 use scriba::core::{
-    resolve_transcription_mode, AudioFormat, CloudProvider, CompressionSettings, EnrichmentMode,
-    LocalModel, ScribaConfig, TranscriptionMode, WorkflowManager, initialize_world_from_seed,
+    resolve_transcription_mode, AudioFormat, AutopilotOptions, CloudProvider, CompressionSettings,
+    EnrichmentMode, LocalModel, RecordingStatus, ScribaConfig, TranscriptionMode, WorkflowManager,
+    initialize_world_from_seed, run_autopilot, watcher_excludes_self,
 };
 use scriba::database::Database;
 use scriba::enrichment::WorldContext;
@@ -10,6 +11,7 @@ use scriba::mcp::run_mcp_server;
 use scriba::tui::Dashboard;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 use structopt::StructOpt;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -134,6 +136,47 @@ enum Command {
     },
     /// Run the Model Context Protocol (MCP) server over stdio
     Mcp,
+    /// Run the meeting autopilot in the foreground (the TUI runs it in the
+    /// background by default). Detects meetings, asks via a Record/Ignore
+    /// panel, records, and stops the moment the meeting app releases the mic.
+    ///
+    /// Detection works by watching whether a microphone is in use by another
+    /// process (e.g. Zoom or Google Meet opening the mic on join) — not by
+    /// listening to audio levels — so casual talking never triggers it.
+    Watch {
+        #[structopt(
+            long = "no-auto-record",
+            help = "Only fire a desktop notification when a meeting is detected; don't record"
+        )]
+        no_auto_record: bool,
+        #[structopt(
+            long = "no-transcribe",
+            help = "Skip transcription after an auto-recorded meeting"
+        )]
+        no_transcribe: bool,
+        #[structopt(
+            long = "no-confirm",
+            help = "Record immediately without asking via the Record/Ignore dialog"
+        )]
+        no_confirm: bool,
+        #[structopt(
+            long = "min-silence-seconds",
+            help = "Fallback: seconds of silence to auto-stop a meeting recording if the mic-release signal is unavailable"
+        )]
+        min_silence_seconds: Option<u32>,
+        #[structopt(
+            long = "device",
+            help = "Input device / source name (Linux). On macOS all input devices are monitored"
+        )]
+        device: Option<String>,
+        #[structopt(long = "verbose", help = "Verbose logging from the watcher")]
+        verbose: bool,
+        #[structopt(
+            long = "once",
+            help = "Detect and (optionally) record a single meeting, then exit"
+        )]
+        once: bool,
+    },
     /// Run knowledge extraction on an existing recording
     Enrich {
         #[structopt(help = "Recording directory name to enrich")]
@@ -562,6 +605,26 @@ async fn main() -> Result<()> {
                 Command::Mcp => {
                     // Run MCP server on stdio
                     run_mcp_server().await
+                }
+                Command::Watch {
+                    no_auto_record,
+                    no_transcribe,
+                    no_confirm,
+                    min_silence_seconds,
+                    device,
+                    verbose,
+                    once,
+                } => {
+                    run_watch(
+                        no_auto_record,
+                        no_transcribe,
+                        no_confirm,
+                        min_silence_seconds,
+                        device,
+                        verbose,
+                        once,
+                    )
+                    .await
                 }
                 Command::Enrich { directory_name, enrichment_provider, enrichment_api_key, enrichment_model } => {
                     println!("🧠 Running knowledge extraction on: {}", directory_name);
@@ -1089,4 +1152,98 @@ fn apply_enrichment_overrides(
         }
     }
     Ok(())
+}
+
+/// CLI wrapper for the meeting autopilot (`scriba watch`): prints the banner,
+/// maps Ctrl+C to the shutdown signal, then runs the shared autopilot loop
+/// (`core::autopilot`). The same loop runs quietly inside the TUI dashboard
+/// by default.
+#[allow(clippy::too_many_arguments)]
+async fn run_watch(
+    no_auto_record: bool,
+    no_transcribe: bool,
+    no_confirm: bool,
+    min_silence_seconds: Option<u32>,
+    device: Option<String>,
+    verbose: bool,
+    once: bool,
+) -> Result<()> {
+    let mut config = ScribaConfig::load()?;
+
+    // Apply CLI overrides to the meeting detection config (not persisted).
+    let md = &mut config.meeting_detection;
+    if no_auto_record {
+        md.auto_record = false;
+    }
+    if no_confirm {
+        md.confirm_before_record = false;
+    }
+    if let Some(s) = min_silence_seconds {
+        md.min_silence_seconds = s;
+    }
+    if device.is_some() {
+        md.input_device = device;
+    }
+
+    if !config.meeting_detection.enabled {
+        eprintln!(
+            "Meeting detection is disabled in config. Enable it with `meeting_detection.enabled = true` in {}.",
+            ScribaConfig::config_path()?.display()
+        );
+        return Ok(());
+    }
+
+    let md = config.meeting_detection.clone();
+    let exclude_self = watcher_excludes_self();
+
+    println!("👀 Scriba meeting watcher is running...");
+    println!("   Detection watches whether another process is using a microphone.");
+    if md.auto_record && md.confirm_before_record {
+        println!(
+            "   A Record/Ignore dialog is shown on detection (ignored after {}s if unanswered).",
+            md.confirm_timeout_seconds
+        );
+    }
+    if md.auto_record && !exclude_self {
+        println!(
+            "   Note: this system can't attribute mic use per process, so recordings stop after {}s of silence instead of on mic release.",
+            md.min_silence_seconds
+        );
+    }
+    println!("   Press Ctrl+C to stop.");
+    if verbose {
+        println!(
+            "   auto_record={} confirm={} exclude_self={} silence_fallback={}s cooldown={}s ignored={:?}",
+            md.auto_record,
+            md.confirm_before_record,
+            exclude_self,
+            md.min_silence_seconds,
+            md.cooldown_seconds,
+            md.ignored_processes
+        );
+    }
+
+    // First Ctrl+C requests a graceful shutdown; a second force-quits.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        println!("\n👋 Stopping meeting watcher (Ctrl+C again to force quit)...");
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::signal::ctrl_c().await;
+        eprintln!("Aborting.");
+        std::process::exit(130);
+    });
+
+    run_autopilot(
+        config,
+        AutopilotOptions {
+            transcribe: !no_transcribe,
+            once,
+            verbose,
+            quiet: false,
+        },
+        shutdown_rx,
+        Arc::new(RecordingStatus::default()),
+    )
+    .await
 }

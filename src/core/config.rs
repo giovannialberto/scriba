@@ -126,6 +126,9 @@ pub struct ScribaConfig {
     /// Silence auto-stop settings.
     #[serde(default)]
     pub silence_auto_stop: SilenceAutoStopConfig,
+    /// Automatic meeting detection settings (`scriba watch`).
+    #[serde(default)]
+    pub meeting_detection: MeetingDetectionConfig,
     /// Speaker diarization settings (reserved for future use).
     #[serde(default, skip_serializing)]
     pub diarization: DiarizationConfig,
@@ -182,6 +185,87 @@ impl Default for SilenceAutoStopConfig {
         Self {
             enabled: true,
             timeout_seconds: 60,
+        }
+    }
+}
+
+/// Configuration for automatic meeting detection (`scriba watch`).
+///
+/// The watcher detects the start and end of a meeting by watching whether a
+/// microphone is in use by another process (e.g. Zoom or Google Meet opening
+/// the mic for capture on join and releasing it on leave) rather than by
+/// listening to audio levels, so casual talking in front of the computer never
+/// triggers a false detection. When a meeting starts it can fire a desktop
+/// notification and optionally auto-record it; the recording stops the moment
+/// the meeting app releases the mic (where the OS supports per-process
+/// attribution: macOS 14+, PulseAudio/PipeWire), with a silence timeout as a
+/// fallback net.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeetingDetectionConfig {
+    /// Whether meeting detection is enabled when running `scriba watch`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// When true, automatically start recording when a meeting is detected and
+    /// stop it when the meeting ends. When false, only fire a desktop
+    /// notification.
+    #[serde(default = "default_true")]
+    pub auto_record: bool,
+    /// Ask before recording: show a Record/Ignore dialog when a meeting is
+    /// detected instead of recording immediately. An unanswered dialog counts
+    /// as Ignore — nothing is recorded without explicit consent.
+    #[serde(default = "default_true")]
+    pub confirm_before_record: bool,
+    /// Seconds before the Record/Ignore dialog gives up (and ignores the
+    /// meeting).
+    #[serde(default = "default_confirm_timeout")]
+    pub confirm_timeout_seconds: u32,
+    /// Fallback net: seconds of continuous silence after which an
+    /// auto-recorded meeting's recording stops anyway. The primary stop signal
+    /// is the meeting app releasing the mic; this only kicks in when that
+    /// signal is unavailable (pre-14 macOS) or missed.
+    #[serde(default = "default_min_silence")]
+    pub min_silence_seconds: u32,
+    /// Seconds after a recording finishes during which new detections are
+    /// ignored. Guards against feedback loops with other recording tools on
+    /// the same machine, whose reaction to Scriba's capture would otherwise
+    /// look like a new meeting.
+    #[serde(default = "default_cooldown")]
+    pub cooldown_seconds: u32,
+    /// Processes whose mic capture never counts as a meeting (case-insensitive
+    /// substring match on the bundle ID / process name, e.g. "granola" or
+    /// "us.zoom"). Add other recording tools here to avoid feedback loops.
+    #[serde(default)]
+    pub ignored_processes: Vec<String>,
+    /// Preferred input device name (Linux: filter the PulseAudio/PipeWire
+    /// source by name). On macOS all input devices are monitored and this is
+    /// currently ignored.
+    #[serde(default)]
+    pub input_device: Option<String>,
+}
+
+fn default_confirm_timeout() -> u32 {
+    15
+}
+
+fn default_min_silence() -> u32 {
+    90
+}
+
+fn default_cooldown() -> u32 {
+    120
+}
+
+impl Default for MeetingDetectionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auto_record: true,
+            confirm_before_record: true,
+            confirm_timeout_seconds: default_confirm_timeout(),
+            min_silence_seconds: default_min_silence(),
+            cooldown_seconds: default_cooldown(),
+            ignored_processes: Vec::new(),
+            input_device: None,
         }
     }
 }
@@ -584,6 +668,7 @@ impl Default for ScribaConfig {
             last_api_key: None,
             enrichment: EnrichmentConfig::default(),
             silence_auto_stop: SilenceAutoStopConfig::default(),
+            meeting_detection: MeetingDetectionConfig::default(),
             diarization: DiarizationConfig::default(),
             voice: VoiceConfig::default(),
             last_local_model: None,

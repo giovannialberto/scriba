@@ -1,5 +1,7 @@
 use crate::core::{
-    AudioPlayer, EnrichmentMode, RecordingResult, ScribaConfig, TranscriptionMode,
+    AudioPlayer, AutopilotHandle, AutopilotOptions, EnrichmentMode, RecordingGuard,
+    RecordingKind, RecordingPhase, RecordingResult, RecordingStatus, ScribaConfig, TranscriptionMode,
+    rebuild_world_from_entities, spawn_autopilot,
 };
 use crate::database::{Database, Entity, Recording, RecordingStats};
 use crate::enrichment::{OllamaClient, WorldContext, WorldData};
@@ -20,6 +22,7 @@ use ratatui::{
 };
 use std::collections::VecDeque;
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -54,12 +57,14 @@ pub struct Dashboard {
     pub(super) delete_candidate: Option<Recording>,
     pub(super) audio_player: Option<AudioPlayer>, // Native rodio playback (replaces subprocess players)
     pub(super) last_transcribe_warning: Option<usize>, // Track which recording showed overwrite warning
-    pub(super) progress_animation: Option<String>,     // Base message for progress animation
     pub(super) progress_frame: usize,                  // Animation frame counter
     pub(super) active_transcription: Option<ActiveTranscription>, // Currently running transcription
     pub(super) transcription_queue: VecDeque<PendingTranscription>, // FIFO queue of pending transcriptions
     pub(super) notification_message: Option<(String, usize)>, // (message, frames_remaining) -- auto-dismiss
     pub(super) recording_task: Option<tokio::task::JoinHandle<Result<RecordingResult, anyhow::Error>>>,
+    pub(super) autopilot: Option<AutopilotHandle>, // Background meeting watcher (auto-detect + record)
+    pub(super) last_recording_status: Option<(RecordingPhase, Option<String>)>, // For change detection
+    pub(super) recording_guard: RecordingGuard, // True while any recording (manual or auto) runs
     pub(super) recording_mode: Option<RecordingMode>, // Track if we should transcribe after recording
     pub(super) recording_stop_tx: Option<mpsc::Sender<()>>, // Channel to stop recording
     pub(super) recording_level_rx: Option<mpsc::Receiver<f32>>, // Channel to receive volume levels
@@ -184,12 +189,14 @@ impl Dashboard {
             delete_candidate: None,
             audio_player: None,
             last_transcribe_warning: None,
-            progress_animation: None,
             progress_frame: 0,
             active_transcription: None,
             transcription_queue: VecDeque::new(),
             notification_message: None,
             recording_task: None,
+            autopilot: None,
+            last_recording_status: None,
+            recording_guard: Arc::new(RecordingStatus::default()),
             recording_mode: None,
             recording_stop_tx: None,
             recording_level_rx: None,
@@ -292,6 +299,20 @@ impl Dashboard {
             });
         }
 
+        // A missing world.md alongside a populated entity index is a lost
+        // derived file, not a fresh install: regenerate it instead of sending
+        // the user back through onboarding (which would start a new world).
+        if !WorldContext::exists()
+            && self
+                .db
+                .list_entities(None, None)
+                .map(|e| !e.is_empty())
+                .unwrap_or(false)
+            && let Err(e) = rebuild_world_from_entities(&self.db)
+        {
+            eprintln!("⚠️  Could not rebuild world.md from entities: {e}");
+        }
+
         // Check if onboarding is needed (no world.md exists)
         if !WorldContext::exists() {
             self.current_view = DashboardView::Onboarding;
@@ -301,6 +322,9 @@ impl Dashboard {
             self.load_entities().ok();
             self.init_global_chat();
         }
+
+        // Background meeting watcher: on by default, toggled in Settings.
+        self.sync_autopilot();
 
         let result = self.run_app(&mut terminal).await;
 
@@ -313,7 +337,44 @@ impl Dashboard {
         )?;
         terminal.show_cursor()?;
 
+        // Wind down the meeting watcher; if it is mid-recording this stops the
+        // capture and finalizes it before the process exits.
+        if let Some(handle) = self.autopilot.take() {
+            if self.recording_guard.is_active() {
+                println!("⏳ Finishing meeting recording...");
+            }
+            if let Err(e) = handle.join().await {
+                eprintln!("⚠️  Meeting watcher stopped with an error: {e}");
+            }
+        }
+
         result
+    }
+
+    /// Start or stop the background meeting autopilot to match
+    /// `config.meeting_detection.enabled`.
+    pub(super) fn sync_autopilot(&mut self) {
+        let want = self.config.meeting_detection.enabled;
+        let running = self
+            .autopilot
+            .as_ref()
+            .map(|h| !h.is_finished())
+            .unwrap_or(false);
+        if want && !running {
+            self.autopilot = Some(spawn_autopilot(
+                self.config.clone(),
+                AutopilotOptions {
+                    quiet: true, // the TUI owns the terminal
+                    ..AutopilotOptions::default()
+                },
+                self.recording_guard.clone(),
+            ));
+        } else if !want
+            && running
+            && let Some(handle) = self.autopilot.take()
+        {
+            handle.stop();
+        }
     }
 
     async fn run_app<B: ratatui::backend::Backend>(
@@ -336,6 +397,7 @@ impl Dashboard {
                 if task.is_finished() {
                     let completed_task = self.recording_task.take().unwrap();
                     let recording_mode = self.recording_mode.take();
+                    self.recording_guard.end();
 
                     // Clean up channels
                     self.recording_stop_tx = None;
@@ -358,10 +420,8 @@ impl Dashboard {
 
                             // Recording completed successfully
                             if let Some(RecordingMode::RecordAndTranscribe) = recording_mode {
-                                // Dismiss recording modal -- transcription runs non-blocking
-                                self.stop_progress_animation();
-                                self.show_message = false;
-                                self.message.clear();
+                                // The new row appears in the list immediately with a
+                                // transcribing indicator; no footer notification needed.
                                 let _ = self.load_recordings();
                                 let _ = self.load_stats();
 
@@ -373,21 +433,16 @@ impl Dashboard {
                                 });
                             } else {
                                 // Recording only mode - complete
-                                self.stop_progress_animation();
-                                self.message = "Recording complete.".to_string();
-                                self.show_message = true;
                                 // Reload data to show new recording
                                 let _ = self.load_recordings();
                                 let _ = self.load_stats();
                             }
                         }
                         Ok(Err(err)) => {
-                            self.stop_progress_animation();
                             self.message = format!("Recording failed: {}", err);
                             self.show_message = true;
                         }
                         Err(_) => {
-                            self.stop_progress_animation();
                             self.message = "Recording task failed.".to_string();
                             self.show_message = true;
                         }
@@ -402,10 +457,6 @@ impl Dashboard {
                     let name = completed.recording_name;
                     match completed.task.await {
                         Ok(Ok(())) => {
-                            self.notification_message = Some((
-                                format!("Transcription complete: {}", name),
-                                30,
-                            ));
                             let _ = self.load_recordings();
                             let _ = self.load_stats();
                         }
@@ -527,7 +578,7 @@ impl Dashboard {
             if self.pending_record_from_chat {
                 self.pending_record_from_chat = false;
                 if self.recording_task.is_some() {
-                    self.notification_message = Some(("Already recording \u{2014} press Esc to stop.".to_string(), 30));
+                    self.notification_message = Some(("Already recording \u{2014} Ctrl+R stops it.".to_string(), 30));
                 } else {
                     let _ = self.execute_record_and_transcribe().await;
                 }
@@ -563,14 +614,52 @@ impl Dashboard {
                 }
             }
 
-            // Update progress animation if active (throttled)
-            if anim_tick && self.progress_animation.is_some() {
-                self.update_progress_message();
+            // Tick progress frame for inline transcription/update/recording animation (throttled)
+            if anim_tick
+                && (self.active_transcription.is_some()
+                    || !self.transcription_queue.is_empty()
+                    || self.update_in_progress
+                    || self.recording_indicator_visible())
+            {
+                self.progress_frame = self.progress_frame.wrapping_add(1);
             }
 
-            // Tick progress frame for inline transcription/update animation (throttled)
-            if anim_tick && (self.active_transcription.is_some() || !self.transcription_queue.is_empty() || self.update_in_progress) {
-                self.progress_frame = self.progress_frame.wrapping_add(1);
+            // Reload the recordings list when a recording's lifecycle moves on
+            // (saved, finished) so new rows and their status show up at once.
+            if anim_tick {
+                let key = self
+                    .recording_guard
+                    .snapshot()
+                    .map(|i| (i.phase, i.directory));
+                if key != self.last_recording_status {
+                    let saved_or_done = matches!(&key, Some((_, Some(_)))) || key.is_none();
+                    if saved_or_done {
+                        let _ = self.load_recordings();
+                        let _ = self.load_stats();
+                    }
+                    self.last_recording_status = key;
+                }
+                self.refresh_home_busy();
+            }
+
+            // Meeting auto-recordings publish their mic level through the shared
+            // status; sample it into the same waveform manual recordings use.
+            if anim_tick {
+                match self.recording_guard.snapshot() {
+                    Some(info) if info.kind == RecordingKind::Meeting => {
+                        let level = self.recording_guard.level();
+                        self.current_volume_level = level;
+                        if self.volume_history.len() >= 48 {
+                            self.volume_history.pop_front();
+                        }
+                        self.volume_history.push_back(level);
+                    }
+                    None if self.recording_task.is_none() && !self.volume_history.is_empty() => {
+                        self.volume_history.clear();
+                        self.current_volume_level = 0.0;
+                    }
+                    _ => {}
+                }
             }
 
             // Auto-dismiss notification countdown (throttled)
@@ -687,16 +776,6 @@ impl Dashboard {
             }
         }
 
-        // If recording is active and Escape is pressed, stop recording
-        if self.recording_task.is_some() && matches!(key_code, KeyCode::Esc) {
-            // Send stop signal to recording task
-            if let Some(stop_tx) = self.recording_stop_tx.take() {
-                let _ = stop_tx.send(()).await;
-            }
-            // The recording task will handle cleanup and completion
-            return Ok(DashboardAction::Continue);
-        }
-
         // Dismiss easter egg on any keypress
         if self.owl_easter_egg_frame.is_some() {
             self.owl_easter_egg_frame = None;
@@ -744,7 +823,6 @@ impl Dashboard {
             // Special-case: allow confirming re-transcribe overwrite with T while message is visible
             if matches!(key_code, KeyCode::Char('t') | KeyCode::Char('T'))
                 && self.last_transcribe_warning.is_some()
-                && self.progress_animation.is_none()
             {
                 // Dismiss the warning and trigger the action
                 self.show_message = false;
@@ -752,8 +830,7 @@ impl Dashboard {
                 return Ok(DashboardAction::TranscribeSelected);
             }
 
-            // Don't close message if progress animation is active
-            if self.progress_animation.is_none() && matches!(key_code, KeyCode::Esc) {
+            if matches!(key_code, KeyCode::Esc) {
                 // Only Esc key closes the message popup (consistent behavior)
                 self.show_message = false;
                 self.message.clear();
@@ -885,7 +962,7 @@ impl Dashboard {
     async fn handle_dashboard_action(&mut self, action: DashboardAction) -> Result<()> {
         match action {
             DashboardAction::RecordAndTranscribe => {
-                self.execute_record_and_transcribe().await?;
+                self.toggle_recording().await?;
             }
             DashboardAction::TranscribeSelected => {
                 self.execute_transcribe_selected().await?;
@@ -896,13 +973,42 @@ impl Dashboard {
     }
 
     fn ui(&mut self, f: &mut Frame) {
+        let full = f.size();
+
+        // Non-blocking recording indicator while a manual or meeting recording
+        // is in progress: under the logo on the home screen, otherwise a strip
+        // above the active view.
+        let recording = self.recording_indicator_visible();
+        let on_home = self.current_view == DashboardView::Main
+            && self.chat.show_home_screen
+            && self.chat.messages.is_empty()
+            && self.chat.pending_blocks.is_empty()
+            && !self.chat.is_generating;
+        self.chat.recording_lines = if recording && on_home {
+            // Home content is centered at ≤90 columns with a 3-char margin.
+            let width = (full.width.min(90) as usize).saturating_sub(4);
+            vec![self.recording_strip_line(width, "   ")]
+        } else {
+            Vec::new()
+        };
+        let area = if recording && !on_home && full.height > 6 {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(2), Constraint::Min(1)])
+                .split(full);
+            self.render_recording_strip(f, chunks[0]);
+            chunks[1]
+        } else {
+            full
+        };
+
         match self.current_view {
-            DashboardView::Main => self.render_main_dashboard(f),
-            DashboardView::Browse => self.render_browse_view(f),
-            DashboardView::Help => self.render_help(f, f.size()),
-            DashboardView::Settings => self.render_settings(f, f.size()),
-            DashboardView::Entities => self.render_entities_view(f, f.size()),
-            DashboardView::Onboarding => self.render_onboarding(f, f.size()),
+            DashboardView::Main => self.render_main_dashboard(f, area),
+            DashboardView::Browse => self.render_browse_view(f, area),
+            DashboardView::Help => self.render_help(f, area),
+            DashboardView::Settings => self.render_settings(f, area),
+            DashboardView::Entities => self.render_entities_view(f, area),
+            DashboardView::Onboarding => self.render_onboarding(f, area),
         }
 
         // Easter egg overlay (renders on top of everything)
@@ -911,13 +1017,8 @@ impl Dashboard {
         }
     }
 
-    fn render_main_dashboard(&mut self, f: &mut Frame) {
-        let size = f.size();
-
-        if self.recording_task.is_some() {
-            self.render_recording_view(f, size);
-            return;
-        }
+    fn render_main_dashboard(&mut self, f: &mut Frame, area: Rect) {
+        let size = area;
 
         if self.show_file_dialog {
             self.render_file_dialog_popup(f, size);
@@ -1082,7 +1183,10 @@ impl Dashboard {
             Span::styled("] Browse  ", Style::default().fg(Color::DarkGray)),
             Span::styled("[", Style::default().fg(Color::DarkGray)),
             Span::styled("Ctrl+R", Style::default().fg(Color::White)),
-            Span::styled("] Record  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                if self.recording_indicator_visible() { "] Stop  " } else { "] Record  " },
+                Style::default().fg(Color::DarkGray),
+            ),
             Span::styled("[", Style::default().fg(Color::DarkGray)),
             Span::styled("?", Style::default().fg(Color::White)),
             Span::styled("] Help ", Style::default().fg(Color::DarkGray)),
@@ -1126,7 +1230,7 @@ impl Dashboard {
             Line::from("SCRIBA HELP"),
             Line::from(""),
             Line::from("Global Shortcuts:"),
-            Line::from("  Ctrl+R     - Record audio (Esc to stop)"),
+            Line::from("  Ctrl+R     - Start / stop recording (manual or meeting)"),
             Line::from("  Tab        - Browse recordings"),
             Line::from("  Ctrl+S     - Settings"),
             Line::from("  Ctrl+W     - World (entities)"),
@@ -1272,7 +1376,8 @@ impl Dashboard {
                 if first.is_empty() { None } else { Some(format!("{}.", first)) }
             });
             let recording_id = r.id.unwrap_or(0);
-            HomeRecording { recording_id, name, duration_mins, summary_line }
+            let directory_name = r.directory_name.clone();
+            HomeRecording { recording_id, directory_name, name, duration_mins, summary_line, busy: false }
         }).collect();
         // If no duration info, show at least 1m
         for rec in &mut home_recs {
@@ -1286,6 +1391,7 @@ impl Dashboard {
         self.chat.greeting_subtitle = self.greeting_subtitle.clone();
         self.chat.home_recordings = home_recs;
         self.chat.selected_action = 0;
+        self.refresh_home_busy();
 
         self.chat.placeholder = if self.recordings.is_empty() {
             "Type \u{201c}record\u{201d} or press Ctrl+R to start your first recording".to_string()

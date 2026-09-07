@@ -8,9 +8,12 @@
 //! - Workflow orchestration
 
 pub mod audio;
+pub mod autopilot;
 pub mod config;
 pub mod files;
 pub mod loopback;
+pub mod meeting;
+pub mod notify;
 pub mod playback;
 pub mod recording;
 pub mod ring_buffer;
@@ -20,11 +23,14 @@ pub mod workflow;
 
 // Re-export commonly used types for convenience
 pub use audio::{AudioEncoder, AudioFormat, CompressionSettings, merge_wav_files};
+pub use autopilot::{run_autopilot, spawn_autopilot, AutopilotHandle, AutopilotOptions, RecordingGuard, RecordingInfo, RecordingKind, RecordingPhase, RecordingStatus};
 pub use loopback::{detect_loopback_sources, start_loopback_capture};
 pub use playback::AudioPlayer;
 #[allow(deprecated)]
-pub use config::{resolve_transcription_mode, CloudProvider, EnrichmentConfig, EnrichmentMode, LocalModel, LocalModelSize, ModelDef, ScribaConfig, SilenceAutoStopConfig, TranscriptionMode};
+pub use config::{resolve_transcription_mode, CloudProvider, EnrichmentConfig, EnrichmentMode, LocalModel, LocalModelSize, MeetingDetectionConfig, ModelDef, ScribaConfig, SilenceAutoStopConfig, TranscriptionMode};
 pub use files::FileManager;
+pub use meeting::{capturing_processes, friendly_process_name, meeting_signal, notify_event, run_meeting_watcher, watcher_excludes_self, MeetingEvent, MeetingWatcherConfig};
+pub use notify::{confirm as desktop_confirm, notification_helper_ready, notify as desktop_notify, prepare_notification_helper};
 pub use recording::{record_audio, list_input_devices, resolve_input_device, AudioLevelMonitor, RecordOptions, RecordingResult};
 pub use transcription::{transcribe_audio, TranscriptionProgress};
 pub use types::{ManagedRecording, RecordingConfig, RecordingMetadata, RecordingMode};

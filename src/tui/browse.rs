@@ -384,13 +384,6 @@ impl Dashboard {
     }
 
     pub(super) async fn execute_add_external_file(&mut self) -> Result<()> {
-        // Check if already recording (transcription can run concurrently)
-        if self.recording_task.is_some() {
-            self.message = "Recording already in progress".to_string();
-            self.show_message = true;
-            return Ok(());
-        }
-
         // Show file dialog for importing audio file
         self.show_file_dialog = true;
         self.file_dialog_stage = FileDialogStage::FilePath;
@@ -433,13 +426,8 @@ impl Dashboard {
         Ok(())
     }
 
-    pub(super) fn render_browse_view(&mut self, f: &mut Frame) {
-        let size = f.size();
-
-        if self.recording_task.is_some() {
-            self.render_recording_view(f, size);
-            return;
-        }
+    pub(super) fn render_browse_view(&mut self, f: &mut Frame, area: ratatui::layout::Rect) {
+        let size = area;
 
         if self.show_file_dialog {
             self.render_file_dialog_popup(f, size);
@@ -522,21 +510,13 @@ impl Dashboard {
             format!("{}m", total_m)
         };
 
-        let mut left_spans = vec![
+        let left_spans = vec![
             Span::styled(" \u{25B8} ", Style::default().fg(ACCENT)),
             Span::styled(
                 format!("scriba \u{00B7} v{} \u{00B7} {} recordings \u{00B7} {}", version, rec_count, duration_str),
                 Style::default().fg(Color::DarkGray),
             ),
         ];
-
-        // Transcribing indicator
-        if self.active_transcription.is_some() {
-            left_spans.push(Span::styled(
-                " \u{00B7} Transcribing...",
-                Style::default().fg(Color::Yellow),
-            ));
-        }
 
         // Right side: shortcuts + page indicator (only shown when >1 page)
         let total_pages = if self.page_size > 0 {
@@ -631,7 +611,8 @@ impl Dashboard {
 
             let is_selected = i == selected_idx;
             let is_active = self.active_transcription.as_ref()
-                .is_some_and(|a| a.recording_name == recording.directory_name);
+                .is_some_and(|a| a.recording_name == recording.directory_name)
+                || self.processing_directory().as_deref() == Some(recording.directory_name.as_str());
             let is_queued = !is_active
                 && self.transcription_queue.iter().any(|p| p.recording_name() == recording.directory_name);
 
