@@ -1,23 +1,25 @@
 // Scriba notification panel helper.
 //
 // Renders a notification-style floating card in the top-right corner of the
-// main screen: dark rounded card with an icon badge, title/subtitle, and (in
-// confirm mode) Ignore/Record pill buttons. Unbundled CLI processes cannot
-// post real Notification Center banners with action buttons, so Scriba draws
-// its own.
+// main screen: dark rounded card with an icon badge, title/subtitle, a
+// countdown bar along the bottom, and (in confirm mode) Ignore/Record pill
+// buttons. Hovering the card pauses the countdown and reveals a ✕ dismiss
+// button on the top-left corner. Unbundled CLI processes cannot post real
+// Notification Center banners with action buttons, so Scriba draws its own.
 //
 // Usage:
 //   notify-panel notify  --title T --subtitle S [--timeout 5] [--sound Glass]
 //   notify-panel confirm --title T --subtitle S --yes Record --no Ignore \
 //                        [--timeout 30] [--sound Glass]
-//   notify-panel confirm ... --snapshot /tmp/card.png   (render PNG and exit)
+//   notify-panel ... --snapshot /tmp/card.png [--hover yes|no|card]
+//                        (render a PNG for design QA and exit)
 //
 // The subtitle is prettified: bundle identifiers are resolved to app display
 // names via NSWorkspace (e.g. "company.thebrowser.browser.helper" -> "Arc").
 //
 // Prints exactly one line to stdout before exiting:
-//   confirm mode: "yes" | "no" | "timeout"
-//   notify mode:  "timeout" (after the display duration, or on click)
+//   confirm mode: "yes" | "no" | "timeout"   (✕ counts as "no")
+//   notify mode:  "timeout" (after the display duration, on click, or ✕)
 //
 // Compiled at runtime by Scriba via swiftc (see src/core/notify.rs).
 
@@ -32,7 +34,7 @@ struct Options {
     var timeout: Double = 5
     var sound: String? = nil
     var snapshot: String? = nil
-    var hover: String? = nil // design QA: render a pill in its hover state
+    var hover: String? = nil // design QA: render an element in its hover state
 }
 
 func parseOptions() -> Options {
@@ -112,6 +114,9 @@ let primaryPillText = NSColor(white: 1.0, alpha: 0.98)
 let quietPillColor = NSColor(white: 1.0, alpha: 0.09)
 let quietPillHover = NSColor(white: 1.0, alpha: 0.17)
 let quietPillText = NSColor(white: 1.0, alpha: 0.85)
+let closeFill = NSColor(red: 0.23, green: 0.225, blue: 0.215, alpha: 1.0)
+let closeHover = NSColor(red: 0.32, green: 0.315, blue: 0.30, alpha: 1.0)
+let countdownColor = brandVioletLight.withAlphaComponent(0.45)
 
 let opts = parseOptions()
 let app = NSApplication.shared
@@ -148,6 +153,8 @@ final class Handler: NSObject {
     @objc func yes(_ sender: Any?) { finish("yes") }
     @objc func no(_ sender: Any?) { finish("no") }
     @objc func dismiss(_ sender: Any?) { finish("timeout") }
+    // ✕: decline in confirm mode, plain dismissal otherwise.
+    @objc func close(_ sender: Any?) { finish(hasButtons ? "no" : "timeout") }
 }
 let handler = Handler()
 
@@ -156,9 +163,9 @@ func textWidth(_ string: String, font: NSFont) -> CGFloat {
     (string as NSString).size(withAttributes: [.font: font]).width
 }
 
-/// Pill button with a hover state: the fill brightens on mouse-over (with a
-/// short cross-fade) and the cursor becomes a pointing hand.
-final class HoverPill: NSButton {
+/// Button with a hover state: the fill brightens on mouse-over (with a short
+/// cross-fade) and the cursor becomes a pointing hand.
+class HoverButton: NSButton {
     var baseFill: NSColor = .clear
     var hoverFill: NSColor = .clear
     private var trackingArea: NSTrackingArea?
@@ -201,12 +208,35 @@ final class HoverPill: NSButton {
     }
 }
 
+/// Root view: tracks hover over the whole card area to pause the countdown
+/// and reveal the ✕ button.
+final class HoverRoot: NSView {
+    var onHoverChange: ((Bool) -> Void)?
+    private var trackingArea: NSTrackingArea?
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let area = trackingArea {
+            removeTrackingArea(area)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways],
+            owner: self, userInfo: nil)
+        addTrackingArea(area)
+        trackingArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) { onHoverChange?(true) }
+    override func mouseExited(with event: NSEvent) { onHoverChange?(false) }
+}
+
 func makePill(
     _ label: String, fill: NSColor, hoverFill: NSColor, textColor: NSColor,
     action: Selector
-) -> HoverPill {
+) -> HoverButton {
     let font = NSFont.systemFont(ofSize: 13, weight: .semibold)
-    let button = HoverPill(title: label, target: handler, action: action)
+    let button = HoverButton(title: label, target: handler, action: action)
     button.isBordered = false
     button.wantsLayer = true
     button.baseFill = fill
@@ -231,6 +261,10 @@ let leftPad: CGFloat = 14
 let badgeSize: CGFloat = 38
 let textGap: CGFloat = 12
 let rightPad: CGFloat = 14
+// Transparent margin on the top/left of the panel so the ✕ can straddle the
+// card corner.
+let closeSize: CGFloat = 24
+let overhang: CGFloat = closeSize / 2
 
 let yesPill = makePill(
     opts.yes, fill: primaryPillColor, hoverFill: primaryPillHover,
@@ -249,8 +283,11 @@ let fixedWidth = leftPad + badgeSize + textGap + rightPad + buttonsWidth
 let cardWidth = min(max(fixedWidth + naturalTextWidth + 8, 320), 480)
 let labelWidth = cardWidth - fixedWidth
 
+let rootWidth = cardWidth + overhang
+let rootHeight = cardHeight + overhang
+
 let panel = NSPanel(
-    contentRect: NSRect(x: 0, y: 0, width: cardWidth, height: cardHeight),
+    contentRect: NSRect(x: 0, y: 0, width: rootWidth, height: rootHeight),
     styleMask: [.borderless, .nonactivatingPanel],
     backing: .buffered, defer: false)
 panelRef = panel
@@ -261,14 +298,19 @@ panel.hasShadow = true
 panel.hidesOnDeactivate = false
 panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
-let card = NSView(frame: NSRect(x: 0, y: 0, width: cardWidth, height: cardHeight))
+let root = HoverRoot(
+    frame: NSRect(x: 0, y: 0, width: rootWidth, height: rootHeight))
+panel.contentView = root
+
+let card = NSView(
+    frame: NSRect(x: overhang, y: 0, width: cardWidth, height: cardHeight))
 card.wantsLayer = true
 card.layer?.backgroundColor = cardColor.cgColor
 card.layer?.cornerRadius = 18
 card.layer?.cornerCurve = .continuous
 card.layer?.borderWidth = 1
 card.layer?.borderColor = strokeColor.cgColor
-panel.contentView = card
+root.addSubview(card)
 
 // Icon badge: rounded square with a mic symbol.
 let badge = NSView(
@@ -330,16 +372,88 @@ if hasButtons {
     card.addGestureRecognizer(click)
 }
 
+// Countdown bar along the card bottom, shrinking as the timeout approaches.
+let barInset: CGFloat = 18
+let barMaxWidth = cardWidth - barInset * 2
+let countdownBar = NSView(
+    frame: NSRect(x: barInset, y: 6, width: barMaxWidth, height: 3))
+countdownBar.wantsLayer = true
+countdownBar.layer?.backgroundColor = countdownColor.cgColor
+countdownBar.layer?.cornerRadius = 1.5
+card.addSubview(countdownBar)
+
+// ✕ dismiss button straddling the top-left corner; revealed on hover.
+let closeButton = HoverButton(
+    title: "", target: handler, action: #selector(Handler.close(_:)))
+closeButton.isBordered = false
+closeButton.wantsLayer = true
+closeButton.baseFill = closeFill
+closeButton.hoverFill = closeHover
+closeButton.layer?.backgroundColor = closeFill.cgColor
+closeButton.layer?.cornerRadius = closeSize / 2
+closeButton.layer?.borderWidth = 1
+closeButton.layer?.borderColor = NSColor(white: 1.0, alpha: 0.18).cgColor
+if let xImage = NSImage(
+    systemSymbolName: "xmark", accessibilityDescription: "Dismiss")
+{
+    let config = NSImage.SymbolConfiguration(pointSize: 9, weight: .bold)
+    closeButton.image = xImage.withSymbolConfiguration(config)
+    closeButton.imagePosition = .imageOnly
+    closeButton.contentTintColor = NSColor(white: 1.0, alpha: 0.9)
+}
+closeButton.frame = NSRect(
+    x: 0, y: rootHeight - closeSize, width: closeSize, height: closeSize)
+closeButton.alphaValue = 0
+root.addSubview(closeButton)
+
+// ── Countdown: ticks the bar down; hovering the card pauses it ──────────────
+var remaining = opts.timeout
+var hoverPaused = false
+
+root.onHoverChange = { hovering in
+    hoverPaused = hovering
+    NSAnimationContext.runAnimationGroup { ctx in
+        ctx.duration = 0.15
+        closeButton.animator().alphaValue = hovering ? 1 : 0
+    }
+}
+
+func startCountdown() {
+    let tick = 0.05
+    let timer = Timer(timeInterval: tick, repeats: true) { timer in
+        if finished {
+            timer.invalidate()
+            return
+        }
+        if hoverPaused { return }
+        remaining -= tick
+        if remaining <= 0 {
+            timer.invalidate()
+            finish("timeout")
+            return
+        }
+        let fraction = CGFloat(max(remaining / opts.timeout, 0))
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        countdownBar.frame.size.width = barMaxWidth * fraction
+        CATransaction.commit()
+    }
+    RunLoop.main.add(timer, forMode: .common)
+}
+
 // ── Snapshot mode: render the card to a PNG and exit (used for design QA) ───
 if let snapshotPath = opts.snapshot {
     switch opts.hover {
     case "yes": yesPill.setFill(primaryPillHover)
     case "no": noPill.setFill(quietPillHover)
+    case "card":
+        closeButton.alphaValue = 1
+        countdownBar.frame.size.width = barMaxWidth * 0.62
     default: break
     }
-    card.layoutSubtreeIfNeeded()
-    if let rep = card.bitmapImageRepForCachingDisplay(in: card.bounds) {
-        card.cacheDisplay(in: card.bounds, to: rep)
+    root.layoutSubtreeIfNeeded()
+    if let rep = root.bitmapImageRepForCachingDisplay(in: root.bounds) {
+        root.cacheDisplay(in: root.bounds, to: rep)
         if let data = rep.representation(using: .png, properties: [:]) {
             try? data.write(to: URL(fileURLWithPath: snapshotPath))
         }
@@ -351,8 +465,12 @@ if let snapshotPath = opts.snapshot {
 // ── Show, top-right of the main screen ───────────────────────────────────────
 if let screen = NSScreen.main {
     let vf = screen.visibleFrame
+    // Anchor the card (not the transparent ✕ margin) 16pt from the right edge
+    // and 12pt from the top.
     panel.setFrameOrigin(
-        NSPoint(x: vf.maxX - cardWidth - 16, y: vf.maxY - cardHeight - 12))
+        NSPoint(
+            x: vf.maxX - rootWidth - 16,
+            y: vf.maxY - 12 + overhang - rootHeight))
 }
 panel.alphaValue = 0
 panel.orderFrontRegardless()
@@ -364,7 +482,5 @@ if let soundName = opts.sound {
     NSSound(named: soundName)?.play()
 }
 
-DispatchQueue.main.asyncAfter(deadline: .now() + opts.timeout) {
-    finish("timeout")
-}
+startCountdown()
 app.run()

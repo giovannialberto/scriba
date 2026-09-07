@@ -202,8 +202,10 @@ pub async fn confirm(
         timeout_secs,
         default_answer,
     );
-    // Belt over the tooling's own timeout in case it isn't honored.
-    let hard_timeout = Duration::from_secs(timeout_secs as u64 + 10);
+    // Belt over the tooling's own timeout in case it isn't honored. Generous:
+    // hovering the native panel legitimately pauses its countdown while the
+    // user decides.
+    let hard_timeout = Duration::from_secs(timeout_secs as u64 + 600);
     match tokio::time::timeout(hard_timeout, attempt).await {
         Ok(Ok(answer)) => answer,
         Ok(Err(e)) => {
