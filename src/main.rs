@@ -136,9 +136,9 @@ enum Command {
     },
     /// Run the Model Context Protocol (MCP) server over stdio
     Mcp,
-    /// Run in the background, auto-detecting meetings via microphone activity.
-    /// Fires a desktop notification when a meeting starts and (optionally)
-    /// records it automatically, stopping the recording when the meeting ends.
+    /// Run the meeting autopilot in the foreground (the TUI runs it in the
+    /// background by default). Detects meetings, asks via a Record/Ignore
+    /// panel, records, and stops the moment the meeting app releases the mic.
     ///
     /// Detection works by watching whether a microphone is in use by another
     /// process (e.g. Zoom or Google Meet opening the mic on join) — not by

@@ -8,7 +8,7 @@ Rust TUI that records audio, transcribes it (local or cloud), enriches it with L
 cargo build                  # debug build
 cargo build --release        # release build
 cargo run                    # launch TUI dashboard
-cargo test                   # run all tests (~32 tests, <1s)
+cargo test                   # run all tests (~40 tests, <2s)
 cargo fmt --all              # format
 cargo clippy -- -D warnings  # lint
 ```
@@ -24,7 +24,11 @@ src/
     transcription.rs   STT: sherpa-onnx (local) + OpenAI API
     workflow.rs        Orchestration: record -> transcribe -> enrich
     loopback.rs        System audio capture (macOS: ScreenCaptureKit, Linux: PulseAudio/PipeWire)
-    config.rs          ScribaConfig, TranscriptionMode, EnrichmentMode
+    meeting.rs         Meeting detection: polls "mic in use by another process" (Core Audio process objects / pactl)
+    autopilot.rs       Meeting autopilot: detect -> confirm -> record -> instant stop; shared RecordingStatus
+    notify.rs          Desktop notifications + Record/Ignore prompt (native panel helper, AppleScript fallback)
+    notify_panel.swift Notification-style panel, compiled at runtime by notify.rs (macOS)
+    config.rs          ScribaConfig, TranscriptionMode, EnrichmentMode, MeetingDetectionConfig
   database/            SQLite persistence (schema.sql at repo root, included at compile time)
   enrichment/          LLM integration (Ollama, Anthropic, OpenAI, Google)
     world.rs           Knowledge graph (WorldData), single source of truth
@@ -58,6 +62,8 @@ src/
 - **TUI is modular** — each view in its own file under `tui/`, keep it that way
 - **World = single source of truth** — DB entities are a materialized index derived from `~/scriba_recordings/world.md`
 - **Entity linking is LLM-driven** — no fuzzy matching, no substring scanning
+- **Nothing hosted by the TUI may print** — background work (autopilot, workflows) takes a `quiet`/`verbose` flag; stdout corrupts the ratatui screen. Use the `_silent` workflow variants and desktop notifications instead
+- **Never delete by heuristic in `~/scriba_recordings`** — `world.md`, `scriba.db`, and `config.json` live there next to recording directories
 
 ## Release process
 
