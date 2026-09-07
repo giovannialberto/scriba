@@ -2062,15 +2062,35 @@ fn version_newer(a: &str, b: &str) -> bool {
 }
 
 /// Perform the actual update. Returns the new version string on success.
-/// `brew upgrade scriba`, with Homebrew's environment hints silenced so the
-/// auto-update banner doesn't drown the actual outcome.
+/// `brew update` then `brew upgrade scriba`, with Homebrew's environment hints
+/// silenced so the auto-update banner doesn't drown the actual outcome.
+///
+/// The explicit `brew update` matters: brew only refreshes taps on its own
+/// once a day, so a plain `brew upgrade` minutes after a release happily
+/// reports "already installed" and exits 0.
 async fn brew_upgrade() -> Result<std::process::Output, String> {
+    let _ = tokio::process::Command::new("brew")
+        .args(["update", "--quiet"])
+        .env("HOMEBREW_NO_ENV_HINTS", "1")
+        .output()
+        .await;
     tokio::process::Command::new("brew")
         .args(["upgrade", "scriba"])
         .env("HOMEBREW_NO_ENV_HINTS", "1")
         .output()
         .await
         .map_err(|e| format!("brew upgrade failed: {}", e))
+}
+
+/// Versions of scriba Homebrew has installed, per `brew list --versions`.
+async fn brew_installed_versions() -> String {
+    tokio::process::Command::new("brew")
+        .args(["list", "--versions", "scriba"])
+        .env("HOMEBREW_NO_ENV_HINTS", "1")
+        .output()
+        .await
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default()
 }
 
 /// The part of brew's stderr worth showing: its `Error:` lines if any,
@@ -2125,10 +2145,18 @@ async fn perform_update(version: &str) -> Result<String, String> {
                     result = brew_upgrade().await?;
                 }
             }
-            if result.status.success() {
+            if !result.status.success() {
+                return Err(brew_error_summary(&String::from_utf8_lossy(&result.stderr)));
+            }
+            // Exit 0 also covers "already installed": check what brew actually has.
+            let plain_version = version.trim_start_matches('v');
+            if brew_installed_versions().await.contains(plain_version) {
                 return Ok(version.to_string());
             }
-            return Err(brew_error_summary(&String::from_utf8_lossy(&result.stderr)));
+            return Err(format!(
+                "Homebrew did not pick up {}; try `brew update && brew upgrade scriba`",
+                version_tag
+            ));
         }
     }
 
