@@ -2062,6 +2062,38 @@ fn version_newer(a: &str, b: &str) -> bool {
 }
 
 /// Perform the actual update. Returns the new version string on success.
+/// `brew upgrade scriba`, with Homebrew's environment hints silenced so the
+/// auto-update banner doesn't drown the actual outcome.
+async fn brew_upgrade() -> Result<std::process::Output, String> {
+    tokio::process::Command::new("brew")
+        .args(["upgrade", "scriba"])
+        .env("HOMEBREW_NO_ENV_HINTS", "1")
+        .output()
+        .await
+        .map_err(|e| format!("brew upgrade failed: {}", e))
+}
+
+/// The part of brew's stderr worth showing: its `Error:` lines if any,
+/// otherwise the last non-empty line (brew prints progress first and the
+/// failure last).
+fn brew_error_summary(stderr: &str) -> String {
+    let errors: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("Error:"))
+        .collect();
+    if !errors.is_empty() {
+        return errors.join(" ");
+    }
+    stderr
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .next_back()
+        .unwrap_or("brew upgrade failed")
+        .to_string()
+}
+
 async fn perform_update(version: &str) -> Result<String, String> {
     let version_tag = if version.starts_with('v') {
         version.to_string()
@@ -2075,19 +2107,28 @@ async fn perform_update(version: &str) -> Result<String, String> {
             .args(["list", "scriba"])
             .output()
             .await;
-        if let Ok(output) = brew_check {
-            if output.status.success() {
-                // Update via Homebrew
-                let result = tokio::process::Command::new("brew")
-                    .args(["upgrade", "scriba"])
-                    .output()
-                    .await
-                    .map_err(|e| format!("brew upgrade failed: {}", e))?;
-                if result.status.success() {
-                    return Ok(version.to_string());
+        if let Ok(output) = brew_check
+            && output.status.success()
+        {
+            // Update via Homebrew. Homebrew 6+ refuses to load third-party
+            // tap formulae until the tap is trusted; since Scriba was
+            // installed from our own tap, trust it and retry once.
+            let mut result = brew_upgrade().await?;
+            if !result.status.success() {
+                let stderr = String::from_utf8_lossy(&result.stderr);
+                if stderr.contains("brew trust") || stderr.contains("untrusted") {
+                    let _ = tokio::process::Command::new("brew")
+                        .args(["trust", "--tap", "giovannialberto/scriba"])
+                        .env("HOMEBREW_NO_ENV_HINTS", "1")
+                        .output()
+                        .await;
+                    result = brew_upgrade().await?;
                 }
-                return Err(String::from_utf8_lossy(&result.stderr).to_string());
             }
+            if result.status.success() {
+                return Ok(version.to_string());
+            }
+            return Err(brew_error_summary(&String::from_utf8_lossy(&result.stderr)));
         }
     }
 

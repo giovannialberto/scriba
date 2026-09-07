@@ -34,6 +34,7 @@ Run entirely **offline** with local STT models (Parakeet, Whisper, SenseVoice) +
 ```bash
 brew install ffmpeg
 brew tap giovannialberto/scriba
+brew trust --tap giovannialberto/scriba   # Homebrew 6+: allow formulae from this tap
 brew install scriba
 ```
 
