@@ -1,19 +1,23 @@
 // Scriba notification panel helper.
 //
-// Renders a macOS-notification-style floating panel in the top-right corner
-// of the main screen: vibrancy background, rounded corners, icon, title,
-// message, and (in confirm mode) Yes/No buttons. Unbundled CLI processes
-// cannot post real Notification Center banners with action buttons, so Scriba
-// draws its own.
+// Renders a notification-style floating card in the top-right corner of the
+// main screen: dark rounded card with an icon badge, title/subtitle, and (in
+// confirm mode) Ignore/Record pill buttons. Unbundled CLI processes cannot
+// post real Notification Center banners with action buttons, so Scriba draws
+// its own.
 //
 // Usage:
-//   notify-panel notify  --title T --message M [--timeout 5] [--sound Glass]
-//   notify-panel confirm --title T --message M --yes Record --no Ignore \
+//   notify-panel notify  --title T --subtitle S [--timeout 5] [--sound Glass]
+//   notify-panel confirm --title T --subtitle S --yes Record --no Ignore \
 //                        [--timeout 30] [--sound Glass]
+//   notify-panel confirm ... --snapshot /tmp/card.png   (render PNG and exit)
+//
+// The subtitle is prettified: bundle identifiers are resolved to app display
+// names via NSWorkspace (e.g. "company.thebrowser.browser.helper" -> "Arc").
 //
 // Prints exactly one line to stdout before exiting:
 //   confirm mode: "yes" | "no" | "timeout"
-//   notify mode:  "timeout" (after the display duration)
+//   notify mode:  "timeout" (after the display duration, or on click)
 //
 // Compiled at runtime by Scriba via swiftc (see src/core/notify.rs).
 
@@ -22,11 +26,12 @@ import AppKit
 struct Options {
     var mode = "notify"
     var title = "Scriba"
-    var message = ""
-    var yes = "OK"
-    var no = "Dismiss"
+    var subtitle = ""
+    var yes = "Record"
+    var no = "Ignore"
     var timeout: Double = 5
     var sound: String? = nil
+    var snapshot: String? = nil
 }
 
 func parseOptions() -> Options {
@@ -41,11 +46,12 @@ func parseOptions() -> Options {
         let value: String? = i + 1 < args.count ? args[i + 1] : nil
         switch args[i] {
         case "--title": if let v = value { o.title = v }
-        case "--message": if let v = value { o.message = v }
+        case "--subtitle", "--message": if let v = value { o.subtitle = v }
         case "--yes": if let v = value { o.yes = v }
         case "--no": if let v = value { o.no = v }
         case "--timeout": if let v = value, let t = Double(v) { o.timeout = t }
         case "--sound": o.sound = value
+        case "--snapshot": o.snapshot = value
         default:
             i -= 1 // flag without value: don't skip the next arg
         }
@@ -54,77 +60,68 @@ func parseOptions() -> Options {
     return o
 }
 
+/// Resolve a raw process identity (bundle id or executable name) to a
+/// human-friendly app name. Helper bundles resolve to their host app by
+/// progressively trimming trailing segments ("company.thebrowser.browser
+/// .helper" -> Arc).
+func friendlyAppName(_ raw: String) -> String {
+    let trimmed = raw.trimmingCharacters(in: .whitespaces)
+    if !trimmed.contains(".") || trimmed.contains(" ") { return trimmed }
+    var parts = trimmed.split(separator: ".").map(String.init)
+    var best: String? = nil
+    // Keep the shallowest resolution so helper bundles report their host app
+    // ("company.thebrowser.browser.helper" resolves to "Browser Helper", but
+    // "company.thebrowser.browser" resolves to "Arc" — prefer Arc).
+    while parts.count >= 2 {
+        let candidate = parts.joined(separator: ".")
+        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: candidate) {
+            let name = FileManager.default.displayName(atPath: url.path)
+            best = name.hasSuffix(".app") ? String(name.dropLast(4)) : name
+        }
+        parts.removeLast()
+    }
+    return best ?? trimmed
+}
+
+func prettySubtitle(_ raw: String) -> String {
+    let parts = raw.split(separator: ",").map {
+        friendlyAppName(String($0))
+    }
+    var seen = Set<String>()
+    let unique = parts.filter { seen.insert($0).inserted }
+    return unique.joined(separator: ", ")
+}
+
+// ── Palette ──────────────────────────────────────────────────────────────────
+let cardColor = NSColor(red: 0.157, green: 0.153, blue: 0.145, alpha: 0.985)
+let strokeColor = NSColor(white: 1.0, alpha: 0.07)
+let titleColor = NSColor(white: 1.0, alpha: 0.96)
+let subtitleColor = NSColor(white: 1.0, alpha: 0.55)
+let badgeColor = NSColor(white: 1.0, alpha: 0.10)
+let primaryPillColor = NSColor(white: 1.0, alpha: 0.92)
+let primaryPillText = NSColor(red: 0.12, green: 0.12, blue: 0.11, alpha: 1.0)
+let quietPillColor = NSColor(white: 1.0, alpha: 0.09)
+let quietPillText = NSColor(white: 1.0, alpha: 0.85)
+
 let opts = parseOptions()
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 
 let hasButtons = opts.mode == "confirm"
-
-// ── Layout ───────────────────────────────────────────────────────────────────
-let panelWidth: CGFloat = 356
-let pad: CGFloat = 14
-let iconColumn: CGFloat = 44
-let textWidth = panelWidth - pad * 2 - iconColumn
-let titleHeight: CGFloat = 18
-
-let messageLabel = NSTextField(wrappingLabelWithString: opts.message)
-messageLabel.font = NSFont.systemFont(ofSize: 12)
-messageLabel.textColor = .secondaryLabelColor
-let messageHeight = min(
-    messageLabel.sizeThatFits(NSSize(width: textWidth, height: 400)).height, 120)
-
-let buttonRow: CGFloat = hasButtons ? 40 : 0
-let panelHeight = pad + titleHeight + 3 + messageHeight + buttonRow + pad
-
-let panel = NSPanel(
-    contentRect: NSRect(x: 0, y: 0, width: panelWidth, height: panelHeight),
-    styleMask: [.borderless, .nonactivatingPanel],
-    backing: .buffered, defer: false)
-panel.level = .statusBar
-panel.isOpaque = false
-panel.backgroundColor = .clear
-panel.hasShadow = true
-panel.hidesOnDeactivate = false
-panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-
-let effect = NSVisualEffectView(
-    frame: NSRect(x: 0, y: 0, width: panelWidth, height: panelHeight))
-effect.material = .popover
-effect.blendingMode = .behindWindow
-effect.state = .active
-effect.wantsLayer = true
-effect.layer?.cornerRadius = 14
-effect.layer?.masksToBounds = true
-effect.layer?.borderWidth = 0.5
-effect.layer?.borderColor = NSColor.separatorColor.cgColor
-panel.contentView = effect
-
-let icon = NSTextField(labelWithString: "🎙️")
-icon.font = NSFont.systemFont(ofSize: 26)
-icon.frame = NSRect(
-    x: pad, y: panelHeight - pad - 34, width: iconColumn - 6, height: 34)
-effect.addSubview(icon)
-
-let titleLabel = NSTextField(labelWithString: opts.title)
-titleLabel.font = NSFont.boldSystemFont(ofSize: 13)
-titleLabel.textColor = .labelColor
-titleLabel.lineBreakMode = .byTruncatingTail
-titleLabel.frame = NSRect(
-    x: pad + iconColumn, y: panelHeight - pad - titleHeight,
-    width: textWidth, height: titleHeight)
-effect.addSubview(titleLabel)
-
-messageLabel.frame = NSRect(
-    x: pad + iconColumn,
-    y: panelHeight - pad - titleHeight - 3 - messageHeight,
-    width: textWidth, height: messageHeight)
-effect.addSubview(messageLabel)
+let title = opts.title
+let subtitle = prettySubtitle(opts.subtitle)
 
 // ── Result plumbing ──────────────────────────────────────────────────────────
+var panelRef: NSPanel? = nil
 var finished = false
 func finish(_ result: String) {
     if finished { return }
     finished = true
+    guard let panel = panelRef else {
+        print(result)
+        fflush(stdout)
+        exit(0)
+    }
     NSAnimationContext.runAnimationGroup(
         { ctx in
             ctx.duration = 0.15
@@ -140,35 +137,159 @@ func finish(_ result: String) {
 final class Handler: NSObject {
     @objc func yes(_ sender: Any?) { finish("yes") }
     @objc func no(_ sender: Any?) { finish("no") }
+    @objc func dismiss(_ sender: Any?) { finish("timeout") }
 }
 let handler = Handler()
 
-if hasButtons {
-    let yesButton = NSButton(
-        title: opts.yes, target: handler, action: #selector(Handler.yes(_:)))
-    yesButton.bezelStyle = .rounded
-    yesButton.keyEquivalent = "\r"
-    yesButton.sizeToFit()
-    let noButton = NSButton(
-        title: opts.no, target: handler, action: #selector(Handler.no(_:)))
-    noButton.bezelStyle = .rounded
-    noButton.sizeToFit()
-    let yesWidth = max(yesButton.frame.width, 76)
-    let noWidth = max(noButton.frame.width, 76)
-    yesButton.frame = NSRect(
-        x: panelWidth - pad - yesWidth, y: 11, width: yesWidth, height: 24)
-    noButton.frame = NSRect(
-        x: panelWidth - pad - yesWidth - 8 - noWidth, y: 11,
-        width: noWidth, height: 24)
-    effect.addSubview(noButton)
-    effect.addSubview(yesButton)
+// ── Building blocks ──────────────────────────────────────────────────────────
+func textWidth(_ string: String, font: NSFont) -> CGFloat {
+    (string as NSString).size(withAttributes: [.font: font]).width
 }
 
-// ── Show, top-right of the main screen ──────────────────────────────────────
+func makePill(
+    _ label: String, fill: NSColor, textColor: NSColor, action: Selector
+) -> NSButton {
+    let font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+    let button = NSButton(title: label, target: handler, action: action)
+    button.isBordered = false
+    button.wantsLayer = true
+    button.layer?.backgroundColor = fill.cgColor
+    button.layer?.cornerRadius = 16
+    button.layer?.cornerCurve = .continuous
+    button.attributedTitle = NSAttributedString(
+        string: label,
+        attributes: [.font: font, .foregroundColor: textColor])
+    let width = max(textWidth(label, font: font) + 30, 72)
+    button.frame = NSRect(x: 0, y: 0, width: width, height: 32)
+    return button
+}
+
+// ── Layout ───────────────────────────────────────────────────────────────────
+let titleFont = NSFont.systemFont(ofSize: 15, weight: .semibold)
+let subtitleFont = NSFont.systemFont(ofSize: 13, weight: .regular)
+
+let cardHeight: CGFloat = 66
+let leftPad: CGFloat = 14
+let badgeSize: CGFloat = 38
+let textGap: CGFloat = 12
+let rightPad: CGFloat = 14
+
+let yesPill = makePill(
+    opts.yes, fill: primaryPillColor, textColor: primaryPillText,
+    action: #selector(Handler.yes(_:)))
+yesPill.keyEquivalent = "\r"
+let noPill = makePill(
+    opts.no, fill: quietPillColor, textColor: quietPillText,
+    action: #selector(Handler.no(_:)))
+
+let buttonsWidth: CGFloat =
+    hasButtons ? noPill.frame.width + 8 + yesPill.frame.width + 16 : 0
+let naturalTextWidth = max(
+    textWidth(title, font: titleFont),
+    textWidth(subtitle, font: subtitleFont))
+let fixedWidth = leftPad + badgeSize + textGap + rightPad + buttonsWidth
+let cardWidth = min(max(fixedWidth + naturalTextWidth + 8, 320), 480)
+let labelWidth = cardWidth - fixedWidth
+
+let panel = NSPanel(
+    contentRect: NSRect(x: 0, y: 0, width: cardWidth, height: cardHeight),
+    styleMask: [.borderless, .nonactivatingPanel],
+    backing: .buffered, defer: false)
+panelRef = panel
+panel.level = .statusBar
+panel.isOpaque = false
+panel.backgroundColor = .clear
+panel.hasShadow = true
+panel.hidesOnDeactivate = false
+panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+
+let card = NSView(frame: NSRect(x: 0, y: 0, width: cardWidth, height: cardHeight))
+card.wantsLayer = true
+card.layer?.backgroundColor = cardColor.cgColor
+card.layer?.cornerRadius = 18
+card.layer?.cornerCurve = .continuous
+card.layer?.borderWidth = 1
+card.layer?.borderColor = strokeColor.cgColor
+panel.contentView = card
+
+// Icon badge: rounded square with a mic symbol.
+let badge = NSView(
+    frame: NSRect(
+        x: leftPad, y: (cardHeight - badgeSize) / 2,
+        width: badgeSize, height: badgeSize))
+badge.wantsLayer = true
+badge.layer?.backgroundColor = badgeColor.cgColor
+badge.layer?.cornerRadius = 11
+badge.layer?.cornerCurve = .continuous
+card.addSubview(badge)
+
+if let micImage = NSImage(
+    systemSymbolName: "mic.fill", accessibilityDescription: nil)
+{
+    let config = NSImage.SymbolConfiguration(pointSize: 16, weight: .semibold)
+    let imageView = NSImageView(
+        frame: NSRect(x: 0, y: 0, width: badgeSize, height: badgeSize))
+    imageView.image = micImage.withSymbolConfiguration(config)
+    imageView.contentTintColor = titleColor
+    badge.addSubview(imageView)
+}
+
+// Title / subtitle stack, vertically centered.
+let textX = leftPad + badgeSize + textGap
+let hasSubtitle = !subtitle.isEmpty
+
+let titleLabel = NSTextField(labelWithString: title)
+titleLabel.font = titleFont
+titleLabel.textColor = titleColor
+titleLabel.lineBreakMode = .byTruncatingTail
+let titleY: CGFloat = hasSubtitle ? cardHeight / 2 - 1 : (cardHeight - 18) / 2
+titleLabel.frame = NSRect(x: textX, y: titleY, width: labelWidth, height: 18)
+card.addSubview(titleLabel)
+
+if hasSubtitle {
+    let subtitleLabel = NSTextField(labelWithString: subtitle)
+    subtitleLabel.font = subtitleFont
+    subtitleLabel.textColor = subtitleColor
+    subtitleLabel.lineBreakMode = .byTruncatingTail
+    subtitleLabel.frame = NSRect(
+        x: textX, y: cardHeight / 2 - 18, width: labelWidth, height: 16)
+    card.addSubview(subtitleLabel)
+}
+
+if hasButtons {
+    yesPill.frame.origin = NSPoint(
+        x: cardWidth - rightPad - yesPill.frame.width,
+        y: (cardHeight - 32) / 2)
+    noPill.frame.origin = NSPoint(
+        x: yesPill.frame.origin.x - 8 - noPill.frame.width,
+        y: (cardHeight - 32) / 2)
+    card.addSubview(noPill)
+    card.addSubview(yesPill)
+} else {
+    // Click anywhere on a plain notification to dismiss it.
+    let click = NSClickGestureRecognizer(
+        target: handler, action: #selector(Handler.dismiss(_:)))
+    card.addGestureRecognizer(click)
+}
+
+// ── Snapshot mode: render the card to a PNG and exit (used for design QA) ───
+if let snapshotPath = opts.snapshot {
+    card.layoutSubtreeIfNeeded()
+    if let rep = card.bitmapImageRepForCachingDisplay(in: card.bounds) {
+        card.cacheDisplay(in: card.bounds, to: rep)
+        if let data = rep.representation(using: .png, properties: [:]) {
+            try? data.write(to: URL(fileURLWithPath: snapshotPath))
+        }
+    }
+    print("snapshot")
+    exit(0)
+}
+
+// ── Show, top-right of the main screen ───────────────────────────────────────
 if let screen = NSScreen.main {
     let vf = screen.visibleFrame
     panel.setFrameOrigin(
-        NSPoint(x: vf.maxX - panelWidth - 16, y: vf.maxY - panelHeight - 12))
+        NSPoint(x: vf.maxX - cardWidth - 16, y: vf.maxY - cardHeight - 12))
 }
 panel.alphaValue = 0
 panel.orderFrontRegardless()

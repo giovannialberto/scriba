@@ -127,7 +127,7 @@ fn try_notify(title: &str, body: &str) -> Result<()> {
                     "notify",
                     "--title",
                     title,
-                    "--message",
+                    "--subtitle",
                     body,
                     "--timeout",
                     "5",
@@ -174,6 +174,8 @@ fn try_notify(title: &str, body: &str) -> Result<()> {
 }
 
 /// Show a desktop confirmation with a yes/no choice and return the answer.
+/// `message` is the second line under the title (keep it short; the native
+/// panel renders it as a subtitle and resolves bundle IDs to app names).
 ///
 /// Blocks (async) until the user chooses, the dialog times out, or the future
 /// is dropped (the dialog process is killed on drop, so callers can cancel it
@@ -181,8 +183,8 @@ fn try_notify(title: &str, body: &str) -> Result<()> {
 /// back to `default_answer` — a plain notification is fired instead on
 /// failure so the event is not silently swallowed.
 ///
-/// - macOS: `osascript` `display dialog` with two buttons and `giving up
-///   after` the timeout.
+/// - macOS: native notification-style panel (top-right, pill buttons);
+///   `osascript` `display dialog` when the panel helper is unavailable.
 /// - Linux: `notify-send -A` action buttons (libnotify 0.7.9+).
 pub async fn confirm(
     title: &str,
@@ -229,7 +231,7 @@ async fn try_confirm(
                 "confirm",
                 "--title",
                 title,
-                "--message",
+                "--subtitle",
                 message,
                 "--yes",
                 yes_label,

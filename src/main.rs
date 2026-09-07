@@ -1397,13 +1397,12 @@ async fn run_watch(
         }
 
         let decision = if confirm {
-            let message = match &trigger {
-                Some(t) => format!("A meeting seems to have started ({t}). Record it?"),
-                None => "A meeting seems to have started. Record it?".to_string(),
-            };
+            // The panel shows this as the subtitle and resolves bundle IDs to
+            // app names (e.g. "company.thebrowser.browser.helper" -> "Arc").
+            let subtitle = trigger.clone().unwrap_or_default();
             let dialog = desktop_confirm(
                 "Scriba \u{00B7} Meeting detected",
-                &message,
+                &subtitle,
                 "Record",
                 "Ignore",
                 md.confirm_timeout_seconds,

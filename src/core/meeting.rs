@@ -215,28 +215,25 @@ pub fn run_meeting_watcher(
 
 /// Fire the desktop notification for a meeting event. `recorded` selects the
 /// wording (whether Scriba is/was recording the meeting or only observing);
-/// `detail` names the app that triggered the detection.
+/// `detail` names the app that triggered the detection and is shown as the
+/// notification's subtitle (the panel resolves bundle IDs to app names).
 pub fn notify_event(event: MeetingEvent, recorded: bool, detail: Option<&str>) {
-    let suffix = detail.map(|d| format!(" ({d})")).unwrap_or_default();
-    let (title, body) = match (event, recorded) {
+    let (title, subtitle) = match (event, recorded) {
         (MeetingEvent::MeetingStarted, true) => (
-            "Scriba \u{00B7} Meeting detected",
-            format!("A meeting seems to have started{suffix}. Scriba is recording it."),
+            "Scriba \u{00B7} Recording meeting",
+            detail.unwrap_or("Meeting detected").to_string(),
         ),
         (MeetingEvent::MeetingStarted, false) => (
             "Scriba \u{00B7} Meeting detected",
-            format!("A meeting seems to have started{suffix}."),
+            detail.unwrap_or("").to_string(),
         ),
         (MeetingEvent::MeetingEnded, true) => (
             "Scriba \u{00B7} Meeting ended",
-            "The meeting ended. Recording has stopped.".to_string(),
+            "Recording stopped".to_string(),
         ),
-        (MeetingEvent::MeetingEnded, false) => (
-            "Scriba \u{00B7} Meeting ended",
-            "The meeting ended.".to_string(),
-        ),
+        (MeetingEvent::MeetingEnded, false) => ("Scriba \u{00B7} Meeting ended", String::new()),
     };
-    super::notify::notify(title, &body);
+    super::notify::notify(title, &subtitle);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
