@@ -366,15 +366,61 @@ impl Dashboard {
         self.execute_record_and_transcribe().await
     }
 
-    /// Non-blocking recording indicator: one content line plus a separator,
-    /// rendered above whichever view is active. Pulsing dot, elapsed time,
-    /// live waveform, and the source app for meeting recordings.
+    /// Directory of a meeting recording whose capture is done but whose
+    /// transcription/enrichment is still running in the autopilot.
+    pub(super) fn processing_directory(&self) -> Option<String> {
+        self.recording_guard
+            .snapshot()
+            .filter(|i| i.phase == RecordingPhase::Processing)
+            .and_then(|i| i.directory)
+    }
+
+    /// Whether background work (TUI transcription queue or autopilot
+    /// finalization) is running for a recording.
+    pub(super) fn is_recording_busy(&self, directory_name: &str) -> bool {
+        self.is_transcription_pending_or_active(directory_name)
+            || self.processing_directory().as_deref() == Some(directory_name)
+    }
+
+    /// Keep the home list's per-row busy flags in sync with current state.
+    pub(super) fn refresh_home_busy(&mut self) {
+        let busy: Vec<bool> = self
+            .chat
+            .home_recordings
+            .iter()
+            .map(|r| self.is_recording_busy(&r.directory_name))
+            .collect();
+        for (rec, b) in self.chat.home_recordings.iter_mut().zip(busy) {
+            rec.busy = b;
+        }
+    }
+
+    /// Non-blocking recording indicator rendered at the top of non-home views:
+    /// one content line plus a separator.
     pub(super) fn render_recording_strip(&self, f: &mut Frame, area: Rect) {
         let aligned = Rect {
             x: area.x + 2,
             width: area.width.saturating_sub(4),
             ..area
         };
+        let line = self.recording_strip_line(aligned.width as usize, "");
+        f.render_widget(
+            Paragraph::new(line),
+            Rect { x: aligned.x, y: aligned.y, width: aligned.width, height: 1 },
+        );
+        if area.height > 1 {
+            let sep = "\u{2500}".repeat(aligned.width as usize);
+            f.render_widget(
+                Paragraph::new(sep).style(Style::default().fg(Color::Indexed(237))),
+                Rect { x: aligned.x, y: aligned.y + 1, width: aligned.width, height: 1 },
+            );
+        }
+    }
+
+    /// The recording indicator as a single line: pulsing dot, kind (with the
+    /// source app for meetings), elapsed time, live waveform, and a right-
+    /// aligned Ctrl+R hint; a spinner while finalization runs.
+    pub(super) fn recording_strip_line(&self, width: usize, margin: &str) -> Line<'static> {
         let info = self.recording_guard.snapshot();
         let (kind_label, source, phase, started) = match &info {
             Some(i) => (
@@ -393,7 +439,7 @@ impl Dashboard {
         let dim = Style::default().fg(Color::DarkGray);
         let bold = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
 
-        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut spans: Vec<Span<'static>> = vec![Span::raw(margin.to_string())];
         match phase {
             RecordingPhase::Recording => {
                 // Pulsing red dot (~1s period at the 100ms animation tick).
@@ -433,20 +479,10 @@ impl Dashboard {
         };
         let left_width: usize = spans.iter().map(|s| s.content.chars().count()).sum();
         let right_width: usize = hint.iter().map(|s| s.content.chars().count()).sum();
-        let gap = (aligned.width as usize).saturating_sub(left_width + right_width);
+        let gap = width.saturating_sub(left_width + right_width);
         spans.push(Span::raw(" ".repeat(gap)));
         spans.extend(hint);
-        f.render_widget(
-            Paragraph::new(Line::from(spans)),
-            Rect { x: aligned.x, y: aligned.y, width: aligned.width, height: 1 },
-        );
-        if area.height > 1 {
-            let sep = "\u{2500}".repeat(aligned.width as usize);
-            f.render_widget(
-                Paragraph::new(sep).style(Style::default().fg(Color::Indexed(237))),
-                Rect { x: aligned.x, y: aligned.y + 1, width: aligned.width, height: 1 },
-            );
-        }
+        Line::from(spans)
     }
 
     /// Recent mic levels as block-height characters, newest on the right.

@@ -178,7 +178,7 @@ impl WorkflowManager {
                 .await?;
                 result.recording_name
             }
-            RecordingMode::Meeting { stop_rx, level_tx, silence_timeout, verbose } => {
+            RecordingMode::Meeting { stop_rx, level_tx, saved_tx, silence_timeout, verbose } => {
                 let result = record_audio(
                     recording_path,
                     RecordOptions {
@@ -192,6 +192,9 @@ impl WorkflowManager {
                     },
                 )
                 .await?;
+                if let Some(tx) = saved_tx {
+                    let _ = tx.send(result.recording_name.clone());
+                }
                 result.recording_name
             }
         };
@@ -685,6 +688,7 @@ impl WorkflowManager {
         transcription_mode: Option<TranscriptionMode>,
         stop_rx: mpsc::Receiver<()>,
         level_tx: Option<mpsc::Sender<f32>>,
+        saved_tx: Option<tokio::sync::oneshot::Sender<String>>,
         silence_timeout: Option<Duration>,
         verbose: bool,
     ) -> Result<ManagedRecording> {
@@ -694,7 +698,7 @@ impl WorkflowManager {
             auto_transcribe,
             transcription_mode,
         };
-        let mode = RecordingMode::Meeting { stop_rx, level_tx, silence_timeout, verbose };
+        let mode = RecordingMode::Meeting { stop_rx, level_tx, saved_tx, silence_timeout, verbose };
         self.complete_recording_workflow(config, mode).await
     }
 

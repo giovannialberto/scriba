@@ -55,6 +55,9 @@ pub struct RecordingInfo {
     /// App that triggered a meeting recording (e.g. "Arc"), when known.
     pub source: Option<String>,
     pub started: Instant,
+    /// Recording directory once the captured audio has been saved (capture is
+    /// over; finalization is running).
+    pub directory: Option<String>,
 }
 
 /// Shared "what is being recorded right now" between the autopilot and the
@@ -81,9 +84,19 @@ impl RecordingStatus {
             phase: RecordingPhase::Recording,
             source,
             started: Instant::now(),
+            directory: None,
         });
         self.set_level(0.0);
         true
+    }
+
+    /// The captured audio was saved to `directory`: capture is over and
+    /// finalization (encode/transcribe/enrich) is in progress.
+    pub fn set_saved(&self, directory: String) {
+        if let Some(info) = self.current.lock().unwrap().as_mut() {
+            info.directory = Some(directory);
+            info.phase = RecordingPhase::Processing;
+        }
     }
 
     pub fn set_phase(&self, phase: RecordingPhase) {
@@ -535,6 +548,10 @@ pub async fn run_autopilot(
                 level_sink.set_level(level);
             }
         });
+        // Fires as soon as the raw recording is saved, so the TUI can show the
+        // new recording (and its processing spinner) without waiting for
+        // transcription to finish.
+        let (saved_tx, mut saved_rx) = tokio::sync::oneshot::channel::<String>();
         let rec_verbose = !quiet;
         let mut rec_task = tokio::spawn(async move {
             workflow
@@ -545,6 +562,7 @@ pub async fn run_autopilot(
                     transcription_mode,
                     stop_rx,
                     Some(level_tx),
+                    Some(saved_tx),
                     silence_net,
                     rec_verbose,
                 )
@@ -554,10 +572,17 @@ pub async fn run_autopilot(
         let mut meeting_ended = false;
         let mut interrupted = false;
         let mut user_stopped = false;
+        let mut saved_seen = false;
         let mut watcher_alive = exclude_self;
         let rec_result = loop {
             tokio::select! {
                 biased;
+                saved = &mut saved_rx, if !saved_seen => {
+                    saved_seen = true;
+                    if let Ok(directory) = saved {
+                        recording_guard.set_saved(directory);
+                    }
+                }
                 _ = wait_shutdown(&mut shutdown), if !interrupted => {
                     interrupted = true;
                     recording_guard.set_phase(RecordingPhase::Processing);

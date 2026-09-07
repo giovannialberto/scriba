@@ -619,7 +619,8 @@ impl Dashboard {
 
             let is_selected = i == selected_idx;
             let is_active = self.active_transcription.as_ref()
-                .is_some_and(|a| a.recording_name == recording.directory_name);
+                .is_some_and(|a| a.recording_name == recording.directory_name)
+                || self.processing_directory().as_deref() == Some(recording.directory_name.as_str());
             let is_queued = !is_active
                 && self.transcription_queue.iter().any(|p| p.recording_name() == recording.directory_name);
 

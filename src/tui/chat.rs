@@ -85,9 +85,12 @@ impl ChatMessage {
 #[derive(Debug, Clone)]
 pub struct HomeRecording {
     pub recording_id: i64,
+    pub directory_name: String,
     pub name: String,
     pub duration_mins: i64,
     pub summary_line: Option<String>,
+    /// Background work (transcription/enrichment) running for this recording.
+    pub busy: bool,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -137,6 +140,9 @@ pub struct ChatState {
 
     // Home screen timeline
     pub home_recordings: Vec<HomeRecording>,
+    /// Recording indicator injected under the logo while recording (set by
+    /// the dashboard each frame; empty when idle).
+    pub recording_lines: Vec<Line<'static>>,
     pub selected_action: usize,
     pub show_home_screen: bool,
 
@@ -207,6 +213,7 @@ impl ChatState {
             greeting_subtitle: String::new(),
             borderless: false,
             home_recordings: Vec::new(),
+            recording_lines: Vec::new(),
             selected_action: 0,
             show_home_screen: true,
             action_menu_open: false,
@@ -561,6 +568,16 @@ impl ChatState {
             all_lines.push(Line::from(""));
             content_texts.push(String::new());
 
+            // Recording indicator (below the logo, above the timeline)
+            if !self.recording_lines.is_empty() {
+                for line in &self.recording_lines {
+                    all_lines.push(line.clone());
+                    content_texts.push(String::new());
+                }
+                all_lines.push(Line::from(""));
+                content_texts.push(String::new());
+            }
+
             // Timeline entry 1: System initialization
             let init_text = format!("{}\u{25CB}  System initialization complete.", margin);
             content_texts.push(init_text.clone());
@@ -612,9 +629,15 @@ impl ChatState {
                 };
                 all_lines.push(Line::from(Span::styled(rec_line, rec_style)));
 
-                // Summary line if present — truncate to fit
+                // Background work indicator, else summary line if present
                 let vert = if is_last { " " } else { "\u{2502}" };
-                if let Some(ref summary) = rec.summary_line {
+                if rec.busy {
+                    let spinners = ['\u{25D0}', '\u{25D3}', '\u{25D1}', '\u{25D2}'];
+                    let spinner = spinners[(self.spinner_frame / 2) % spinners.len()];
+                    let busy_line = format!("{}   {}   {} transcribing\u{2026}", margin, vert, spinner);
+                    content_texts.push(String::new());
+                    all_lines.push(Line::from(Span::styled(busy_line, Style::default().fg(Color::Yellow))));
+                } else if let Some(ref summary) = rec.summary_line {
                     let sum_prefix = format!("{}   {}   ", margin, vert);
                     let max_sum = tree_max.saturating_sub(sum_prefix.chars().count());
                     let truncated: String = if summary.chars().count() > max_sum {
