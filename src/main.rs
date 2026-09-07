@@ -2,8 +2,8 @@ use anyhow::Result;
 use scriba::core::{
     resolve_transcription_mode, AudioFormat, CloudProvider, CompressionSettings, EnrichmentMode,
     LocalModel, MeetingEvent, MeetingWatcherConfig, ScribaConfig, TranscriptionMode,
-    WorkflowManager, initialize_world_from_seed, mic_in_use_by_others, notify_event,
-    run_meeting_watcher, watcher_excludes_self,
+    WorkflowManager, capturing_processes, desktop_confirm, initialize_world_from_seed,
+    meeting_signal, notify_event, run_meeting_watcher, watcher_excludes_self,
 };
 use scriba::database::Database;
 use scriba::enrichment::WorldContext;
@@ -158,6 +158,11 @@ enum Command {
             help = "Skip transcription after an auto-recorded meeting"
         )]
         no_transcribe: bool,
+        #[structopt(
+            long = "no-confirm",
+            help = "Record immediately without asking via the Record/Ignore dialog"
+        )]
+        no_confirm: bool,
         #[structopt(
             long = "min-silence-seconds",
             help = "Fallback: seconds of silence to auto-stop a meeting recording if the mic-release signal is unavailable"
@@ -608,6 +613,7 @@ async fn main() -> Result<()> {
                 Command::Watch {
                     no_auto_record,
                     no_transcribe,
+                    no_confirm,
                     min_silence_seconds,
                     device,
                     verbose,
@@ -616,6 +622,7 @@ async fn main() -> Result<()> {
                     run_watch(
                         no_auto_record,
                         no_transcribe,
+                        no_confirm,
                         min_silence_seconds,
                         device,
                         verbose,
@@ -1177,11 +1184,19 @@ async fn watcher_exit_error(watcher: &mut WatcherHandle) -> anyhow::Error {
     }
 }
 
+/// What to do with a detected meeting after the optional confirmation step.
+enum MeetingDecision {
+    Record,
+    Skip,
+    AlreadyEnded,
+}
+
 /// Background meeting watcher (`scriba watch`).
 ///
 /// Detects the start of a meeting by watching whether a microphone is in use
-/// by another process (Zoom/Meet grab the mic on join). Fires a desktop
-/// notification, and — when auto-record is on — records the meeting.
+/// by another process (Zoom/Meet grab the mic on join). By default asks via a
+/// Record/Ignore dialog, then records the meeting; `--no-confirm` records
+/// immediately and `--no-auto-record` only notifies.
 ///
 /// Where the OS attributes mic use per process (macOS 14+, PulseAudio/
 /// PipeWire), the watcher keeps running during the recording with Scriba's own
@@ -1189,9 +1204,17 @@ async fn watcher_exit_error(watcher: &mut WatcherHandle) -> anyhow::Error {
 /// releases the mic; the silence timeout is only a fallback net. On older
 /// macOS the watcher can't tell Scriba's capture from the meeting's, so it is
 /// paused while recording and the silence timeout is the stop mechanism.
+///
+/// After each recording a cooldown suppresses new detections, so another
+/// recording tool reacting to Scriba's capture can't trigger a feedback loop
+/// of tiny recordings (`meeting_detection.cooldown_seconds`; listing the tool
+/// in `meeting_detection.ignored_processes` removes it from detection
+/// entirely).
+#[allow(clippy::too_many_arguments)]
 async fn run_watch(
     no_auto_record: bool,
     no_transcribe: bool,
+    no_confirm: bool,
     min_silence_seconds: Option<u32>,
     device: Option<String>,
     verbose: bool,
@@ -1203,6 +1226,9 @@ async fn run_watch(
     let md = &mut config.meeting_detection;
     if no_auto_record {
         md.auto_record = false;
+    }
+    if no_confirm {
+        md.confirm_before_record = false;
     }
     if let Some(s) = min_silence_seconds {
         md.min_silence_seconds = s;
@@ -1221,11 +1247,19 @@ async fn run_watch(
 
     let md = config.meeting_detection.clone();
     let auto_record = md.auto_record;
+    let confirm = md.confirm_before_record;
     let silence_fallback = Duration::from_secs(md.min_silence_seconds as u64);
+    let cooldown = Duration::from_secs(md.cooldown_seconds as u64);
     let exclude_self = watcher_excludes_self();
 
     println!("👀 Scriba meeting watcher is running...");
     println!("   Detection watches whether another process is using a microphone.");
+    if auto_record && confirm {
+        println!(
+            "   A Record/Ignore dialog is shown on detection (records after {}s if unanswered).",
+            md.confirm_timeout_seconds
+        );
+    }
     if auto_record && !exclude_self {
         println!(
             "   Note: this system can't attribute mic use per process, so recordings stop after {}s of silence instead of on mic release.",
@@ -1235,20 +1269,42 @@ async fn run_watch(
     println!("   Press Ctrl+C to stop.");
     if verbose {
         println!(
-            "   auto_record={} exclude_self={} silence_fallback={}s",
-            auto_record, exclude_self, md.min_silence_seconds
+            "   auto_record={} confirm={} exclude_self={} silence_fallback={}s cooldown={}s ignored={:?}",
+            auto_record,
+            confirm,
+            exclude_self,
+            md.min_silence_seconds,
+            md.cooldown_seconds,
+            md.ignored_processes
         );
     }
 
     let watcher_cfg = MeetingWatcherConfig {
         input_device: md.input_device.clone(),
+        ignored_processes: md.ignored_processes.clone(),
         verbose,
     };
+
+    // Surface anything already holding the mic: a meeting in progress won't be
+    // detected until it ends, and another recording tool showing up here is a
+    // candidate for `meeting_detection.ignored_processes`.
+    if let Ok(procs) = capturing_processes(&watcher_cfg)
+        && !procs.is_empty()
+    {
+        println!(
+            "   ⚠️  Mic currently in use by: {} — a meeting already in progress is not detected until it ends.",
+            procs.join(", ")
+        );
+    }
+
     let mut watcher = spawn_watcher(watcher_cfg.clone());
 
     // Set when an auto-recording stopped (silence fallback) before the meeting
     // app released the mic: the next MeetingEnded should still notify.
     let mut pending_end_notify = false;
+    // After a recording finishes, suppress new detections until this instant
+    // (breaks feedback loops with other recording tools reacting to us).
+    let mut cooldown_until: Option<tokio::time::Instant> = None;
 
     'outer: loop {
         // Phase 1: wait for a meeting to start.
@@ -1257,11 +1313,36 @@ async fn run_watch(
                 biased;
                 _ = tokio::signal::ctrl_c() => break 'outer,
                 evt = watcher.events.recv() => match evt {
-                    Some(MeetingEvent::MeetingStarted) => break,
+                    Some(MeetingEvent::MeetingStarted) => {
+                        match cooldown_until {
+                            Some(until) if tokio::time::Instant::now() < until => {
+                                if verbose {
+                                    println!("🧊 Detection during post-recording cooldown — waiting it out.");
+                                }
+                                tokio::select! {
+                                    biased;
+                                    _ = tokio::signal::ctrl_c() => break 'outer,
+                                    _ = tokio::time::sleep_until(until) => {}
+                                }
+                                cooldown_until = None;
+                                // Discard events raced during the cooldown and
+                                // judge by the current state instead.
+                                while watcher.events.try_recv().is_ok() {}
+                                if meeting_signal(&watcher_cfg).unwrap_or(false) {
+                                    break; // outlasted the cooldown: a real meeting
+                                }
+                                // Fizzled during cooldown: keep waiting.
+                            }
+                            _ => {
+                                cooldown_until = None;
+                                break;
+                            }
+                        }
+                    }
                     Some(MeetingEvent::MeetingEnded) => {
                         if pending_end_notify {
                             pending_end_notify = false;
-                            notify_event(MeetingEvent::MeetingEnded, true);
+                            notify_event(MeetingEvent::MeetingEnded, true, None);
                             if once {
                                 break 'outer;
                             }
@@ -1272,17 +1353,22 @@ async fn run_watch(
             }
         }
 
-        notify_event(MeetingEvent::MeetingStarted, auto_record);
+        // Which app triggered the detection (dialog / notification wording).
+        let trigger = capturing_processes(&watcher_cfg)
+            .ok()
+            .filter(|p| !p.is_empty())
+            .map(|p| p.join(", "));
 
-        // Notification-only mode: wait for the end, notify, loop.
+        // Notification-only mode: announce start and end, never record.
         if !auto_record {
+            notify_event(MeetingEvent::MeetingStarted, false, trigger.as_deref());
             loop {
                 tokio::select! {
                     biased;
                     _ = tokio::signal::ctrl_c() => break 'outer,
                     evt = watcher.events.recv() => match evt {
                         Some(MeetingEvent::MeetingEnded) => {
-                            notify_event(MeetingEvent::MeetingEnded, false);
+                            notify_event(MeetingEvent::MeetingEnded, false, None);
                             break;
                         }
                         Some(_) => {}
@@ -1294,6 +1380,75 @@ async fn run_watch(
                 break;
             }
             continue;
+        }
+
+        let decision = if confirm {
+            let message = match &trigger {
+                Some(t) => format!("A meeting seems to have started ({t}). Record it?"),
+                None => "A meeting seems to have started. Record it?".to_string(),
+            };
+            let dialog = desktop_confirm(
+                "Scriba \u{00B7} Meeting detected",
+                &message,
+                "Record",
+                "Ignore",
+                md.confirm_timeout_seconds,
+                true,
+            );
+            tokio::pin!(dialog);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = tokio::signal::ctrl_c() => break 'outer,
+                    answer = &mut dialog => {
+                        break if answer { MeetingDecision::Record } else { MeetingDecision::Skip };
+                    }
+                    evt = watcher.events.recv() => match evt {
+                        // Meeting over before the user answered: the dropped
+                        // dialog future kills the dialog process.
+                        Some(MeetingEvent::MeetingEnded) => break MeetingDecision::AlreadyEnded,
+                        Some(_) => {}
+                        None => return Err(watcher_exit_error(&mut watcher).await),
+                    },
+                }
+            }
+        } else {
+            notify_event(MeetingEvent::MeetingStarted, true, trigger.as_deref());
+            MeetingDecision::Record
+        };
+
+        match decision {
+            MeetingDecision::AlreadyEnded => {
+                notify_event(MeetingEvent::MeetingEnded, false, None);
+                if once {
+                    break;
+                }
+                continue;
+            }
+            MeetingDecision::Skip => {
+                if verbose {
+                    println!("🙈 Recording declined — ignoring this meeting.");
+                }
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = tokio::signal::ctrl_c() => break 'outer,
+                        evt = watcher.events.recv() => match evt {
+                            Some(MeetingEvent::MeetingEnded) => {
+                                notify_event(MeetingEvent::MeetingEnded, false, None);
+                                break;
+                            }
+                            Some(_) => {}
+                            None => return Err(watcher_exit_error(&mut watcher).await),
+                        },
+                    }
+                }
+                if once {
+                    break;
+                }
+                continue;
+            }
+            MeetingDecision::Record => {}
         }
 
         if !exclude_self {
@@ -1359,6 +1514,9 @@ async fn run_watch(
                 evt = watcher.events.recv(), if watcher_alive && !meeting_ended => match evt {
                     Some(MeetingEvent::MeetingEnded) => {
                         meeting_ended = true;
+                        // Notify right away — finalization (encode, DB,
+                        // transcription) can take a while.
+                        notify_event(MeetingEvent::MeetingEnded, true, None);
                         if verbose {
                             println!("📴 Meeting app released the mic — stopping recording.");
                         }
@@ -1384,9 +1542,12 @@ async fn run_watch(
             break;
         }
 
+        cooldown_until = Some(tokio::time::Instant::now() + cooldown);
+
         if exclude_self {
             if meeting_ended {
-                notify_event(MeetingEvent::MeetingEnded, true);
+                // End notification already fired the moment the mic was
+                // released.
                 if once {
                     break;
                 }
@@ -1400,7 +1561,7 @@ async fn run_watch(
             // giving our own just-closed stream a moment to disappear.
             tokio::time::sleep(Duration::from_millis(1500)).await;
             loop {
-                if !mic_in_use_by_others().unwrap_or(false) {
+                if !meeting_signal(&watcher_cfg).unwrap_or(false) {
                     break;
                 }
                 tokio::select! {
@@ -1409,7 +1570,7 @@ async fn run_watch(
                     _ = tokio::time::sleep(Duration::from_secs(1)) => {}
                 }
             }
-            notify_event(MeetingEvent::MeetingEnded, true);
+            notify_event(MeetingEvent::MeetingEnded, true, None);
             if once {
                 break;
             }

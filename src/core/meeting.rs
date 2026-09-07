@@ -14,6 +14,12 @@
 //! property reads are cheap and re-enumerating on every poll also picks up
 //! hot-plugged devices (e.g. AirPods connected when joining a call).
 //!
+//! Processes listed in `ignored_processes` (case-insensitive substring match
+//! on the bundle ID / process name) never count as a meeting. This matters
+//! when another recording tool runs on the same machine: each tool's recording
+//! looks like a meeting to the other, producing a feedback loop of tiny
+//! recordings unless one of them is ignored.
+//!
 //! Platform implementations:
 //! - **macOS 14+**: Core Audio process objects
 //!   (`kAudioHardwarePropertyProcessObjectList` +
@@ -21,9 +27,9 @@
 //!   attribution keeps working *while Scriba records*, so a meeting's end is
 //!   detected the moment the meeting app releases the mic.
 //! - **older macOS**: falls back to `kAudioDevicePropertyDeviceIsRunningSomewhere`
-//!   across all input devices. This cannot exclude Scriba's own capture, so
-//!   callers must pause the watcher while recording (see
-//!   [`watcher_excludes_self`]).
+//!   across all input devices. This cannot exclude Scriba's own capture (nor
+//!   apply the ignore list), so callers must pause the watcher while recording
+//!   (see [`watcher_excludes_self`]).
 //! - **Linux**: polls `pactl list source-outputs` (PulseAudio/PipeWire),
 //!   excluding Scriba's own PID, corked streams, and monitor sources.
 //! - Other platforms: not supported.
@@ -48,6 +54,9 @@ pub struct MeetingWatcherConfig {
     /// Linux: only count source-outputs on sources whose name contains this
     /// (substring match). `None` = any. Ignored on macOS.
     pub input_device: Option<String>,
+    /// Processes whose mic capture never counts as a meeting
+    /// (case-insensitive substring match on bundle ID / process name).
+    pub ignored_processes: Vec<String>,
     pub verbose: bool,
 }
 
@@ -61,11 +70,37 @@ pub fn watcher_excludes_self() -> bool {
     platform::excludes_self()
 }
 
-/// One-shot query: is a microphone currently in use (by another process,
-/// where the platform can tell)? Used by the fallback orchestration path to
-/// wait for the meeting app to release the mic after a recording finishes.
-pub fn mic_in_use_by_others() -> Result<bool> {
-    platform::mic_in_use_by_others(&None)
+/// One-shot query: is the meeting signal currently active (a non-ignored
+/// process other than us capturing a mic)?
+pub fn meeting_signal(config: &MeetingWatcherConfig) -> Result<bool> {
+    Ok(!capturing_processes(config)?.is_empty())
+}
+
+/// One-shot query: names of the processes currently driving the meeting
+/// signal (after PID/ignore/source filtering). Empty = no meeting.
+pub fn capturing_processes(config: &MeetingWatcherConfig) -> Result<Vec<String>> {
+    platform::capturing_others(&config.input_device, &config.ignored_processes)
+}
+
+/// System processes that capture the mic for reasons that are never a
+/// meeting. `com.apple.CoreSpeech` in particular grabs the mic right after
+/// any recording ends (Siri/dictation re-arming), which would otherwise
+/// read as a new meeting and loop forever.
+const BUILTIN_IGNORED: &[&str] = &[
+    "com.apple.corespeech",
+    "com.apple.siri",
+    "com.apple.dictation",
+    "com.apple.assistant",
+];
+
+/// Case-insensitive substring match of a process name against the built-in
+/// and user-configured ignore lists.
+fn is_ignored(name: &str, ignored: &[String]) -> bool {
+    let lower = name.to_lowercase();
+    BUILTIN_IGNORED.iter().any(|p| lower.contains(p))
+        || ignored
+            .iter()
+            .any(|p| !p.is_empty() && lower.contains(&p.to_lowercase()))
 }
 
 /// Map a state transition of the "mic in use by others" signal to an event.
@@ -133,11 +168,19 @@ pub fn run_meeting_watcher(
     }
     // The first probe doubles as an availability check: fail fast instead of
     // silently watching a signal that can never change.
-    let initial = platform::mic_in_use_by_others(&config.input_device)?;
+    let initial = platform::capturing_others(&config.input_device, &config.ignored_processes)?;
     if config.verbose {
-        println!("   initial mic-in-use-by-others = {initial}");
+        if initial.is_empty() {
+            println!("   initial mic-in-use-by-others = false");
+        } else {
+            println!(
+                "   initial mic-in-use-by-others = true ({})",
+                initial.join(", ")
+            );
+        }
     }
-    let mut debouncer = Debouncer::new(initial);
+    let mut debouncer = Debouncer::new(!initial.is_empty());
+    let mut last_names = initial;
 
     while !stop.load(Ordering::Relaxed) {
         if event_tx.is_closed() {
@@ -146,10 +189,23 @@ pub fn run_meeting_watcher(
         std::thread::sleep(platform::POLL);
         // Transient probe errors (e.g. a device disappearing mid-read) keep
         // the previous state rather than fabricating a transition.
-        let now = platform::mic_in_use_by_others(&config.input_device).unwrap_or(debouncer.settled);
+        let now = match platform::capturing_others(&config.input_device, &config.ignored_processes)
+        {
+            Ok(names) => {
+                last_names = names;
+                !last_names.is_empty()
+            }
+            Err(_) => debouncer.settled,
+        };
         if let Some(evt) = debouncer.update(now) {
             if config.verbose {
-                println!("mic-in-use transition: {:?}", evt);
+                match evt {
+                    MeetingEvent::MeetingStarted => println!(
+                        "mic-in-use transition: MeetingStarted ({})",
+                        last_names.join(", ")
+                    ),
+                    MeetingEvent::MeetingEnded => println!("mic-in-use transition: MeetingEnded"),
+                }
             }
             let _ = event_tx.try_send(evt);
         }
@@ -158,26 +214,29 @@ pub fn run_meeting_watcher(
 }
 
 /// Fire the desktop notification for a meeting event. `recorded` selects the
-/// wording: whether Scriba is/was recording the meeting or only observing.
-pub fn notify_event(event: MeetingEvent, recorded: bool) {
+/// wording (whether Scriba is/was recording the meeting or only observing);
+/// `detail` names the app that triggered the detection.
+pub fn notify_event(event: MeetingEvent, recorded: bool, detail: Option<&str>) {
+    let suffix = detail.map(|d| format!(" ({d})")).unwrap_or_default();
     let (title, body) = match (event, recorded) {
         (MeetingEvent::MeetingStarted, true) => (
             "Scriba \u{00B7} Meeting detected",
-            "A meeting seems to have started. Scriba is recording it.",
+            format!("A meeting seems to have started{suffix}. Scriba is recording it."),
         ),
         (MeetingEvent::MeetingStarted, false) => (
             "Scriba \u{00B7} Meeting detected",
-            "A meeting seems to have started.",
+            format!("A meeting seems to have started{suffix}."),
         ),
         (MeetingEvent::MeetingEnded, true) => (
             "Scriba \u{00B7} Meeting ended",
-            "The meeting ended. Recording has stopped.",
+            "The meeting ended. Recording has stopped.".to_string(),
         ),
-        (MeetingEvent::MeetingEnded, false) => {
-            ("Scriba \u{00B7} Meeting ended", "The meeting ended.")
-        }
+        (MeetingEvent::MeetingEnded, false) => (
+            "Scriba \u{00B7} Meeting ended",
+            "The meeting ended.".to_string(),
+        ),
     };
-    super::notify::notify(title, body);
+    super::notify::notify(title, &body);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -187,7 +246,8 @@ pub fn notify_event(event: MeetingEvent, recorded: bool) {
 #[cfg(target_os = "macos")]
 mod platform {
     use super::*;
-    use std::sync::OnceLock;
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
     use std::time::Duration;
 
     pub const POLL: Duration = Duration::from_millis(250);
@@ -227,6 +287,19 @@ mod platform {
         ) -> OSStatus;
     }
 
+    // CoreFoundation, for reading CFString-valued properties (bundle IDs).
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFStringGetCString(
+            theString: *const std::ffi::c_void,
+            buffer: *mut std::ffi::c_char,
+            bufferSize: isize,
+            encoding: u32,
+        ) -> u8;
+        fn CFRelease(cf: *const std::ffi::c_void);
+    }
+    const CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+
     // Four-char-code selectors and scopes (packed big-endian).
     const SEL_DEVICES: u32 = u32::from_be_bytes(*b"dev#");
     const SEL_RUNNING_SOMEWHERE: u32 = u32::from_be_bytes(*b"irun");
@@ -234,6 +307,7 @@ mod platform {
     // Process objects (macOS 14+): per-process audio activity.
     const SEL_PROCESS_OBJECT_LIST: u32 = u32::from_be_bytes(*b"prs#");
     const SEL_PROCESS_PID: u32 = u32::from_be_bytes(*b"ppid");
+    const SEL_PROCESS_BUNDLE_ID: u32 = u32::from_be_bytes(*b"pbid");
     const SEL_PROCESS_IS_RUNNING_INPUT: u32 = u32::from_be_bytes(*b"piri");
 
     const SCOPE_GLOBAL: u32 = u32::from_be_bytes(*b"glob");
@@ -262,25 +336,113 @@ mod platform {
         }
     }
 
-    /// Is a microphone in use — by a process other than us where the OS can
-    /// tell (macOS 14+), by anyone otherwise. The device filter is ignored on
-    /// macOS.
-    pub fn mic_in_use_by_others(_filter: &Option<String>) -> Result<bool> {
+    /// Names of processes (other than us, not ignored) currently capturing
+    /// mic input. On pre-14 macOS the device-level fallback cannot attribute
+    /// usage, so an active mic reports a single "unknown process" entry and
+    /// the ignore list has no effect. The device filter is ignored on macOS.
+    pub fn capturing_others(_filter: &Option<String>, ignored: &[String]) -> Result<Vec<String>> {
         if process_api_available() {
             let own_pid = std::process::id();
             let procs = get_audio_objects(SYSTEM_OBJECT, SEL_PROCESS_OBJECT_LIST, SCOPE_GLOBAL)?;
+            let mut names = Vec::new();
             for proc_obj in procs {
-                if get_prop_u32(proc_obj, SEL_PROCESS_PID).ok() == Some(own_pid) {
+                let pid = get_prop_u32(proc_obj, SEL_PROCESS_PID).unwrap_or(0);
+                if pid == own_pid {
                     continue;
                 }
-                if get_prop_u32(proc_obj, SEL_PROCESS_IS_RUNNING_INPUT).unwrap_or(0) != 0 {
-                    return Ok(true);
+                if get_prop_u32(proc_obj, SEL_PROCESS_IS_RUNNING_INPUT).unwrap_or(0) == 0 {
+                    continue;
                 }
+                let name = display_name(pid, proc_obj);
+                if is_ignored(&name, ignored) {
+                    continue;
+                }
+                names.push(name);
             }
-            Ok(false)
+            Ok(names)
         } else {
             let devices = enumerate_input_devices()?;
-            compute_in_use(&devices)
+            if compute_in_use(&devices)? {
+                Ok(vec!["unknown process".to_string()])
+            } else {
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    /// Human-readable name for a capturing process: bundle ID when the HAL
+    /// knows it, executable name otherwise. Cached per PID (PIDs recycle
+    /// rarely and the probe runs several times a second).
+    fn display_name(pid: u32, proc_obj: AudioObjectID) -> String {
+        static CACHE: OnceLock<Mutex<HashMap<u32, String>>> = OnceLock::new();
+        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Some(name) = cache.lock().unwrap().get(&pid) {
+            return name.clone();
+        }
+        let name = process_bundle_id(proc_obj)
+            .or_else(|| process_name_from_ps(pid))
+            .unwrap_or_else(|| format!("pid {pid}"));
+        cache.lock().unwrap().insert(pid, name.clone());
+        name
+    }
+
+    /// Read `kAudioProcessPropertyBundleID` (a CFString) from a process object.
+    fn process_bundle_id(proc_obj: AudioObjectID) -> Option<String> {
+        let addr = AudioObjectPropertyAddress {
+            mSelector: SEL_PROCESS_BUNDLE_ID,
+            mScope: SCOPE_GLOBAL,
+            mElement: ELEMENT_WILDCARD,
+        };
+        let mut cf: *const std::ffi::c_void = std::ptr::null();
+        let mut size = std::mem::size_of::<*const std::ffi::c_void>() as u32;
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                proc_obj,
+                &addr,
+                0,
+                std::ptr::null(),
+                &mut size,
+                &mut cf as *mut *const std::ffi::c_void as *mut std::ffi::c_void,
+            )
+        };
+        if status != 0 || cf.is_null() {
+            return None;
+        }
+        let mut buf = [0u8; 256];
+        let ok = unsafe {
+            CFStringGetCString(
+                cf,
+                buf.as_mut_ptr() as *mut std::ffi::c_char,
+                buf.len() as isize,
+                CF_STRING_ENCODING_UTF8,
+            )
+        };
+        unsafe { CFRelease(cf) };
+        if ok == 0 {
+            return None;
+        }
+        let s = std::ffi::CStr::from_bytes_until_nul(&buf)
+            .ok()?
+            .to_string_lossy()
+            .trim()
+            .to_string();
+        if s.is_empty() { None } else { Some(s) }
+    }
+
+    /// Fallback name via `ps` for processes without a bundle ID (CLI tools).
+    fn process_name_from_ps(pid: u32) -> Option<String> {
+        if pid == 0 {
+            return None;
+        }
+        let out = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "comm="])
+            .output()
+            .ok()?;
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if s.is_empty() {
+            None
+        } else {
+            Some(s.rsplit('/').next().unwrap_or(&s).to_string())
         }
     }
 
@@ -435,7 +597,7 @@ mod platform {
         fn mic_probe_does_not_panic() {
             // Best-effort: may fail if no input devices in the test env, but
             // must not panic.
-            let _ = mic_in_use_by_others(&None);
+            let _ = capturing_others(&None, &[]);
         }
     }
 }
@@ -459,9 +621,13 @@ mod platform {
         "PulseAudio/PipeWire source-outputs (excluding Scriba)"
     }
 
-    /// Is any process other than us capturing from a (non-monitor) source?
-    /// When `name_filter` is set, only count sources whose name contains it.
-    pub fn mic_in_use_by_others(name_filter: &Option<String>) -> Result<bool> {
+    /// Names of processes (other than us, not ignored) capturing from a
+    /// non-monitor source. When `name_filter` is set, only count sources
+    /// whose name contains it.
+    pub fn capturing_others(
+        name_filter: &Option<String>,
+        ignored: &[String],
+    ) -> Result<Vec<String>> {
         let sources = source_names_by_index()?;
         let output = Command::new("pactl")
             .args(["list", "source-outputs"])
@@ -471,26 +637,31 @@ mod platform {
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
         let own_pid = std::process::id().to_string();
-        Ok(any_foreign_capture(
+        Ok(foreign_captures(
             &stdout,
             &sources,
             &own_pid,
             name_filter,
+            ignored,
         ))
     }
 
-    /// Pure parse of `pactl list source-outputs` output: true if any
-    /// source-output belongs to another process, is not corked, captures from
-    /// a non-monitor source, and matches the optional source-name filter.
-    fn any_foreign_capture(
+    /// Pure parse of `pactl list source-outputs` output: application names of
+    /// source-outputs that belong to another process, are not corked, capture
+    /// from a non-monitor source, match the optional source-name filter, and
+    /// are not in the ignore list.
+    fn foreign_captures(
         listing: &str,
         sources: &HashMap<String, String>,
         own_pid: &str,
         name_filter: &Option<String>,
-    ) -> bool {
+        ignored: &[String],
+    ) -> Vec<String> {
+        let mut names = Vec::new();
         for block in listing.split("Source Output #").skip(1) {
             let mut source_index = None;
             let mut pid = None;
+            let mut app_name = None;
             let mut corked = false;
             for line in block.lines() {
                 let t = line.trim();
@@ -500,6 +671,8 @@ mod platform {
                     corked = v.trim() == "yes";
                 } else if let Some(v) = t.strip_prefix("application.process.id = ") {
                     pid = Some(v.trim().trim_matches('"').to_string());
+                } else if let Some(v) = t.strip_prefix("application.name = ") {
+                    app_name = Some(v.trim().trim_matches('"').to_string());
                 }
             }
             if corked {
@@ -523,9 +696,13 @@ mod platform {
                     continue;
                 }
             }
-            return true;
+            let name = app_name.unwrap_or_else(|| "unknown process".to_string());
+            if is_ignored(&name, ignored) {
+                continue;
+            }
+            names.push(name);
         }
-        false
+        names
     }
 
     /// Map of source index -> source name from `pactl list sources short`.
@@ -583,15 +760,22 @@ Source Output #59
         }
 
         #[test]
-        fn detects_foreign_mic_capture() {
-            assert!(any_foreign_capture(LISTING, &sources(), "9999", &None));
+        fn detects_foreign_mic_capture_with_name() {
+            let names = foreign_captures(LISTING, &sources(), "9999", &None, &[]);
+            assert_eq!(names, vec!["ZOOM VoiceEngine".to_string()]);
         }
 
         #[test]
         fn excludes_own_pid() {
             // Only #57 is a live mic capture; if that's us, nothing remains
             // (#58 is a monitor source, #59 is corked).
-            assert!(!any_foreign_capture(LISTING, &sources(), "4242", &None));
+            assert!(foreign_captures(LISTING, &sources(), "4242", &None, &[]).is_empty());
+        }
+
+        #[test]
+        fn ignored_processes_do_not_count() {
+            let ignored = vec!["zoom".to_string()];
+            assert!(foreign_captures(LISTING, &sources(), "9999", &None, &ignored).is_empty());
         }
 
         #[test]
@@ -603,12 +787,7 @@ Source Output #58
 \tProperties:
 \t\tapplication.process.id = \"5151\"
 ";
-            assert!(!any_foreign_capture(
-                only_monitor,
-                &sources(),
-                "9999",
-                &None
-            ));
+            assert!(foreign_captures(only_monitor, &sources(), "9999", &None, &[]).is_empty());
         }
 
         #[test]
@@ -620,23 +799,31 @@ Source Output #59
 \tProperties:
 \t\tapplication.process.id = \"6161\"
 ";
-            assert!(!any_foreign_capture(only_corked, &sources(), "9999", &None));
+            assert!(foreign_captures(only_corked, &sources(), "9999", &None, &[]).is_empty());
         }
 
         #[test]
         fn source_name_filter_applies() {
-            assert!(any_foreign_capture(
-                LISTING,
-                &sources(),
-                "9999",
-                &Some("usb-mic".to_string())
-            ));
-            assert!(!any_foreign_capture(
-                LISTING,
-                &sources(),
-                "9999",
-                &Some("builtin".to_string())
-            ));
+            assert!(
+                !foreign_captures(
+                    LISTING,
+                    &sources(),
+                    "9999",
+                    &Some("usb-mic".to_string()),
+                    &[]
+                )
+                .is_empty()
+            );
+            assert!(
+                foreign_captures(
+                    LISTING,
+                    &sources(),
+                    "9999",
+                    &Some("builtin".to_string()),
+                    &[]
+                )
+                .is_empty()
+            );
         }
     }
 }
@@ -656,7 +843,7 @@ mod platform {
         "unsupported platform"
     }
 
-    pub fn mic_in_use_by_others(_filter: &Option<String>) -> Result<bool> {
+    pub fn capturing_others(_filter: &Option<String>, _ignored: &[String]) -> Result<Vec<String>> {
         Err(anyhow::anyhow!(
             "Meeting detection is only supported on macOS and Linux"
         ))
@@ -693,6 +880,24 @@ mod tests {
         assert_eq!(d.update(false), None);
         assert_eq!(d.update(true), None);
         assert_eq!(d.update(true), Some(MeetingEvent::MeetingStarted));
+    }
+
+    #[test]
+    fn ignore_matching_is_case_insensitive_substring() {
+        let ignored = vec!["granola".to_string(), "us.zoom".to_string()];
+        assert!(is_ignored("Granola", &ignored));
+        assert!(is_ignored("com.granola.app", &ignored));
+        assert!(is_ignored("US.ZOOM.XOS", &ignored));
+        assert!(!is_ignored("com.google.Chrome", &ignored));
+        assert!(!is_ignored("anything", &[]));
+        assert!(!is_ignored("anything", &[String::new()]));
+    }
+
+    #[test]
+    fn system_speech_daemons_are_always_ignored() {
+        assert!(is_ignored("com.apple.CoreSpeech", &[]));
+        assert!(is_ignored("com.apple.siri.embeddedspeech", &[]));
+        assert!(!is_ignored("us.zoom.xos", &[]));
     }
 
     #[tokio::test]

@@ -203,16 +203,39 @@ impl Default for SilenceAutoStopConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MeetingDetectionConfig {
     /// Whether meeting detection is enabled when running `scriba watch`.
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// When true, automatically start recording when a meeting is detected and
     /// stop it when the meeting ends. When false, only fire a desktop
     /// notification.
+    #[serde(default = "default_true")]
     pub auto_record: bool,
+    /// Ask before recording: show a Record/Ignore dialog when a meeting is
+    /// detected instead of recording immediately. On timeout the meeting is
+    /// recorded anyway (so an unattended meeting is never silently lost).
+    #[serde(default = "default_true")]
+    pub confirm_before_record: bool,
+    /// Seconds before the Record/Ignore dialog gives up and defaults to
+    /// recording.
+    #[serde(default = "default_confirm_timeout")]
+    pub confirm_timeout_seconds: u32,
     /// Fallback net: seconds of continuous silence after which an
     /// auto-recorded meeting's recording stops anyway. The primary stop signal
     /// is the meeting app releasing the mic; this only kicks in when that
     /// signal is unavailable (pre-14 macOS) or missed.
+    #[serde(default = "default_min_silence")]
     pub min_silence_seconds: u32,
+    /// Seconds after a recording finishes during which new detections are
+    /// ignored. Guards against feedback loops with other recording tools on
+    /// the same machine, whose reaction to Scriba's capture would otherwise
+    /// look like a new meeting.
+    #[serde(default = "default_cooldown")]
+    pub cooldown_seconds: u32,
+    /// Processes whose mic capture never counts as a meeting (case-insensitive
+    /// substring match on the bundle ID / process name, e.g. "granola" or
+    /// "us.zoom"). Add other recording tools here to avoid feedback loops.
+    #[serde(default)]
+    pub ignored_processes: Vec<String>,
     /// Preferred input device name (Linux: filter the PulseAudio/PipeWire
     /// source by name). On macOS all input devices are monitored and this is
     /// currently ignored.
@@ -220,12 +243,28 @@ pub struct MeetingDetectionConfig {
     pub input_device: Option<String>,
 }
 
+fn default_confirm_timeout() -> u32 {
+    30
+}
+
+fn default_min_silence() -> u32 {
+    90
+}
+
+fn default_cooldown() -> u32 {
+    120
+}
+
 impl Default for MeetingDetectionConfig {
     fn default() -> Self {
         Self {
             enabled: true,
             auto_record: true,
-            min_silence_seconds: 90,
+            confirm_before_record: true,
+            confirm_timeout_seconds: default_confirm_timeout(),
+            min_silence_seconds: default_min_silence(),
+            cooldown_seconds: default_cooldown(),
+            ignored_processes: Vec::new(),
             input_device: None,
         }
     }
