@@ -211,12 +211,12 @@ pub struct MeetingDetectionConfig {
     #[serde(default = "default_true")]
     pub auto_record: bool,
     /// Ask before recording: show a Record/Ignore dialog when a meeting is
-    /// detected instead of recording immediately. On timeout the meeting is
-    /// recorded anyway (so an unattended meeting is never silently lost).
+    /// detected instead of recording immediately. An unanswered dialog counts
+    /// as Ignore — nothing is recorded without explicit consent.
     #[serde(default = "default_true")]
     pub confirm_before_record: bool,
-    /// Seconds before the Record/Ignore dialog gives up and defaults to
-    /// recording.
+    /// Seconds before the Record/Ignore dialog gives up (and ignores the
+    /// meeting).
     #[serde(default = "default_confirm_timeout")]
     pub confirm_timeout_seconds: u32,
     /// Fallback net: seconds of continuous silence after which an

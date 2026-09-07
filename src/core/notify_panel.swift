@@ -261,7 +261,7 @@ let leftPad: CGFloat = 14
 let badgeSize: CGFloat = 38
 let textGap: CGFloat = 12
 let rightPad: CGFloat = 14
-// Transparent margin on the top/right of the panel so the ✕ can straddle the
+// Transparent margin on the top/left of the panel so the ✕ can straddle the
 // card corner.
 let closeSize: CGFloat = 24
 let overhang: CGFloat = closeSize / 2
@@ -303,7 +303,7 @@ let root = HoverRoot(
 panel.contentView = root
 
 let card = NSView(
-    frame: NSRect(x: 0, y: 0, width: cardWidth, height: cardHeight))
+    frame: NSRect(x: overhang, y: 0, width: cardWidth, height: cardHeight))
 card.wantsLayer = true
 card.layer?.backgroundColor = cardColor.cgColor
 card.layer?.cornerRadius = 18
@@ -382,7 +382,7 @@ countdownBar.layer?.backgroundColor = countdownColor.cgColor
 countdownBar.layer?.cornerRadius = 1.5
 card.addSubview(countdownBar)
 
-// ✕ dismiss button straddling the top-right corner; revealed on hover.
+// ✕ dismiss button straddling the top-left corner; revealed on hover.
 let closeButton = HoverButton(
     title: "", target: handler, action: #selector(Handler.close(_:)))
 closeButton.isBordered = false
@@ -402,8 +402,7 @@ if let xImage = NSImage(
     closeButton.contentTintColor = NSColor(white: 1.0, alpha: 0.9)
 }
 closeButton.frame = NSRect(
-    x: rootWidth - closeSize, y: rootHeight - closeSize,
-    width: closeSize, height: closeSize)
+    x: 0, y: rootHeight - closeSize, width: closeSize, height: closeSize)
 closeButton.alphaValue = 0
 root.addSubview(closeButton)
 
@@ -467,10 +466,10 @@ if let snapshotPath = opts.snapshot {
 if let screen = NSScreen.main {
     let vf = screen.visibleFrame
     // Anchor the card (not the transparent ✕ margin) 16pt from the right edge
-    // and 12pt from the top; the ✕ pokes into those margins.
+    // and 12pt from the top; the ✕ pokes into the top margin on the left.
     panel.setFrameOrigin(
         NSPoint(
-            x: vf.maxX - 16 - cardWidth,
+            x: vf.maxX - rootWidth - 16,
             y: vf.maxY - 12 + overhang - rootHeight))
 }
 panel.alphaValue = 0

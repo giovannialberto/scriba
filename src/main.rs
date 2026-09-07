@@ -1257,7 +1257,7 @@ async fn run_watch(
     println!("   Detection watches whether another process is using a microphone.");
     if auto_record && confirm {
         println!(
-            "   A Record/Ignore dialog is shown on detection (records after {}s if unanswered).",
+            "   A Record/Ignore dialog is shown on detection (ignored after {}s if unanswered).",
             md.confirm_timeout_seconds
         );
     }
@@ -1406,7 +1406,7 @@ async fn run_watch(
                 "Record",
                 "Ignore",
                 md.confirm_timeout_seconds,
-                true,
+                false,
             );
             tokio::pin!(dialog);
             loop {
