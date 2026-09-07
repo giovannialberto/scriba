@@ -32,6 +32,7 @@ struct Options {
     var timeout: Double = 5
     var sound: String? = nil
     var snapshot: String? = nil
+    var hover: String? = nil // design QA: render a pill in its hover state
 }
 
 func parseOptions() -> Options {
@@ -52,6 +53,7 @@ func parseOptions() -> Options {
         case "--timeout": if let v = value, let t = Double(v) { o.timeout = t }
         case "--sound": o.sound = value
         case "--snapshot": o.snapshot = value
+        case "--hover": o.hover = value
         default:
             i -= 1 // flag without value: don't skip the next arg
         }
@@ -105,8 +107,10 @@ let subtitleColor = NSColor(white: 1.0, alpha: 0.55)
 let badgeColor = brandViolet.withAlphaComponent(0.28)
 let badgeIconColor = brandVioletLight
 let primaryPillColor = brandViolet
+let primaryPillHover = brandViolet.blended(withFraction: 0.18, of: .white) ?? brandViolet
 let primaryPillText = NSColor(white: 1.0, alpha: 0.98)
 let quietPillColor = NSColor(white: 1.0, alpha: 0.09)
+let quietPillHover = NSColor(white: 1.0, alpha: 0.17)
 let quietPillText = NSColor(white: 1.0, alpha: 0.85)
 
 let opts = parseOptions()
@@ -152,13 +156,61 @@ func textWidth(_ string: String, font: NSFont) -> CGFloat {
     (string as NSString).size(withAttributes: [.font: font]).width
 }
 
+/// Pill button with a hover state: the fill brightens on mouse-over (with a
+/// short cross-fade) and the cursor becomes a pointing hand.
+final class HoverPill: NSButton {
+    var baseFill: NSColor = .clear
+    var hoverFill: NSColor = .clear
+    private var trackingArea: NSTrackingArea?
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let area = trackingArea {
+            removeTrackingArea(area)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways],
+            owner: self, userInfo: nil)
+        addTrackingArea(area)
+        trackingArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        setFill(hoverFill)
+        // Cursor rects only apply to key windows and this panel never becomes
+        // key (non-activating), so set the cursor by hand.
+        NSCursor.pointingHand.set()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        setFill(baseFill)
+        NSCursor.arrow.set()
+    }
+
+    func setFill(_ color: NSColor) {
+        guard let layer = layer else { return }
+        // The backing layer of a layer-backed view doesn't animate implicit
+        // property changes; cross-fade explicitly.
+        let fade = CABasicAnimation(keyPath: "backgroundColor")
+        fade.fromValue = layer.backgroundColor
+        fade.toValue = color.cgColor
+        fade.duration = 0.15
+        layer.add(fade, forKey: "fill")
+        layer.backgroundColor = color.cgColor
+    }
+}
+
 func makePill(
-    _ label: String, fill: NSColor, textColor: NSColor, action: Selector
-) -> NSButton {
+    _ label: String, fill: NSColor, hoverFill: NSColor, textColor: NSColor,
+    action: Selector
+) -> HoverPill {
     let font = NSFont.systemFont(ofSize: 13, weight: .semibold)
-    let button = NSButton(title: label, target: handler, action: action)
+    let button = HoverPill(title: label, target: handler, action: action)
     button.isBordered = false
     button.wantsLayer = true
+    button.baseFill = fill
+    button.hoverFill = hoverFill
     button.layer?.backgroundColor = fill.cgColor
     button.layer?.cornerRadius = 16
     button.layer?.cornerCurve = .continuous
@@ -181,12 +233,12 @@ let textGap: CGFloat = 12
 let rightPad: CGFloat = 14
 
 let yesPill = makePill(
-    opts.yes, fill: primaryPillColor, textColor: primaryPillText,
-    action: #selector(Handler.yes(_:)))
+    opts.yes, fill: primaryPillColor, hoverFill: primaryPillHover,
+    textColor: primaryPillText, action: #selector(Handler.yes(_:)))
 yesPill.keyEquivalent = "\r"
 let noPill = makePill(
-    opts.no, fill: quietPillColor, textColor: quietPillText,
-    action: #selector(Handler.no(_:)))
+    opts.no, fill: quietPillColor, hoverFill: quietPillHover,
+    textColor: quietPillText, action: #selector(Handler.no(_:)))
 
 let buttonsWidth: CGFloat =
     hasButtons ? noPill.frame.width + 8 + yesPill.frame.width + 16 : 0
@@ -280,6 +332,11 @@ if hasButtons {
 
 // ── Snapshot mode: render the card to a PNG and exit (used for design QA) ───
 if let snapshotPath = opts.snapshot {
+    switch opts.hover {
+    case "yes": yesPill.setFill(primaryPillHover)
+    case "no": noPill.setFill(quietPillHover)
+    default: break
+    }
     card.layoutSubtreeIfNeeded()
     if let rep = card.bitmapImageRepForCachingDisplay(in: card.bounds) {
         card.cacheDisplay(in: card.bounds, to: rep)
