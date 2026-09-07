@@ -93,13 +93,19 @@ func prettySubtitle(_ raw: String) -> String {
 }
 
 // ── Palette ──────────────────────────────────────────────────────────────────
+// Brand: Scriba violet — #7c3aed (primary), #a78bfa (light variant), matching
+// the website theme and the TUI's purple accents.
+let brandViolet = NSColor(red: 0.486, green: 0.227, blue: 0.929, alpha: 1.0)
+let brandVioletLight = NSColor(red: 0.655, green: 0.545, blue: 0.980, alpha: 1.0)
+
 let cardColor = NSColor(red: 0.157, green: 0.153, blue: 0.145, alpha: 0.985)
-let strokeColor = NSColor(white: 1.0, alpha: 0.07)
+let strokeColor = brandVioletLight.withAlphaComponent(0.16)
 let titleColor = NSColor(white: 1.0, alpha: 0.96)
 let subtitleColor = NSColor(white: 1.0, alpha: 0.55)
-let badgeColor = NSColor(white: 1.0, alpha: 0.10)
-let primaryPillColor = NSColor(white: 1.0, alpha: 0.92)
-let primaryPillText = NSColor(red: 0.12, green: 0.12, blue: 0.11, alpha: 1.0)
+let badgeColor = brandViolet.withAlphaComponent(0.28)
+let badgeIconColor = brandVioletLight
+let primaryPillColor = brandViolet
+let primaryPillText = NSColor(white: 1.0, alpha: 0.98)
 let quietPillColor = NSColor(white: 1.0, alpha: 0.09)
 let quietPillText = NSColor(white: 1.0, alpha: 0.85)
 
@@ -230,7 +236,7 @@ if let micImage = NSImage(
     let imageView = NSImageView(
         frame: NSRect(x: 0, y: 0, width: badgeSize, height: badgeSize))
     imageView.image = micImage.withSymbolConfiguration(config)
-    imageView.contentTintColor = titleColor
+    imageView.contentTintColor = badgeIconColor
     badge.addSubview(imageView)
 }
 
