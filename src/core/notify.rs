@@ -11,6 +11,102 @@ use anyhow::Result;
 use std::process::Command;
 use std::time::Duration;
 
+/// Native notification panel helper (macOS).
+///
+/// Unbundled CLI processes cannot post Notification Center banners with
+/// action buttons and `display dialog` is an unstyled centered box, so Scriba
+/// draws its own notification-style panel (top-right, vibrancy, buttons) via
+/// a small AppKit helper. The Swift source is embedded and compiled once with
+/// `swiftc` (ships with the Xcode Command Line Tools, which Homebrew
+/// requires); everything falls back to AppleScript when it is unavailable.
+#[cfg(target_os = "macos")]
+mod panel {
+    use anyhow::Result;
+    use std::path::PathBuf;
+
+    const SOURCE: &str = include_str!("notify_panel.swift");
+
+    fn cache_dir() -> Option<PathBuf> {
+        let home = std::env::var_os("HOME")?;
+        Some(PathBuf::from(home).join("Library/Caches/scriba"))
+    }
+
+    /// Helper path, keyed by a hash of the embedded source so upgrades
+    /// recompile automatically.
+    fn helper_path() -> Option<PathBuf> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        SOURCE.hash(&mut hasher);
+        Some(cache_dir()?.join(format!("notify-panel-{:016x}", hasher.finish())))
+    }
+
+    /// Path to the compiled helper, if it has been built already.
+    pub fn existing() -> Option<PathBuf> {
+        helper_path().filter(|p| p.exists())
+    }
+
+    /// Compile the helper if needed. Idempotent; call at startup so the first
+    /// notification doesn't wait ~10s on swiftc.
+    pub fn ensure() -> Result<PathBuf> {
+        let path = helper_path().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
+        if path.exists() {
+            return Ok(path);
+        }
+        let dir = path.parent().expect("helper path has a parent");
+        std::fs::create_dir_all(dir)?;
+        // Drop helpers left behind by previous Scriba versions.
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("notify-panel-")
+                {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+        let source_path = path.with_extension("swift");
+        std::fs::write(&source_path, SOURCE)?;
+        let output = std::process::Command::new("swiftc")
+            .args(["-O", "-o"])
+            .arg(&path)
+            .arg(&source_path)
+            .output()?;
+        let _ = std::fs::remove_file(&source_path);
+        if !output.status.success() {
+            return Err(anyhow::anyhow!(
+                "swiftc failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        Ok(path)
+    }
+}
+
+/// Whether the native notification panel is already built (always true on
+/// platforms that don't need one).
+pub fn notification_helper_ready() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        panel::existing().is_some()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        true
+    }
+}
+
+/// Build the native notification panel helper ahead of time so the first
+/// meeting notification doesn't wait on a compile. Blocking (runs swiftc on
+/// first call, ~10s); no-op off macOS. On failure callers keep working — the
+/// AppleScript fallbacks are used instead.
+pub fn prepare_notification_helper() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    panel::ensure()?;
+    Ok(())
+}
+
 /// Fire a desktop notification.
 ///
 /// `title` is the bold headline and `body` is the subtext. Sound is played on
@@ -25,6 +121,28 @@ pub fn notify(title: &str, body: &str) {
 fn try_notify(title: &str, body: &str) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
+        if let Some(helper) = panel::existing() {
+            let mut child = Command::new(helper)
+                .args([
+                    "notify",
+                    "--title",
+                    title,
+                    "--message",
+                    body,
+                    "--timeout",
+                    "5",
+                    "--sound",
+                    "Glass",
+                ])
+                .stdout(std::process::Stdio::null())
+                .spawn()?;
+            // The panel outlives this call by design; reap it off-thread so it
+            // doesn't linger as a zombie.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            return Ok(());
+        }
         // Escape double quotes for the AppleScript string literal.
         let title_esc = title.replace('\\', "\\\\").replace('"', "\\\"");
         let body_esc = body.replace('\\', "\\\\").replace('"', "\\\"");
@@ -104,6 +222,38 @@ async fn try_confirm(
     timeout_secs: u32,
     default_answer: bool,
 ) -> Result<bool> {
+    // Native notification-style panel, top-right with action buttons.
+    if let Some(helper) = panel::existing() {
+        let output = tokio::process::Command::new(helper)
+            .args([
+                "confirm",
+                "--title",
+                title,
+                "--message",
+                message,
+                "--yes",
+                yes_label,
+                "--no",
+                no_label,
+                "--timeout",
+                &timeout_secs.to_string(),
+                "--sound",
+                "Glass",
+            ])
+            .kill_on_drop(true)
+            .output()
+            .await?;
+        if !output.status.success() {
+            anyhow::bail!("notify panel exited with status {}", output.status);
+        }
+        return Ok(match String::from_utf8_lossy(&output.stdout).trim() {
+            "yes" => true,
+            "no" => false,
+            _ => default_answer,
+        });
+    }
+
+    // Fallback: centered AppleScript dialog.
     let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
     let script = format!(
         "display dialog \"{}\" with title \"{}\" buttons {{\"{}\", \"{}\"}} default button \"{}\" giving up after {}",

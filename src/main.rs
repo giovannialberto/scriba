@@ -3,7 +3,8 @@ use scriba::core::{
     resolve_transcription_mode, AudioFormat, CloudProvider, CompressionSettings, EnrichmentMode,
     LocalModel, MeetingEvent, MeetingWatcherConfig, ScribaConfig, TranscriptionMode,
     WorkflowManager, capturing_processes, desktop_confirm, initialize_world_from_seed,
-    meeting_signal, notify_event, run_meeting_watcher, watcher_excludes_self,
+    meeting_signal, notification_helper_ready, notify_event, prepare_notification_helper,
+    run_meeting_watcher, watcher_excludes_self,
 };
 use scriba::database::Database;
 use scriba::enrichment::WorldContext;
@@ -1277,6 +1278,19 @@ async fn run_watch(
             md.cooldown_seconds,
             md.ignored_processes
         );
+    }
+
+    // Build the native notification panel up front so the first detection
+    // doesn't wait on swiftc (first run only, ~10s).
+    if !notification_helper_ready() {
+        println!("   Preparing notification panel (first run, takes a few seconds)...");
+    }
+    match tokio::task::spawn_blocking(prepare_notification_helper).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => eprintln!(
+            "⚠️  Native notification panel unavailable ({e}); using AppleScript dialogs instead."
+        ),
+        Err(e) => eprintln!("⚠️  Notification panel setup task failed: {e}"),
     }
 
     let watcher_cfg = MeetingWatcherConfig {
