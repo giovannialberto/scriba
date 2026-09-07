@@ -1,6 +1,7 @@
 use crate::core::{
     AudioPlayer, AutopilotHandle, AutopilotOptions, EnrichmentMode, RecordingGuard,
-    RecordingResult, ScribaConfig, TranscriptionMode, spawn_autopilot,
+    RecordingResult, ScribaConfig, TranscriptionMode, rebuild_world_from_entities,
+    spawn_autopilot,
 };
 use crate::database::{Database, Entity, Recording, RecordingStats};
 use crate::enrichment::{OllamaClient, WorldContext, WorldData};
@@ -297,6 +298,20 @@ impl Dashboard {
                 let result = check_for_update(&current_version).await;
                 let _ = tx.send(result).await;
             });
+        }
+
+        // A missing world.md alongside a populated entity index is a lost
+        // derived file, not a fresh install: regenerate it instead of sending
+        // the user back through onboarding (which would start a new world).
+        if !WorldContext::exists()
+            && self
+                .db
+                .list_entities(None, None)
+                .map(|e| !e.is_empty())
+                .unwrap_or(false)
+            && let Err(e) = rebuild_world_from_entities(&self.db)
+        {
+            eprintln!("⚠️  Could not rebuild world.md from entities: {e}");
         }
 
         // Check if onboarding is needed (no world.md exists)
