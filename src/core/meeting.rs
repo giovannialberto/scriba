@@ -186,7 +186,16 @@ pub fn run_meeting_watcher(
         if event_tx.is_closed() {
             return Ok(());
         }
-        std::thread::sleep(platform::POLL);
+        // Adaptive cadence: the probe costs XPC round-trips to the audio
+        // daemon, so poll slowly while nothing is happening and speed up as
+        // soon as a change is pending or a meeting is in progress (keeping
+        // start confirmation and end detection snappy).
+        let interval = if debouncer.settled || debouncer.streak > 0 {
+            platform::POLL_ACTIVE
+        } else {
+            platform::POLL_IDLE
+        };
+        std::thread::sleep(interval);
         // Transient probe errors (e.g. a device disappearing mid-read) keep
         // the previous state rather than fabricating a transition.
         let now = match platform::capturing_others(&config.input_device, &config.ignored_processes)
@@ -247,7 +256,8 @@ mod platform {
     use std::sync::{Mutex, OnceLock};
     use std::time::Duration;
 
-    pub const POLL: Duration = Duration::from_millis(250);
+    pub const POLL_ACTIVE: Duration = Duration::from_millis(250);
+    pub const POLL_IDLE: Duration = Duration::from_secs(1);
 
     // Core Audio FFI (CoreAudio.framework). We link against the framework and
     // declare the handful of C functions / constants we need.
@@ -299,10 +309,12 @@ mod platform {
 
     // Four-char-code selectors and scopes (packed big-endian).
     const SEL_DEVICES: u32 = u32::from_be_bytes(*b"dev#");
-    const SEL_RUNNING_SOMEWHERE: u32 = u32::from_be_bytes(*b"irun");
+    // kAudioDevicePropertyDeviceIsRunningSomewhere
+    const SEL_RUNNING_SOMEWHERE: u32 = u32::from_be_bytes(*b"gone");
     const SEL_STREAM_CONFIG: u32 = u32::from_be_bytes(*b"slay");
     // Process objects (macOS 14+): per-process audio activity.
     const SEL_PROCESS_OBJECT_LIST: u32 = u32::from_be_bytes(*b"prs#");
+    const SEL_TRANSLATE_PID_TO_PROCESS: u32 = u32::from_be_bytes(*b"id2p");
     const SEL_PROCESS_PID: u32 = u32::from_be_bytes(*b"ppid");
     const SEL_PROCESS_BUNDLE_ID: u32 = u32::from_be_bytes(*b"pbid");
     const SEL_PROCESS_IS_RUNNING_INPUT: u32 = u32::from_be_bytes(*b"piri");
@@ -339,17 +351,29 @@ mod platform {
     /// the ignore list has no effect. The device filter is ignored on macOS.
     pub fn capturing_others(_filter: &Option<String>, ignored: &[String]) -> Result<Vec<String>> {
         if process_api_available() {
-            let own_pid = std::process::id();
+            // Idle fast path. Every property read is an XPC round-trip to
+            // coreaudiod, and there are typically dozens of process objects,
+            // so gate the per-process attribution behind a device-level
+            // "is anyone capturing at all" check (~1 read per input device).
+            let devices = cached_input_devices();
+            if !devices.is_empty() && !compute_in_use(&devices)? {
+                return Ok(Vec::new());
+            }
+            // Someone is capturing: attribute it per process. PID and name
+            // are only fetched for the (few) processes actually capturing;
+            // our own process is excluded by object ID (one translate call)
+            // instead of a per-process PID read.
+            let own_obj = translate_pid_to_process_object(std::process::id());
             let procs = get_audio_objects(SYSTEM_OBJECT, SEL_PROCESS_OBJECT_LIST, SCOPE_GLOBAL)?;
             let mut names = Vec::new();
             for proc_obj in procs {
-                let pid = get_prop_u32(proc_obj, SEL_PROCESS_PID).unwrap_or(0);
-                if pid == own_pid {
+                if own_obj == Some(proc_obj) {
                     continue;
                 }
                 if get_prop_u32(proc_obj, SEL_PROCESS_IS_RUNNING_INPUT).unwrap_or(0) == 0 {
                     continue;
                 }
+                let pid = get_prop_u32(proc_obj, SEL_PROCESS_PID).unwrap_or(0);
                 let name = display_name(pid, proc_obj);
                 if is_ignored(&name, ignored) {
                     continue;
@@ -381,6 +405,34 @@ mod platform {
             .unwrap_or_else(|| format!("pid {pid}"));
         cache.lock().unwrap().insert(pid, name.clone());
         name
+    }
+
+    /// Resolve a PID to its HAL process object, if the process is registered
+    /// with Core Audio (ours only is while recording).
+    fn translate_pid_to_process_object(pid: u32) -> Option<AudioObjectID> {
+        let addr = AudioObjectPropertyAddress {
+            mSelector: SEL_TRANSLATE_PID_TO_PROCESS,
+            mScope: SCOPE_GLOBAL,
+            mElement: ELEMENT_WILDCARD,
+        };
+        let pid = pid as i32;
+        let mut obj: AudioObjectID = 0;
+        let mut size = std::mem::size_of::<AudioObjectID>() as u32;
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                SYSTEM_OBJECT,
+                &addr,
+                std::mem::size_of::<i32>() as u32,
+                &pid as *const i32 as *const std::ffi::c_void,
+                &mut size,
+                &mut obj as *mut AudioObjectID as *mut std::ffi::c_void,
+            )
+        };
+        if status == 0 && obj != 0 {
+            Some(obj)
+        } else {
+            None
+        }
     }
 
     /// Read `kAudioProcessPropertyBundleID` (a CFString) from a process object.
@@ -478,6 +530,28 @@ mod platform {
             }
         }
         Ok(false)
+    }
+
+    /// Input-device list with a short TTL: enumeration costs a couple of XPC
+    /// calls per device, and the watcher polls every second. Hot-plugged
+    /// devices (e.g. AirPods) appear within the TTL.
+    fn cached_input_devices() -> Vec<AudioObjectID> {
+        const TTL: Duration = Duration::from_secs(5);
+        static CACHE: OnceLock<Mutex<(std::time::Instant, Vec<AudioObjectID>)>> = OnceLock::new();
+        let cache = CACHE.get_or_init(|| {
+            Mutex::new((
+                std::time::Instant::now(),
+                enumerate_input_devices().unwrap_or_default(),
+            ))
+        });
+        let mut guard = cache.lock().unwrap();
+        if guard.0.elapsed() > TTL {
+            *guard = (
+                std::time::Instant::now(),
+                enumerate_input_devices().unwrap_or_default(),
+            );
+        }
+        guard.1.clone()
     }
 
     /// Enumerate all audio devices and keep those that have input streams
@@ -606,7 +680,8 @@ mod platform {
     use std::process::Command;
     use std::time::Duration;
 
-    pub const POLL: Duration = Duration::from_millis(500);
+    pub const POLL_ACTIVE: Duration = Duration::from_millis(500);
+    pub const POLL_IDLE: Duration = Duration::from_secs(1);
 
     pub fn excludes_self() -> bool {
         // pactl reports application.process.id per source-output; if a stream
@@ -625,7 +700,6 @@ mod platform {
         name_filter: &Option<String>,
         ignored: &[String],
     ) -> Result<Vec<String>> {
-        let sources = source_names_by_index()?;
         let output = Command::new("pactl")
             .args(["list", "source-outputs"])
             .output()?;
@@ -633,6 +707,12 @@ mod platform {
             return Err(anyhow::anyhow!("pactl exited non-zero"));
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
+        // Idle fast path: no capture streams at all — skip the second pactl
+        // invocation (the watcher polls this a couple of times per second).
+        if !stdout.contains("Source Output #") {
+            return Ok(Vec::new());
+        }
+        let sources = source_names_by_index()?;
         let own_pid = std::process::id().to_string();
         Ok(foreign_captures(
             &stdout,
@@ -830,7 +910,8 @@ mod platform {
     use super::*;
     use std::time::Duration;
 
-    pub const POLL: Duration = Duration::from_secs(1);
+    pub const POLL_ACTIVE: Duration = Duration::from_secs(1);
+    pub const POLL_IDLE: Duration = Duration::from_secs(1);
 
     pub fn excludes_self() -> bool {
         false

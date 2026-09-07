@@ -139,6 +139,12 @@ impl WorkflowManager {
 
         let input_device = self.config.audio_settings.input_device.clone();
         let loopback_device = self.config.audio_settings.loopback_device.clone();
+        // Whether this mode may print to stdout (TUI-hosted modes must not).
+        let verbose = match &mode {
+            RecordingMode::Cli => true,
+            RecordingMode::Tui { .. } => false,
+            RecordingMode::Meeting { verbose, .. } => *verbose,
+        };
         let final_directory_name = match mode {
             RecordingMode::Cli => {
                 let result = record_audio(
@@ -172,14 +178,14 @@ impl WorkflowManager {
                 .await?;
                 result.recording_name
             }
-            RecordingMode::Meeting { stop_rx, silence_timeout } => {
+            RecordingMode::Meeting { stop_rx, silence_timeout, verbose } => {
                 let result = record_audio(
                     recording_path,
                     RecordOptions {
                         compression_settings: config.compression.clone(),
                         stop_rx: Some(stop_rx),
                         level_tx: None,
-                        verbose: true,
+                        verbose,
                         silence_timeout,
                         input_device,
                         loopback_device,
@@ -206,9 +212,11 @@ impl WorkflowManager {
 
         if config.auto_transcribe {
             if let Some(transcription_mode) = config.transcription_mode {
-                println!("📝 Starting auto-transcription...");
+                if verbose {
+                    println!("📝 Starting auto-transcription...");
+                }
                 recording = self
-                    .transcribe_recording(recording, transcription_mode)
+                    .transcribe_recording_internal(recording, transcription_mode, verbose)
                     .await?;
             }
         }
@@ -668,6 +676,7 @@ impl WorkflowManager {
     /// meeting app release the mic) or after `silence_timeout` of continuous
     /// silence as a fallback net, then optionally auto-transcribes. Returns
     /// the finished recording.
+    #[allow(clippy::too_many_arguments)]
     pub async fn record_meeting(
         &mut self,
         name: Option<String>,
@@ -676,6 +685,7 @@ impl WorkflowManager {
         transcription_mode: Option<TranscriptionMode>,
         stop_rx: mpsc::Receiver<()>,
         silence_timeout: Option<Duration>,
+        verbose: bool,
     ) -> Result<ManagedRecording> {
         let config = RecordingConfig {
             name,
@@ -683,7 +693,7 @@ impl WorkflowManager {
             auto_transcribe,
             transcription_mode,
         };
-        let mode = RecordingMode::Meeting { stop_rx, silence_timeout };
+        let mode = RecordingMode::Meeting { stop_rx, silence_timeout, verbose };
         self.complete_recording_workflow(config, mode).await
     }
 

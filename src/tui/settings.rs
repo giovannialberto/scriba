@@ -26,8 +26,8 @@ const IDX_MODE: usize = 0;
 const PRIVATE_MODE_ITEMS: usize = 3;
 /// Number of mode-specific items in Cloud mode (Whisper API Key, LLM Provider, Model, Provider API Key).
 const CLOUD_MODE_ITEMS: usize = 4;
-/// Number of shared items (Auto-Stop, Timeout, Check for Updates).
-const SHARED_ITEMS: usize = 3;
+/// Number of shared items (Auto-Stop, Timeout, Meeting Watch, Check for Updates).
+const SHARED_ITEMS: usize = 4;
 
 /// First shared-section index for a given mode.
 fn shared_offset(is_private: bool) -> usize {
@@ -409,6 +409,16 @@ impl Dashboard {
                                 }
                             }
                             2 => {
+                                // Toggle background meeting detection
+                                self.config.meeting_detection.enabled = !self.config.meeting_detection.enabled;
+                                if let Err(e) = self.config.save() {
+                                    self.message = format!("Failed to save setting: {}", e);
+                                    self.show_message = true;
+                                    self.return_to_view = Some(DashboardView::Settings);
+                                }
+                                self.sync_autopilot();
+                            }
+                            3 => {
                                 // Toggle check for updates
                                 self.config.check_for_updates = !self.config.check_for_updates;
                                 if let Err(e) = self.config.save() {
@@ -696,12 +706,15 @@ impl Dashboard {
         let timeout_hint = if silence_enabled { "\u{2190} Enter to cycle" } else { "(enable auto-stop first)" };
         setting_line!("Timeout", timeout_display, shared_off + 1, timeout_hint, timeout_style_override);
 
+        let watch_value = if self.config.meeting_detection.enabled { "Enabled" } else { "Disabled" };
+        setting_line!("Meeting Watch", watch_value, shared_off + 2, "\u{2190} Enter to toggle", None::<Style>);
+
         // ── GENERAL ─────────────────────────────────────────────────
         lines.push(Line::from(""));
         lines.push(Line::from(vec![Span::raw("  "), Span::styled("GENERAL", section_style)]));
 
         let updates_value = if self.config.check_for_updates { "Enabled" } else { "Disabled" };
-        setting_line!("Check for Updates", updates_value, shared_off + 2, "\u{2190} Enter to toggle", None::<Style>);
+        setting_line!("Check for Updates", updates_value, shared_off + 3, "\u{2190} Enter to toggle", None::<Style>);
 
         let body = Paragraph::new(lines).style(Style::default().fg(Color::White));
         f.render_widget(body, chunks[1]);

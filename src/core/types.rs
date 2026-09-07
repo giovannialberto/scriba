@@ -29,10 +29,12 @@ pub enum RecordingMode {
     },
     /// Meeting mode: stopped via `stop_rx` when the meeting watcher sees the
     /// meeting app release the mic, with `silence_timeout` as a fallback net.
-    /// Used by `scriba watch` when a meeting is detected.
+    /// Used by the meeting autopilot; `verbose` must be false when it runs
+    /// inside the TUI (stdout would corrupt the ratatui screen).
     Meeting {
         stop_rx: tokio::sync::mpsc::Receiver<()>,
         silence_timeout: Option<Duration>,
+        verbose: bool,
     },
 }
 

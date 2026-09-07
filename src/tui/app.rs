@@ -1,5 +1,6 @@
 use crate::core::{
-    AudioPlayer, EnrichmentMode, RecordingResult, ScribaConfig, TranscriptionMode,
+    AudioPlayer, AutopilotHandle, AutopilotOptions, EnrichmentMode, RecordingGuard,
+    RecordingResult, ScribaConfig, TranscriptionMode, spawn_autopilot,
 };
 use crate::database::{Database, Entity, Recording, RecordingStats};
 use crate::enrichment::{OllamaClient, WorldContext, WorldData};
@@ -20,6 +21,8 @@ use ratatui::{
 };
 use std::collections::VecDeque;
 use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -60,6 +63,8 @@ pub struct Dashboard {
     pub(super) transcription_queue: VecDeque<PendingTranscription>, // FIFO queue of pending transcriptions
     pub(super) notification_message: Option<(String, usize)>, // (message, frames_remaining) -- auto-dismiss
     pub(super) recording_task: Option<tokio::task::JoinHandle<Result<RecordingResult, anyhow::Error>>>,
+    pub(super) autopilot: Option<AutopilotHandle>, // Background meeting watcher (auto-detect + record)
+    pub(super) recording_guard: RecordingGuard, // True while any recording (manual or auto) runs
     pub(super) recording_mode: Option<RecordingMode>, // Track if we should transcribe after recording
     pub(super) recording_stop_tx: Option<mpsc::Sender<()>>, // Channel to stop recording
     pub(super) recording_level_rx: Option<mpsc::Receiver<f32>>, // Channel to receive volume levels
@@ -190,6 +195,8 @@ impl Dashboard {
             transcription_queue: VecDeque::new(),
             notification_message: None,
             recording_task: None,
+            autopilot: None,
+            recording_guard: Arc::new(AtomicBool::new(false)),
             recording_mode: None,
             recording_stop_tx: None,
             recording_level_rx: None,
@@ -302,6 +309,9 @@ impl Dashboard {
             self.init_global_chat();
         }
 
+        // Background meeting watcher: on by default, toggled in Settings.
+        self.sync_autopilot();
+
         let result = self.run_app(&mut terminal).await;
 
         // Restore terminal
@@ -313,7 +323,44 @@ impl Dashboard {
         )?;
         terminal.show_cursor()?;
 
+        // Wind down the meeting watcher; if it is mid-recording this stops the
+        // capture and finalizes it before the process exits.
+        if let Some(handle) = self.autopilot.take() {
+            if self.recording_guard.load(AtomicOrdering::SeqCst) {
+                println!("⏳ Finishing meeting recording...");
+            }
+            if let Err(e) = handle.join().await {
+                eprintln!("⚠️  Meeting watcher stopped with an error: {e}");
+            }
+        }
+
         result
+    }
+
+    /// Start or stop the background meeting autopilot to match
+    /// `config.meeting_detection.enabled`.
+    pub(super) fn sync_autopilot(&mut self) {
+        let want = self.config.meeting_detection.enabled;
+        let running = self
+            .autopilot
+            .as_ref()
+            .map(|h| !h.is_finished())
+            .unwrap_or(false);
+        if want && !running {
+            self.autopilot = Some(spawn_autopilot(
+                self.config.clone(),
+                AutopilotOptions {
+                    quiet: true, // the TUI owns the terminal
+                    ..AutopilotOptions::default()
+                },
+                self.recording_guard.clone(),
+            ));
+        } else if !want
+            && running
+            && let Some(handle) = self.autopilot.take()
+        {
+            handle.stop();
+        }
     }
 
     async fn run_app<B: ratatui::backend::Backend>(
@@ -336,6 +383,7 @@ impl Dashboard {
                 if task.is_finished() {
                     let completed_task = self.recording_task.take().unwrap();
                     let recording_mode = self.recording_mode.take();
+                    self.recording_guard.store(false, AtomicOrdering::SeqCst);
 
                     // Clean up channels
                     self.recording_stop_tx = None;

@@ -1,10 +1,8 @@
 use anyhow::Result;
 use scriba::core::{
-    resolve_transcription_mode, AudioFormat, CloudProvider, CompressionSettings, EnrichmentMode,
-    LocalModel, MeetingEvent, MeetingWatcherConfig, ScribaConfig, TranscriptionMode,
-    WorkflowManager, capturing_processes, desktop_confirm, initialize_world_from_seed,
-    meeting_signal, notification_helper_ready, notify_event, prepare_notification_helper,
-    run_meeting_watcher, watcher_excludes_self,
+    resolve_transcription_mode, AudioFormat, AutopilotOptions, CloudProvider, CompressionSettings,
+    EnrichmentMode, LocalModel, ScribaConfig, TranscriptionMode, WorkflowManager,
+    initialize_world_from_seed, run_autopilot, watcher_excludes_self,
 };
 use scriba::database::Database;
 use scriba::enrichment::WorldContext;
@@ -14,10 +12,8 @@ use scriba::tui::Dashboard;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::atomic::AtomicBool;
 use structopt::StructOpt;
-use tokio::sync::mpsc;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -1159,58 +1155,10 @@ fn apply_enrichment_overrides(
     Ok(())
 }
 
-/// Handle to a running meeting-watcher thread.
-struct WatcherHandle {
-    stop: Arc<AtomicBool>,
-    events: mpsc::Receiver<MeetingEvent>,
-    task: tokio::task::JoinHandle<Result<()>>,
-}
-
-fn spawn_watcher(config: MeetingWatcherConfig) -> WatcherHandle {
-    let (event_tx, events) = mpsc::channel::<MeetingEvent>(8);
-    let stop = Arc::new(AtomicBool::new(false));
-    let task = tokio::task::spawn_blocking({
-        let stop = stop.clone();
-        move || run_meeting_watcher(config, event_tx, stop)
-    });
-    WatcherHandle { stop, events, task }
-}
-
-/// The watcher's event channel closed: join the thread and surface why.
-async fn watcher_exit_error(watcher: &mut WatcherHandle) -> anyhow::Error {
-    match (&mut watcher.task).await {
-        Ok(Ok(())) => anyhow::anyhow!("meeting watcher exited unexpectedly"),
-        Ok(Err(e)) => e,
-        Err(e) => anyhow::anyhow!("meeting watcher task panicked: {e}"),
-    }
-}
-
-/// What to do with a detected meeting after the optional confirmation step.
-enum MeetingDecision {
-    Record,
-    Skip,
-    AlreadyEnded,
-}
-
-/// Background meeting watcher (`scriba watch`).
-///
-/// Detects the start of a meeting by watching whether a microphone is in use
-/// by another process (Zoom/Meet grab the mic on join). By default asks via a
-/// Record/Ignore dialog, then records the meeting; `--no-confirm` records
-/// immediately and `--no-auto-record` only notifies.
-///
-/// Where the OS attributes mic use per process (macOS 14+, PulseAudio/
-/// PipeWire), the watcher keeps running during the recording with Scriba's own
-/// capture excluded, and the recording is stopped the moment the meeting app
-/// releases the mic; the silence timeout is only a fallback net. On older
-/// macOS the watcher can't tell Scriba's capture from the meeting's, so it is
-/// paused while recording and the silence timeout is the stop mechanism.
-///
-/// After each recording a cooldown suppresses new detections, so another
-/// recording tool reacting to Scriba's capture can't trigger a feedback loop
-/// of tiny recordings (`meeting_detection.cooldown_seconds`; listing the tool
-/// in `meeting_detection.ignored_processes` removes it from detection
-/// entirely).
+/// CLI wrapper for the meeting autopilot (`scriba watch`): prints the banner,
+/// maps Ctrl+C to the shutdown signal, then runs the shared autopilot loop
+/// (`core::autopilot`). The same loop runs quietly inside the TUI dashboard
+/// by default.
 #[allow(clippy::too_many_arguments)]
 async fn run_watch(
     no_auto_record: bool,
@@ -1247,21 +1195,17 @@ async fn run_watch(
     }
 
     let md = config.meeting_detection.clone();
-    let auto_record = md.auto_record;
-    let confirm = md.confirm_before_record;
-    let silence_fallback = Duration::from_secs(md.min_silence_seconds as u64);
-    let cooldown = Duration::from_secs(md.cooldown_seconds as u64);
     let exclude_self = watcher_excludes_self();
 
     println!("👀 Scriba meeting watcher is running...");
     println!("   Detection watches whether another process is using a microphone.");
-    if auto_record && confirm {
+    if md.auto_record && md.confirm_before_record {
         println!(
             "   A Record/Ignore dialog is shown on detection (ignored after {}s if unanswered).",
             md.confirm_timeout_seconds
         );
     }
-    if auto_record && !exclude_self {
+    if md.auto_record && !exclude_self {
         println!(
             "   Note: this system can't attribute mic use per process, so recordings stop after {}s of silence instead of on mic release.",
             md.min_silence_seconds
@@ -1271,8 +1215,8 @@ async fn run_watch(
     if verbose {
         println!(
             "   auto_record={} confirm={} exclude_self={} silence_fallback={}s cooldown={}s ignored={:?}",
-            auto_record,
-            confirm,
+            md.auto_record,
+            md.confirm_before_record,
             exclude_self,
             md.min_silence_seconds,
             md.cooldown_seconds,
@@ -1280,318 +1224,27 @@ async fn run_watch(
         );
     }
 
-    // Build the native notification panel up front so the first detection
-    // doesn't wait on swiftc (first run only, ~10s).
-    if !notification_helper_ready() {
-        println!("   Preparing notification panel (first run, takes a few seconds)...");
-    }
-    match tokio::task::spawn_blocking(prepare_notification_helper).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => eprintln!(
-            "⚠️  Native notification panel unavailable ({e}); using AppleScript dialogs instead."
-        ),
-        Err(e) => eprintln!("⚠️  Notification panel setup task failed: {e}"),
-    }
+    // First Ctrl+C requests a graceful shutdown; a second force-quits.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        println!("\n👋 Stopping meeting watcher (Ctrl+C again to force quit)...");
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::signal::ctrl_c().await;
+        eprintln!("Aborting.");
+        std::process::exit(130);
+    });
 
-    let watcher_cfg = MeetingWatcherConfig {
-        input_device: md.input_device.clone(),
-        ignored_processes: md.ignored_processes.clone(),
-        verbose,
-    };
-
-    // Surface anything already holding the mic: a meeting in progress won't be
-    // detected until it ends, and another recording tool showing up here is a
-    // candidate for `meeting_detection.ignored_processes`.
-    if let Ok(procs) = capturing_processes(&watcher_cfg)
-        && !procs.is_empty()
-    {
-        println!(
-            "   ⚠️  Mic currently in use by: {} — a meeting already in progress is not detected until it ends.",
-            procs.join(", ")
-        );
-    }
-
-    let mut watcher = spawn_watcher(watcher_cfg.clone());
-
-    // Set when an auto-recording stopped (silence fallback) before the meeting
-    // app released the mic: the next MeetingEnded should still notify.
-    let mut pending_end_notify = false;
-    // After a recording finishes, suppress new detections until this instant
-    // (breaks feedback loops with other recording tools reacting to us).
-    let mut cooldown_until: Option<tokio::time::Instant> = None;
-
-    'outer: loop {
-        // Phase 1: wait for a meeting to start.
-        loop {
-            tokio::select! {
-                biased;
-                _ = tokio::signal::ctrl_c() => break 'outer,
-                evt = watcher.events.recv() => match evt {
-                    Some(MeetingEvent::MeetingStarted) => {
-                        match cooldown_until {
-                            Some(until) if tokio::time::Instant::now() < until => {
-                                if verbose {
-                                    println!("🧊 Detection during post-recording cooldown — waiting it out.");
-                                }
-                                tokio::select! {
-                                    biased;
-                                    _ = tokio::signal::ctrl_c() => break 'outer,
-                                    _ = tokio::time::sleep_until(until) => {}
-                                }
-                                cooldown_until = None;
-                                // Discard events raced during the cooldown and
-                                // judge by the current state instead.
-                                while watcher.events.try_recv().is_ok() {}
-                                if meeting_signal(&watcher_cfg).unwrap_or(false) {
-                                    break; // outlasted the cooldown: a real meeting
-                                }
-                                // Fizzled during cooldown: keep waiting.
-                            }
-                            _ => {
-                                cooldown_until = None;
-                                break;
-                            }
-                        }
-                    }
-                    Some(MeetingEvent::MeetingEnded) => {
-                        if pending_end_notify {
-                            pending_end_notify = false;
-                            notify_event(MeetingEvent::MeetingEnded, true, None);
-                            if once {
-                                break 'outer;
-                            }
-                        }
-                    }
-                    None => return Err(watcher_exit_error(&mut watcher).await),
-                },
-            }
-        }
-
-        // Which app triggered the detection (dialog / notification wording).
-        let trigger = capturing_processes(&watcher_cfg)
-            .ok()
-            .filter(|p| !p.is_empty())
-            .map(|p| p.join(", "));
-
-        // Notification-only mode: announce start and end, never record.
-        if !auto_record {
-            notify_event(MeetingEvent::MeetingStarted, false, trigger.as_deref());
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = tokio::signal::ctrl_c() => break 'outer,
-                    evt = watcher.events.recv() => match evt {
-                        Some(MeetingEvent::MeetingEnded) => {
-                            notify_event(MeetingEvent::MeetingEnded, false, None);
-                            break;
-                        }
-                        Some(_) => {}
-                        None => return Err(watcher_exit_error(&mut watcher).await),
-                    },
-                }
-            }
-            if once {
-                break;
-            }
-            continue;
-        }
-
-        let decision = if confirm {
-            // The panel shows this as the subtitle and resolves bundle IDs to
-            // app names (e.g. "company.thebrowser.browser.helper" -> "Arc").
-            let subtitle = trigger.clone().unwrap_or_default();
-            let dialog = desktop_confirm(
-                "Scriba \u{00B7} Meeting detected",
-                &subtitle,
-                "Record",
-                "Ignore",
-                md.confirm_timeout_seconds,
-                false,
-            );
-            tokio::pin!(dialog);
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = tokio::signal::ctrl_c() => break 'outer,
-                    answer = &mut dialog => {
-                        break if answer { MeetingDecision::Record } else { MeetingDecision::Skip };
-                    }
-                    evt = watcher.events.recv() => match evt {
-                        // Meeting over before the user answered: the dropped
-                        // dialog future kills the dialog process.
-                        Some(MeetingEvent::MeetingEnded) => break MeetingDecision::AlreadyEnded,
-                        Some(_) => {}
-                        None => return Err(watcher_exit_error(&mut watcher).await),
-                    },
-                }
-            }
-        } else {
-            notify_event(MeetingEvent::MeetingStarted, true, trigger.as_deref());
-            MeetingDecision::Record
-        };
-
-        match decision {
-            MeetingDecision::AlreadyEnded => {
-                notify_event(MeetingEvent::MeetingEnded, false, None);
-                if once {
-                    break;
-                }
-                continue;
-            }
-            MeetingDecision::Skip => {
-                if verbose {
-                    println!("🙈 Recording declined — ignoring this meeting.");
-                }
-                loop {
-                    tokio::select! {
-                        biased;
-                        _ = tokio::signal::ctrl_c() => break 'outer,
-                        evt = watcher.events.recv() => match evt {
-                            Some(MeetingEvent::MeetingEnded) => {
-                                notify_event(MeetingEvent::MeetingEnded, false, None);
-                                break;
-                            }
-                            Some(_) => {}
-                            None => return Err(watcher_exit_error(&mut watcher).await),
-                        },
-                    }
-                }
-                if once {
-                    break;
-                }
-                continue;
-            }
-            MeetingDecision::Record => {}
-        }
-
-        if !exclude_self {
-            // Our own capture would read as "mic in use": pause the watcher
-            // for the duration of the recording. The thread exits within one
-            // poll interval; no need to join it here.
-            watcher.stop.store(true, Ordering::Relaxed);
-        }
-
-        if verbose {
-            if exclude_self {
-                println!(
-                    "🎙️  Recording meeting (stops on mic release; silence fallback {}s)...",
-                    md.min_silence_seconds
-                );
-            } else {
-                println!(
-                    "🎙️  Recording meeting (auto-stop after {}s of silence)...",
-                    md.min_silence_seconds
-                );
-            }
-        }
-
-        let (stop_tx, stop_rx) = mpsc::channel::<()>(1);
-        let transcription_mode = if no_transcribe {
-            None
-        } else {
-            Some(config.transcription.clone())
-        };
-        let mut workflow = WorkflowManager::with_config(config.clone())?;
-        // The recording must run on its own task: `record_audio` blocks its
-        // task for the whole recording, so polling it inline would starve the
-        // watcher-event and Ctrl+C select arms.
-        let mut rec_task = tokio::spawn(async move {
-            workflow
-                .record_meeting(
-                    Some("Meeting".to_string()),
-                    Some(CompressionSettings::speech_optimized()),
-                    !no_transcribe,
-                    transcription_mode,
-                    stop_rx,
-                    Some(silence_fallback),
-                )
-                .await
-        });
-
-        let mut meeting_ended = false;
-        let mut interrupted = false;
-        let mut watcher_alive = exclude_self;
-        let rec_result = loop {
-            tokio::select! {
-                biased;
-                _ = tokio::signal::ctrl_c() => {
-                    if interrupted {
-                        eprintln!("Aborting.");
-                        std::process::exit(130);
-                    }
-                    interrupted = true;
-                    let _ = stop_tx.try_send(());
-                    println!("\n🛑 Stopping recording (Ctrl+C again to abort processing)...");
-                }
-                res = &mut rec_task => break res,
-                evt = watcher.events.recv(), if watcher_alive && !meeting_ended => match evt {
-                    Some(MeetingEvent::MeetingEnded) => {
-                        meeting_ended = true;
-                        // Notify right away — finalization (encode, DB,
-                        // transcription) can take a while.
-                        notify_event(MeetingEvent::MeetingEnded, true, None);
-                        if verbose {
-                            println!("📴 Meeting app released the mic — stopping recording.");
-                        }
-                        let _ = stop_tx.try_send(());
-                    }
-                    Some(_) => {}
-                    None => watcher_alive = false,
-                },
-            }
-        };
-
-        match rec_result {
-            Ok(Ok(_)) => {
-                if verbose {
-                    println!("✅ Meeting recording finished.");
-                }
-            }
-            Ok(Err(e)) => eprintln!("⚠️  Meeting recording failed: {e}"),
-            Err(e) => eprintln!("⚠️  Meeting recording task panicked: {e}"),
-        }
-
-        if interrupted {
-            break;
-        }
-
-        cooldown_until = Some(tokio::time::Instant::now() + cooldown);
-
-        if exclude_self {
-            if meeting_ended {
-                // End notification already fired the moment the mic was
-                // released.
-                if once {
-                    break;
-                }
-            } else {
-                // The silence fallback (or an error) ended the recording while
-                // the meeting app still holds the mic; notify once it lets go.
-                pending_end_notify = true;
-            }
-        } else {
-            // The watcher was paused, so poll for the mic release ourselves,
-            // giving our own just-closed stream a moment to disappear.
-            tokio::time::sleep(Duration::from_millis(1500)).await;
-            loop {
-                if !meeting_signal(&watcher_cfg).unwrap_or(false) {
-                    break;
-                }
-                tokio::select! {
-                    biased;
-                    _ = tokio::signal::ctrl_c() => break 'outer,
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-                }
-            }
-            notify_event(MeetingEvent::MeetingEnded, true, None);
-            if once {
-                break;
-            }
-            watcher = spawn_watcher(watcher_cfg.clone());
-        }
-    }
-
-    println!("\n👋 Stopping meeting watcher...");
-    watcher.stop.store(true, Ordering::Relaxed);
-    Ok(())
+    run_autopilot(
+        config,
+        AutopilotOptions {
+            transcribe: !no_transcribe,
+            once,
+            verbose,
+            quiet: false,
+        },
+        shutdown_rx,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await
 }

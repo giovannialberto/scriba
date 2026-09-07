@@ -211,6 +211,25 @@ impl Dashboard {
     }
 
     pub(super) async fn start_recording_task(&mut self, recording_name: String) -> Result<()> {
+        // Never double-capture: the meeting autopilot may be auto-recording.
+        if self
+            .recording_guard
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            self.recording_mode = None;
+            self.message =
+                "A meeting is being auto-recorded — wait for it to finish before recording manually."
+                    .to_string();
+            self.show_message = true;
+            return Ok(());
+        }
+
         // Create channels for recording control
         let (stop_tx, stop_rx) = mpsc::channel(1);
         let (level_tx, level_rx) = mpsc::channel(100);
