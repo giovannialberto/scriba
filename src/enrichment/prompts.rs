@@ -51,6 +51,32 @@ Now analyze the transcript above and return JSON with the ACTUAL content:"#,
 
 
 
+/// Build the reduce step of chunked extraction: combine the per-chunk results
+/// (JSON, in transcript order) into one coherent set of recording-level fields.
+pub fn build_extraction_merge_prompt(partials_json: &[String]) -> String {
+    let mut parts = String::new();
+    for (i, partial) in partials_json.iter().enumerate() {
+        parts.push_str(&format!("PART {} OF {}:\n{}\n\n", i + 1, partials_json.len(), partial));
+    }
+    format!(
+        r#"You are a knowledge extraction assistant. A long recording was analyzed in consecutive parts. Below are the PARTIAL RESULTS for each part, in order.
+
+{parts}
+Combine them into ONE result for the whole recording and return it as a JSON object:
+
+1. "title": A concise, descriptive title for the whole recording (5-10 words max)
+2. "summary": A brief summary of the whole recording (2-4 sentences), not a list of parts
+3. "topics": The main topics across all parts, deduplicated (3-7 items)
+4. "people": Leave as an empty array [] (entities are merged separately)
+5. "organizations": Leave as an empty array []
+6. "key_points": The most important points across all parts, deduplicated (3-7 items)
+7. "action_items": All action items or tasks mentioned, deduplicated
+
+Return ONLY valid JSON with exactly these keys, no additional text."#,
+        parts = parts.trim_end()
+    )
+}
+
 /// Build a prompt for updating entity context with new information.
 pub fn build_context_update_prompt(
     entity_name: &str,

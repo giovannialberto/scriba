@@ -79,6 +79,34 @@ async fn main() {
         Err(e) => println!("== generate: FAILED: {e}"),
     }
 
+    // 1b. Schema-constrained generation (falls back to JSON mode where unsupported)
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "city": {"type": "string"},
+            "population": {"type": "integer"},
+            "landmarks": {"type": "array", "items": {"type": "string"}}
+        },
+        "required": ["city", "population", "landmarks"]
+    });
+    match llm
+        .generate_structured("Describe Rome: city name, approximate population, three landmarks.", &schema)
+        .await
+    {
+        Ok(json) => {
+            let parsed: Result<serde_json::Value, _> = serde_json::from_str(json.trim());
+            let keys_ok = parsed
+                .as_ref()
+                .map(|v| ["city", "population", "landmarks"].iter().all(|k| v.get(k).is_some()))
+                .unwrap_or(false);
+            println!("== structured: valid json = {}, schema keys present = {}", parsed.is_ok(), keys_ok);
+            if !keys_ok {
+                println!("   raw: {json}");
+            }
+        }
+        Err(e) => println!("== structured: FAILED: {e}"),
+    }
+
     // 2. Agent loop with tools, then a follow-up turn that replays the transcript
     let system = "You are Scriba, an assistant over the user's recordings. \
                   Always use tools to answer questions about the data."
