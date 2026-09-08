@@ -14,7 +14,11 @@ pub enum ProviderError {
     AuthFailure { message: String },
 
     #[error("Rate limited: {message}")]
-    RateLimited { message: String },
+    RateLimited {
+        message: String,
+        /// Server-suggested wait from a `Retry-After` header, if any.
+        retry_after_secs: Option<u64>,
+    },
 
     #[error("API error ({status}): {message}")]
     HttpStatus { status: u16, message: String },
@@ -74,9 +78,7 @@ mod tests {
     #[test]
     fn retryable_classification() {
         assert!(
-            ProviderError::RateLimited {
-                message: String::new()
-            }
+            ProviderError::RateLimited { message: String::new(), retry_after_secs: None }
             .is_retryable()
         );
         assert!(ProviderError::Timeout { seconds: 1 }.is_retryable());

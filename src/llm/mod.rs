@@ -6,6 +6,7 @@
 //! [`LlmTarget`] that pins the wire protocol, endpoint, credential and model.
 //! Nothing here guesses a provider from a model name.
 
+use std::future::Future;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -41,6 +42,74 @@ const COMPACTION_MAX_TOKENS: u32 = 1024;
 const EXTRACTION_TEMPERATURE: f64 = 0.3;
 /// Longest error body we echo back to the user.
 const MAX_ERROR_BODY_CHARS: usize = 500;
+
+/// How transient failures are retried. One 429 or 503 must not kill an
+/// enrichment run or a chat turn.
+#[derive(Debug, Clone, Copy)]
+pub struct RetryPolicy {
+    /// Total attempts including the first one.
+    pub max_attempts: u32,
+    /// Delay before the first retry; doubles each time.
+    pub base_delay: Duration,
+    /// Upper bound for any single delay (also caps `Retry-After`).
+    pub max_delay: Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 4,
+            base_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(20),
+        }
+    }
+}
+
+impl RetryPolicy {
+    /// Delay before retry number `retry` (1-based), honoring a server hint.
+    fn delay_for(&self, retry: u32, err: &ProviderError) -> Duration {
+        let hinted = match err {
+            ProviderError::RateLimited {
+                retry_after_secs: Some(secs),
+                ..
+            } => Some(Duration::from_secs(*secs)),
+            _ => None,
+        };
+        let backoff = self
+            .base_delay
+            .checked_mul(1u32 << retry.saturating_sub(1).min(16))
+            .unwrap_or(self.max_delay);
+        hinted.unwrap_or(backoff).min(self.max_delay)
+    }
+}
+
+/// Run `op` until it succeeds, fails with a non-retryable error, or the
+/// policy is exhausted. `on_retry(next_attempt, error, delay)` is called
+/// before each wait so callers can surface progress.
+pub async fn with_retry<T, F, Fut, N>(
+    policy: &RetryPolicy,
+    mut op: F,
+    mut on_retry: N,
+) -> Result<T, ProviderError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, ProviderError>>,
+    N: FnMut(u32, &ProviderError, Duration),
+{
+    let mut attempt = 1;
+    loop {
+        match op().await {
+            Ok(v) => return Ok(v),
+            Err(err) if err.is_retryable() && attempt < policy.max_attempts.max(1) => {
+                let delay = policy.delay_for(attempt, &err);
+                attempt += 1;
+                on_retry(attempt, &err, delay);
+                tokio::time::sleep(delay).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
 
 /// Wire protocol spoken to the endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,8 +296,16 @@ pub fn map_error(err: genai::Error) -> ProviderError {
 
     fn from_web(web: &WebError) -> Option<ProviderError> {
         match web {
-            WebError::ResponseFailedStatus { status, body, .. } => {
-                Some(status_error(status.as_u16(), body))
+            WebError::ResponseFailedStatus {
+                status,
+                body,
+                headers,
+            } => {
+                let retry_after = headers
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.trim().parse::<u64>().ok());
+                Some(status_error_with_hint(status.as_u16(), body, retry_after))
             }
             WebError::Reqwest(e) if e.is_timeout() => Some(ProviderError::Timeout {
                 seconds: REQUEST_TIMEOUT.as_secs(),
@@ -274,6 +351,11 @@ pub fn map_error(err: genai::Error) -> ProviderError {
 
 /// Classify an HTTP status into the provider error taxonomy.
 fn status_error(status: u16, body: &str) -> ProviderError {
+    status_error_with_hint(status, body, None)
+}
+
+/// Like [`status_error`], carrying a `Retry-After` hint for 429 responses.
+fn status_error_with_hint(status: u16, body: &str, retry_after_secs: Option<u64>) -> ProviderError {
     let message = trim_body(body);
     match status {
         401 | 403 => ProviderError::AuthFailure { message },
@@ -281,7 +363,10 @@ fn status_error(status: u16, body: &str) -> ProviderError {
         400 if body.contains("API_KEY_INVALID") || body.contains("API key not valid") => {
             ProviderError::AuthFailure { message }
         }
-        429 => ProviderError::RateLimited { message },
+        429 => ProviderError::RateLimited {
+            message,
+            retry_after_secs,
+        },
         _ => ProviderError::HttpStatus { status, message },
     }
 }
@@ -315,6 +400,7 @@ pub struct GenaiProvider {
     client: Client,
     /// Cached result of the Ollama tool-capability probe.
     tools_supported: OnceCell<bool>,
+    retry: RetryPolicy,
 }
 
 impl GenaiProvider {
@@ -329,7 +415,14 @@ impl GenaiProvider {
             service_target,
             client,
             tools_supported: OnceCell::new(),
+            retry: RetryPolicy::default(),
         }
+    }
+
+    /// Override the retry policy (tests, one-shot CLI probes).
+    pub fn with_retry_policy(mut self, retry: RetryPolicy) -> Self {
+        self.retry = retry;
+        self
     }
 
     /// Whether the model can take tool definitions. Ollama rejects requests
@@ -394,11 +487,17 @@ impl GenaiProvider {
         options: ChatOptions,
     ) -> Result<String, ProviderError> {
         self.ensure_credentials()?;
-        let response = self
-            .client
-            .exec_chat(self.service_target.clone(), request, Some(&options))
-            .await
-            .map_err(map_error)?;
+        let response = with_retry(
+            &self.retry,
+            || async {
+                self.client
+                    .exec_chat(self.service_target.clone(), request.clone(), Some(&options))
+                    .await
+                    .map_err(map_error)
+            },
+            |_, _, _| {},
+        )
+        .await?;
         let text = response.content.into_texts().join("");
         if text.trim().is_empty() {
             return Err(ProviderError::ParseError {
@@ -500,11 +599,33 @@ impl AgentProvider for GenaiProvider {
             .with_capture_content(true)
             .with_capture_tool_calls(true);
 
-        let mut response = self
-            .client
-            .exec_chat_stream(self.service_target.clone(), request, Some(&options))
-            .await
-            .map_err(map_error)?;
+        // Retry only the request itself: once chunks have been streamed to the
+        // UI there is no way to take them back.
+        let display_name = self.target.display_name.clone();
+        let mut response = with_retry(
+            &self.retry,
+            || async {
+                self.client
+                    .exec_chat_stream(self.service_target.clone(), request.clone(), Some(&options))
+                    .await
+                    .map_err(map_error)
+            },
+            |attempt, err, delay| {
+                let reason = match err {
+                    ProviderError::RateLimited { .. } => "rate limited".to_string(),
+                    ProviderError::Timeout { .. } => "timed out".to_string(),
+                    ProviderError::Network { .. } => "connection failed".to_string(),
+                    ProviderError::HttpStatus { status, .. } => format!("returned HTTP {status}"),
+                    other => other.to_string(),
+                };
+                let _ = tx.try_send(AgentEvent::Status(format!(
+                    "{display_name} {reason}; retrying in {}s (attempt {attempt}/{})",
+                    delay.as_secs(),
+                    self.retry.max_attempts
+                )));
+            },
+        )
+        .await?;
 
         let mut streamed_text = String::new();
         let mut end = None;
@@ -688,6 +809,117 @@ mod tests {
             supports_tools: Some(false),
         });
         assert_eq!(entry.display_name(), "gemma3:12b (no tools)");
+    }
+
+    fn fast_policy() -> RetryPolicy {
+        RetryPolicy {
+            max_attempts: 3,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(4),
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_transient_errors_then_succeeds() {
+        let calls = std::cell::Cell::new(0);
+        let mut retries = Vec::new();
+        let result = with_retry(
+            &fast_policy(),
+            || {
+                calls.set(calls.get() + 1);
+                let n = calls.get();
+                async move {
+                    if n < 3 {
+                        Err(ProviderError::HttpStatus {
+                            status: 503,
+                            message: "busy".into(),
+                        })
+                    } else {
+                        Ok(n)
+                    }
+                }
+            },
+            |attempt, _, delay| retries.push((attempt, delay)),
+        )
+        .await;
+        assert_eq!(result.unwrap(), 3);
+        assert_eq!(
+            retries,
+            vec![(2, Duration::from_millis(1)), (3, Duration::from_millis(2))]
+        );
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_permanent_errors() {
+        let calls = std::cell::Cell::new(0);
+        let result: Result<(), _> = with_retry(
+            &fast_policy(),
+            || {
+                calls.set(calls.get() + 1);
+                async {
+                    Err(ProviderError::AuthFailure {
+                        message: "bad key".into(),
+                    })
+                }
+            },
+            |_, _, _| panic!("must not retry"),
+        )
+        .await;
+        assert!(matches!(result, Err(ProviderError::AuthFailure { .. })));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn gives_up_after_max_attempts() {
+        let calls = std::cell::Cell::new(0);
+        let result: Result<(), _> = with_retry(
+            &fast_policy(),
+            || {
+                calls.set(calls.get() + 1);
+                async { Err(ProviderError::Timeout { seconds: 1 }) }
+            },
+            |_, _, _| {},
+        )
+        .await;
+        assert!(matches!(result, Err(ProviderError::Timeout { .. })));
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn retry_delays_honor_server_hint_and_cap() {
+        let policy = RetryPolicy {
+            max_attempts: 5,
+            base_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(5),
+        };
+        let generic = ProviderError::Network {
+            message: String::new(),
+        };
+        assert_eq!(policy.delay_for(1, &generic), Duration::from_secs(1));
+        assert_eq!(policy.delay_for(2, &generic), Duration::from_secs(2));
+        assert_eq!(policy.delay_for(3, &generic), Duration::from_secs(4));
+        assert_eq!(policy.delay_for(4, &generic), Duration::from_secs(5));
+        let hinted = ProviderError::RateLimited {
+            message: String::new(),
+            retry_after_secs: Some(3),
+        };
+        assert_eq!(policy.delay_for(1, &hinted), Duration::from_secs(3));
+        let huge_hint = ProviderError::RateLimited {
+            message: String::new(),
+            retry_after_secs: Some(600),
+        };
+        assert_eq!(policy.delay_for(1, &huge_hint), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn retry_after_header_is_carried() {
+        assert!(matches!(
+            status_error_with_hint(429, "slow down", Some(7)),
+            ProviderError::RateLimited {
+                retry_after_secs: Some(7),
+                ..
+            }
+        ));
     }
 
     #[test]
