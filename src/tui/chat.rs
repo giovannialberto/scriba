@@ -91,6 +91,8 @@ pub struct HomeRecording {
     pub summary_line: Option<String>,
     /// Background work (transcription/enrichment) running for this recording.
     pub busy: bool,
+    /// The last transcription attempt failed (retry from Browse with T).
+    pub failed: bool,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -637,6 +639,13 @@ impl ChatState {
                     let busy_line = format!("{}   {}   {} transcribing\u{2026}", margin, vert, spinner);
                     content_texts.push(String::new());
                     all_lines.push(Line::from(Span::styled(busy_line, Style::default().fg(Color::Yellow))));
+                } else if rec.failed {
+                    let failed_line = format!(
+                        "{}   {}   \u{2715} transcription failed \u{2014} retry from Browse (T)",
+                        margin, vert
+                    );
+                    content_texts.push(String::new());
+                    all_lines.push(Line::from(Span::styled(failed_line, Style::default().fg(Color::Red))));
                 } else if let Some(ref summary) = rec.summary_line {
                     let sum_prefix = format!("{}   {}   ", margin, vert);
                     let max_sum = tree_max.saturating_sub(sum_prefix.chars().count());

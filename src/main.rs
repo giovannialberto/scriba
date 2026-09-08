@@ -889,6 +889,7 @@ async fn main() -> Result<()> {
                                 categories: None,
                                 confidence_score: None,
                                 audio_path: audio_filename,
+                                transcript_error: None,
                                 transcript_path: if has_transcript {
                                     Some("transcript.txt".to_string())
                                 } else {

@@ -13,6 +13,7 @@ use serde_json::Value;
 use sherpa_onnx::{OfflineRecognizer, OfflineRecognizerConfig, Wave};
 use std::io::{stdout, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::io::BufReader;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -25,6 +26,18 @@ use crate::utils::BASE_PATH;
 
 /// OpenAI Whisper API maximum upload size (25 MB).
 const OPENAI_MAX_FILE_SIZE: u64 = 25 * 1024 * 1024;
+/// Recordings longer than this are split into chunks for the API even when
+/// they fit the size limit: one long request is slow and far more likely to
+/// hit gateway timeouts or transient 5xx errors than several short ones.
+const API_CHUNK_THRESHOLD_SECS: f64 = 15.0 * 60.0;
+/// Target chunk length when splitting for the API.
+const API_CHUNK_SECS: f64 = 10.0 * 60.0;
+/// Chunks uploaded concurrently.
+const API_CHUNK_CONCURRENCY: usize = 3;
+/// Attempts per chunk before giving up (retries only on transient failures).
+const API_MAX_ATTEMPTS: u32 = 4;
+/// Per-request timeout: upload plus server-side processing of one chunk.
+const API_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Progress indicator for transcription operations.
 pub struct TranscriptionProgress {
@@ -226,22 +239,30 @@ fn get_audio_duration_secs(audio_path: &Path) -> Result<f64> {
         .context("Failed to parse audio duration from ffprobe output")
 }
 
-/// Split an audio file into chunks that each fit under `OPENAI_MAX_FILE_SIZE`.
+/// How many chunks the API upload needs: enough to stay under the size limit
+/// (with a 20% margin) and, for long recordings, to keep each request around
+/// `API_CHUNK_SECS`.
+fn plan_chunks(file_size: u64, duration_secs: f64) -> usize {
+    let by_size = (file_size as f64 / (OPENAI_MAX_FILE_SIZE as f64 * 0.80)).ceil() as usize;
+    let by_duration = if duration_secs > API_CHUNK_THRESHOLD_SECS {
+        (duration_secs / API_CHUNK_SECS).ceil() as usize
+    } else {
+        1
+    };
+    by_size.max(by_duration).max(1)
+}
+
+/// Split an audio file into `num_chunks` equal-length pieces.
 ///
 /// Returns a list of temporary chunk file paths, sorted in order.
-fn split_audio_into_chunks(audio_path: &Path) -> Result<Vec<PathBuf>> {
-    let file_size = std::fs::metadata(audio_path)
-        .context("Failed to read audio file metadata")?
-        .len();
-
-    let duration_secs = get_audio_duration_secs(audio_path)?;
+fn split_audio_into_chunks(
+    audio_path: &Path,
+    duration_secs: f64,
+    num_chunks: usize,
+) -> Result<Vec<PathBuf>> {
     if duration_secs <= 0.0 {
         return Err(anyhow::anyhow!("Audio file has zero or negative duration"));
     }
-
-    // Calculate how many chunks we need, with a 20% safety margin
-    let target_chunk_size = OPENAI_MAX_FILE_SIZE as f64 * 0.80;
-    let num_chunks = (file_size as f64 / target_chunk_size).ceil() as usize;
     let chunk_duration = duration_secs / num_chunks as f64;
 
     let ffmpeg_path = find_ffmpeg()?;
@@ -291,9 +312,39 @@ fn split_audio_into_chunks(audio_path: &Path) -> Result<Vec<PathBuf>> {
     Ok(chunk_paths)
 }
 
-/// Transcribe a single audio chunk via the OpenAI API.
-async fn transcribe_single_chunk(audio_path: &Path, api_key: &str) -> Result<String> {
-    let audio_file = std::fs::read(audio_path).context("Unable to read audio chunk")?;
+/// HTTP client for the OpenAI API with real timeouts: a stalled upload or a
+/// hung response must fail (and be retried) instead of blocking forever.
+fn api_client() -> Result<Client> {
+    Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .timeout(API_REQUEST_TIMEOUT)
+        .build()
+        .context("Failed to build HTTP client")
+}
+
+/// A failed chunk request, classified so the caller knows whether retrying
+/// makes sense (network errors, timeouts, 429, 5xx) or not (4xx, bad body).
+struct ChunkError {
+    retryable: bool,
+    error: anyhow::Error,
+}
+
+fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+/// Transcribe a single audio chunk via the OpenAI API (one attempt).
+async fn transcribe_single_chunk(
+    client: &Client,
+    audio_path: &Path,
+    api_key: &str,
+) -> Result<String, ChunkError> {
+    let fatal = |error: anyhow::Error| ChunkError { retryable: false, error };
+    let transient = |error: anyhow::Error| ChunkError { retryable: true, error };
+
+    let audio_file = std::fs::read(audio_path)
+        .context("Unable to read audio chunk")
+        .map_err(fatal)?;
 
     let filename = audio_path
         .file_name()
@@ -301,12 +352,11 @@ async fn transcribe_single_chunk(audio_path: &Path, api_key: &str) -> Result<Str
         .unwrap_or("audio")
         .to_string();
 
-    let client = Client::new();
-
     let part = Part::bytes(audio_file)
         .file_name(filename)
         .mime_str("audio/mpeg")
-        .context("Failed to create multipart form data")?;
+        .context("Failed to create multipart form data")
+        .map_err(fatal)?;
 
     let form = Form::new().part("file", part).text("model", "whisper-1");
 
@@ -316,7 +366,8 @@ async fn transcribe_single_chunk(audio_path: &Path, api_key: &str) -> Result<Str
         .multipart(form)
         .send()
         .await
-        .context("Failed to send transcription request to OpenAI")?;
+        .context("Failed to send transcription request to OpenAI")
+        .map_err(transient)?;
 
     let status = response.status();
     if !status.is_success() {
@@ -324,23 +375,56 @@ async fn transcribe_single_chunk(audio_path: &Path, api_key: &str) -> Result<Str
             .text()
             .await
             .unwrap_or_else(|_| "Unknown error".to_string());
-        return Err(anyhow::anyhow!(
+        let error = anyhow::anyhow!(
             "OpenAI API request failed with status {}: {}",
             status,
-            error_text
-        ));
+            error_text.trim()
+        );
+        return Err(ChunkError {
+            retryable: is_retryable_status(status),
+            error,
+        });
     }
 
     let response_json: Value = response
         .json()
         .await
-        .context("Failed to parse OpenAI response as JSON")?;
+        .context("Failed to parse OpenAI response as JSON")
+        .map_err(transient)?;
 
     response_json
         .get("text")
         .and_then(|t| t.as_str())
         .map(|s| s.to_string())
-        .ok_or_else(|| anyhow::anyhow!("No 'text' field found in OpenAI response"))
+        .ok_or_else(|| fatal(anyhow::anyhow!("No 'text' field found in OpenAI response")))
+}
+
+/// Transcribe one chunk with exponential backoff on transient failures.
+async fn transcribe_chunk_with_retry(
+    client: &Client,
+    audio_path: &Path,
+    api_key: &str,
+    index: usize,
+    total: usize,
+) -> Result<String> {
+    let mut attempt = 1;
+    loop {
+        match transcribe_single_chunk(client, audio_path, api_key).await {
+            Ok(text) => return Ok(text),
+            Err(ChunkError { retryable: true, .. }) if attempt < API_MAX_ATTEMPTS => {
+                sleep(Duration::from_secs(2u64.pow(attempt))).await;
+                attempt += 1;
+            }
+            Err(ChunkError { error, .. }) => {
+                return Err(error.context(format!(
+                    "Chunk {}/{} failed after {} attempt(s)",
+                    index + 1,
+                    total,
+                    attempt
+                )));
+            }
+        }
+    }
 }
 
 /// Paths to the files composing a sherpa-onnx model.
@@ -729,30 +813,67 @@ async fn transcribe_with_openai_api(audio_path: &PathBuf, api_key: &str) -> Resu
     let file_size = std::fs::metadata(audio_path)
         .context("Failed to read audio file metadata")?
         .len();
+    // Duration is best-effort; without it we still honour the size limit.
+    let duration_secs = get_audio_duration_secs(audio_path).unwrap_or(0.0);
+    let num_chunks = plan_chunks(file_size, duration_secs);
+    let client = api_client()?;
 
-    if file_size <= OPENAI_MAX_FILE_SIZE {
-        return transcribe_single_chunk(audio_path, api_key).await;
+    if num_chunks <= 1 {
+        return transcribe_chunk_with_retry(&client, audio_path, api_key, 0, 1).await;
     }
 
-    // File exceeds 25MB — split into chunks, transcribe each, concatenate
-    let chunk_paths = split_audio_into_chunks(audio_path)?;
-    let num_chunks = chunk_paths.len();
-    let mut transcripts = Vec::with_capacity(num_chunks);
+    // Long or large file: split, transcribe chunks concurrently (bounded by a
+    // semaphore, each task owning its inputs), reassemble in order.
+    let chunk_paths = split_audio_into_chunks(audio_path, duration_secs, num_chunks)?;
+    let tmp_dir = chunk_paths.first().and_then(|p| p.parent()).map(Path::to_path_buf);
 
-    for (i, chunk_path) in chunk_paths.iter().enumerate() {
-        let text = transcribe_single_chunk(chunk_path, api_key)
-            .await
-            .with_context(|| format!("Failed to transcribe chunk {}/{}", i + 1, num_chunks))?;
-
-        transcripts.push(text);
+    let api_key: Arc<str> = Arc::from(api_key);
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(API_CHUNK_CONCURRENCY));
+    let mut tasks = tokio::task::JoinSet::new();
+    for (i, chunk_path) in chunk_paths.iter().cloned().enumerate() {
+        let client = client.clone();
+        let api_key = api_key.clone();
+        let semaphore = semaphore.clone();
+        tasks.spawn(async move {
+            let _permit = semaphore.acquire_owned().await;
+            let text =
+                transcribe_chunk_with_retry(&client, &chunk_path, &api_key, i, num_chunks).await;
+            (i, text)
+        });
     }
 
-    // Clean up temp chunk files
-    if let Some(tmp_dir) = chunk_paths.first().and_then(|p| p.parent()) {
-        let _ = std::fs::remove_dir_all(tmp_dir);
+    let mut transcripts: Vec<Option<String>> = vec![None; num_chunks];
+    let mut first_error: Option<anyhow::Error> = None;
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok((i, Ok(text))) => transcripts[i] = Some(text),
+            Ok((_, Err(e))) => {
+                if first_error.is_none() {
+                    first_error = Some(e);
+                    tasks.abort_all();
+                }
+            }
+            Err(e) if !e.is_cancelled() => {
+                if first_error.is_none() {
+                    first_error = Some(anyhow::anyhow!("Chunk transcription task failed: {e}"));
+                    tasks.abort_all();
+                }
+            }
+            Err(_) => {}
+        }
     }
 
-    Ok(transcripts.join(" "))
+    if let Some(dir) = tmp_dir {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    if let Some(e) = first_error {
+        return Err(e);
+    }
+    Ok(transcripts
+        .into_iter()
+        .map(|t| t.unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join(" "))
 }
 
 /// Unified transcription function.
@@ -890,3 +1011,37 @@ pub async fn transcribe_audio(
 // Whisper initial-prompt functions were removed during the sherpa-onnx migration.
 // sherpa-onnx's Whisper bindings do not currently support initial prompting.
 // If support is added upstream, context-priming can be reintroduced from git history.
+
+#[cfg(test)]
+mod api_chunking_tests {
+    use super::*;
+
+    #[test]
+    fn short_small_files_are_a_single_request() {
+        assert_eq!(plan_chunks(5 * 1024 * 1024, 10.0 * 60.0), 1);
+    }
+
+    #[test]
+    fn long_recordings_split_by_duration_even_when_small() {
+        // 59 minutes at 32 kbps is ~14 MB: under the size limit, but split
+        // into ~10-minute chunks.
+        assert_eq!(plan_chunks(14_238_320, 3559.0), 6);
+    }
+
+    #[test]
+    fn oversized_files_split_by_size() {
+        // 60 MB but only 12 minutes long: size dictates (60 / 20 = 3 chunks).
+        assert_eq!(plan_chunks(60 * 1024 * 1024, 12.0 * 60.0), 3);
+    }
+
+    #[test]
+    fn transient_statuses_are_retryable() {
+        use reqwest::StatusCode;
+        assert!(is_retryable_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_retryable_status(StatusCode::BAD_GATEWAY));
+        assert!(is_retryable_status(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(!is_retryable_status(StatusCode::BAD_REQUEST));
+        assert!(!is_retryable_status(StatusCode::UNAUTHORIZED));
+        assert!(!is_retryable_status(StatusCode::PAYLOAD_TOO_LARGE));
+    }
+}

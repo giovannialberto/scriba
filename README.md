@@ -53,6 +53,12 @@ brew install scriba
 
 Or grab a binary directly from [Releases](https://github.com/giovannialberto/scriba/releases).
 
+**Already on Homebrew with Scriba 0.28.0 or earlier?** Homebrew 6 now requires trusting third-party taps, and the in-app updater in those versions can't do it for you. Run this once, then update normally:
+
+```bash
+brew trust --tap giovannialberto/scriba && brew update && brew upgrade scriba
+```
+
 </details>
 
 ### Run

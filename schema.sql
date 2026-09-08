@@ -32,7 +32,8 @@ CREATE TABLE IF NOT EXISTS recordings (
 
     -- File paths (relative to base directory)
     audio_path TEXT NOT NULL,            -- Path to audio file
-    transcript_path TEXT                 -- Path to transcript file
+    transcript_path TEXT,                -- Path to transcript file
+    transcript_error TEXT                -- Why the last transcription failed (transcript_status = 'failed')
 );
 
 CREATE TABLE IF NOT EXISTS transcripts (
