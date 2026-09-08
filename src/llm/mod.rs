@@ -15,7 +15,7 @@ use genai::chat::{
     CacheControl, ChatMessage, ChatOptions, ChatRequest, ChatResponseFormat, ChatStreamEvent,
     MessageContent, StopReason, Tool,
 };
-use genai::resolver::{AuthData, Endpoint};
+use genai::resolver::{AuthData, Endpoint, ProviderConfig};
 use genai::{Client, ModelIden, ServiceTarget, WebConfig};
 use tokio::sync::mpsc;
 
@@ -113,18 +113,21 @@ impl LlmTarget {
             } => {
                 let protocol = match provider {
                     CloudProvider::Anthropic => Protocol::Anthropic,
-                    CloudProvider::OpenAI => Protocol::OpenAI,
+                    CloudProvider::OpenAI | CloudProvider::OpenAICompatible => Protocol::OpenAI,
                     CloudProvider::Google => Protocol::Gemini,
                 };
+                let endpoint = config
+                    .effective_base_url()
+                    .unwrap_or_else(|| protocol.default_endpoint().to_string());
                 Self {
                     protocol,
-                    endpoint: normalize_base_url(protocol.default_endpoint()),
+                    endpoint: normalize_base_url(&endpoint),
                     api_key: config.resolve_api_key().filter(|k| !k.trim().is_empty()),
-                    api_key_env: Some(provider.env_var_name().to_string()),
+                    api_key_env: config.api_key_env_var(),
                     model: model
                         .clone()
                         .unwrap_or_else(|| provider.default_model().to_string()),
-                    display_name: provider.display_name().to_string(),
+                    display_name: config.provider_display_name(),
                 }
             }
             EnrichmentMode::Local {
@@ -153,6 +156,25 @@ impl LlmTarget {
             model: ModelIden::new(self.protocol.adapter_kind(), self.model.as_str()),
         }
     }
+}
+
+/// List the models an endpoint advertises (`GET {base_url}/models` for
+/// OpenAI-compatible hosts). Ollama has its own listing in `OllamaClient`.
+pub async fn list_models(target: &LlmTarget) -> Result<Vec<String>, ProviderError> {
+    let auth = match &target.api_key {
+        Some(key) => AuthData::from_single(key.clone()),
+        None => AuthData::from_single("none"),
+    };
+    let provider_config =
+        ProviderConfig::from_endpoint(Endpoint::from_owned(target.endpoint.clone()))
+            .with_auth(auth);
+    let mut names = Client::default()
+        .all_model_names(target.protocol.adapter_kind(), provider_config)
+        .await
+        .map_err(map_error)?;
+    names.sort();
+    names.dedup();
+    Ok(names)
 }
 
 /// Ensure a base URL ends with exactly one slash so adapters can append paths.
@@ -479,14 +501,46 @@ impl AgentProvider for GenaiProvider {
 mod tests {
     use super::*;
 
+    #[allow(clippy::field_reassign_with_default)]
     fn cloud_config(provider: CloudProvider, model: Option<&str>) -> EnrichmentConfig {
         let mut config = EnrichmentConfig::default();
         config.mode = EnrichmentMode::Cloud {
             provider,
             api_key: "sk-test".to_string(),
             model: model.map(str::to_string),
+            base_url: None,
         };
         config
+    }
+
+    #[test]
+    fn compatible_target_defaults_to_deepinfra() {
+        let target = LlmTarget::from_config(&cloud_config(CloudProvider::OpenAICompatible, None));
+        assert_eq!(target.protocol, Protocol::OpenAI);
+        assert_eq!(target.endpoint, "https://api.deepinfra.com/v1/openai/");
+        assert_eq!(target.model, crate::core::config::DEFAULT_COMPATIBLE_MODEL);
+        assert_eq!(target.api_key_env.as_deref(), Some("DEEPINFRA_API_KEY"));
+        assert_eq!(target.display_name, "DeepInfra (OpenAI-compatible)");
+    }
+
+    #[test]
+    fn compatible_target_honors_custom_base_url() {
+        let mut config = cloud_config(CloudProvider::OpenAICompatible, Some("my-model"));
+        config.set_base_url(Some("http://localhost:8000/v1/".to_string()));
+        let target = LlmTarget::from_config(&config);
+        assert_eq!(target.endpoint, "http://localhost:8000/v1/");
+        assert_eq!(target.model, "my-model");
+        assert_eq!(target.api_key_env.as_deref(), Some("SCRIBA_LLM_API_KEY"));
+        assert_eq!(target.display_name, "OpenAI-compatible");
+    }
+
+    #[test]
+    fn base_url_override_applies_to_first_party_providers() {
+        let mut config = cloud_config(CloudProvider::Anthropic, None);
+        config.set_base_url(Some("https://proxy.example.com/anthropic".to_string()));
+        let target = LlmTarget::from_config(&config);
+        assert_eq!(target.protocol, Protocol::Anthropic);
+        assert_eq!(target.endpoint, "https://proxy.example.com/anthropic/");
     }
 
     #[test]
@@ -507,6 +561,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn local_target_normalizes_endpoint() {
         let mut config = EnrichmentConfig::default();
         config.mode = EnrichmentMode::Local {

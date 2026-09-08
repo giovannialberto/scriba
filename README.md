@@ -12,7 +12,7 @@
 
 Scriba is an agent that turns your recordings into a searchable, queryable knowledge base and lets you ask questions across all of it. It builds a persistent knowledge graph so the agent always has context, not just the last thing you said.
 
-Run entirely **offline** with local STT models (Parakeet, Whisper, SenseVoice) + Ollama, or bring your own **AI providers** (OpenAI, Anthropic, Google).
+Run entirely **offline** with local STT models (Parakeet, Whisper, SenseVoice) + Ollama, or bring your own **AI providers**: Anthropic, OpenAI, Google, or any **OpenAI-compatible endpoint** (DeepInfra, OpenRouter, Groq, Together, vLLM, LM Studio) for open-weight models.
 
 <div align="center">
 <img src="docs/screenshots/scriba-home-cut.png" alt="Scriba home" width="700" />
@@ -68,6 +68,20 @@ scriba
 ```
 
 On first run, Scriba walks you through an onboarding flow to choose your mode and configure your setup. Then **`Ctrl+R`** to record.
+
+### Choosing an AI provider
+
+Private mode uses Ollama. Cloud mode works with Anthropic, OpenAI, Google, or any OpenAI-compatible endpoint, so open-weight models hosted on DeepInfra, OpenRouter, Groq, or Together, or served locally by vLLM or LM Studio, are one setting away. Pick them in Settings or from the CLI:
+
+```bash
+scriba config set-provider deepinfra                          # known host: endpoint pre-filled
+scriba config set-enrichment-model Qwen/Qwen3.5-397B-A17B
+scriba config set-enrichment-key <your-key>                   # or export DEEPINFRA_API_KEY
+
+scriba config set-provider custom --base-url http://localhost:8000/v1   # vLLM, LM Studio, ...
+```
+
+The Settings screen lists the models the endpoint advertises, so you can switch without looking up IDs.
 
 ## Meeting detection
 

@@ -276,6 +276,10 @@ pub enum CloudProvider {
     Anthropic,
     OpenAI,
     Google,
+    /// Any host speaking the OpenAI Chat Completions protocol (DeepInfra,
+    /// OpenRouter, Groq, Together, vLLM, LM Studio, ...). The endpoint lives
+    /// in `EnrichmentMode::Cloud::base_url`.
+    OpenAICompatible,
 }
 
 impl std::fmt::Display for CloudProvider {
@@ -284,6 +288,7 @@ impl std::fmt::Display for CloudProvider {
             CloudProvider::Anthropic => write!(f, "anthropic"),
             CloudProvider::OpenAI => write!(f, "openai"),
             CloudProvider::Google => write!(f, "google"),
+            CloudProvider::OpenAICompatible => write!(f, "custom"),
         }
     }
 }
@@ -292,22 +297,44 @@ impl std::str::FromStr for CloudProvider {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self> {
-        match s.to_lowercase().as_str() {
+        let lower = s.to_lowercase();
+        match lower.as_str() {
             "anthropic" | "claude" => Ok(CloudProvider::Anthropic),
             "openai" | "gpt" => Ok(CloudProvider::OpenAI),
             "google" | "gemini" => Ok(CloudProvider::Google),
-            _ => Err(anyhow::anyhow!("Invalid cloud provider: {}. Use: anthropic, openai, google", s)),
+            "custom" | "openai-compatible" | "compatible" => Ok(CloudProvider::OpenAICompatible),
+            _ if EndpointPreset::by_name(&lower).is_some() => Ok(CloudProvider::OpenAICompatible),
+            _ => Err(anyhow::anyhow!(
+                "Invalid cloud provider: {}. Use: anthropic, openai, google, custom, or one of {}",
+                s,
+                EndpointPreset::names().join(", ")
+            )),
         }
     }
 }
 
 impl CloudProvider {
+    /// All cloud providers in the order the UI cycles through them.
+    pub const ALL: [CloudProvider; 4] = [
+        CloudProvider::Anthropic,
+        CloudProvider::OpenAI,
+        CloudProvider::Google,
+        CloudProvider::OpenAICompatible,
+    ];
+
+    /// The provider that follows this one in the UI cycle.
+    pub fn next(&self) -> CloudProvider {
+        let idx = Self::ALL.iter().position(|p| p == self).unwrap_or(0);
+        Self::ALL[(idx + 1) % Self::ALL.len()].clone()
+    }
+
     /// Default model for this provider.
     pub fn default_model(&self) -> &str {
         match self {
             CloudProvider::Anthropic => "claude-sonnet-4-6",
             CloudProvider::OpenAI => "gpt-5.2",
             CloudProvider::Google => "gemini-2.5-flash",
+            CloudProvider::OpenAICompatible => DEFAULT_COMPATIBLE_MODEL,
         }
     }
 
@@ -317,16 +344,26 @@ impl CloudProvider {
             CloudProvider::Anthropic => "Anthropic (Claude)",
             CloudProvider::OpenAI => "OpenAI (GPT)",
             CloudProvider::Google => "Google (Gemini)",
+            CloudProvider::OpenAICompatible => "OpenAI-compatible",
         }
     }
 
     /// Env var name for this provider's API key.
+    ///
+    /// For `OpenAICompatible` this is the generic fallback; prefer
+    /// [`EnrichmentConfig::api_key_env_var`], which knows the endpoint.
     pub fn env_var_name(&self) -> &str {
         match self {
             CloudProvider::Anthropic => "ANTHROPIC_API_KEY",
             CloudProvider::OpenAI => "OPENAI_API_KEY",
             CloudProvider::Google => "GOOGLE_API_KEY",
+            CloudProvider::OpenAICompatible => "SCRIBA_LLM_API_KEY",
         }
+    }
+
+    /// Whether this provider needs a user-supplied base URL.
+    pub fn uses_custom_endpoint(&self) -> bool {
+        matches!(self, CloudProvider::OpenAICompatible)
     }
 
     /// Curated list of models for this provider.
@@ -349,6 +386,8 @@ impl CloudProvider {
                 ModelDef { display_name: "Gemini 2.5 Flash-Lite".into(), model_id: "gemini-2.5-flash-lite".into() },
                 ModelDef { display_name: "Gemini 3.1 Pro Preview".into(), model_id: "gemini-3.1-pro-preview".into() },
             ],
+            // Model catalogs differ per host; the UI lists them live from `{base_url}/models`.
+            CloudProvider::OpenAICompatible => vec![],
         }
     }
 }
@@ -357,6 +396,75 @@ impl CloudProvider {
 pub struct ModelDef {
     pub display_name: String,
     pub model_id: String,
+}
+
+/// Default endpoint for `CloudProvider::OpenAICompatible` when none is configured.
+pub const DEFAULT_COMPATIBLE_BASE_URL: &str = "https://api.deepinfra.com/v1/openai";
+/// Default model for `CloudProvider::OpenAICompatible` (open-weight, tool-capable, hosted on DeepInfra).
+pub const DEFAULT_COMPATIBLE_MODEL: &str = "Qwen/Qwen3.5-397B-A17B";
+
+/// A well-known OpenAI-compatible host, so users can pick it by name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EndpointPreset {
+    /// Short name accepted by the CLI (`scriba config set-provider deepinfra`).
+    pub name: &'static str,
+    /// Human-readable name.
+    pub display: &'static str,
+    /// Base URL of the OpenAI-compatible API.
+    pub base_url: &'static str,
+    /// Conventional environment variable for the API key.
+    pub env_var: &'static str,
+}
+
+/// Known OpenAI-compatible hosts. Any other URL works too; these only supply
+/// defaults and nicer labels.
+pub const ENDPOINT_PRESETS: &[EndpointPreset] = &[
+    EndpointPreset {
+        name: "deepinfra",
+        display: "DeepInfra",
+        base_url: "https://api.deepinfra.com/v1/openai",
+        env_var: "DEEPINFRA_API_KEY",
+    },
+    EndpointPreset {
+        name: "openrouter",
+        display: "OpenRouter",
+        base_url: "https://openrouter.ai/api/v1",
+        env_var: "OPENROUTER_API_KEY",
+    },
+    EndpointPreset {
+        name: "groq",
+        display: "Groq",
+        base_url: "https://api.groq.com/openai/v1",
+        env_var: "GROQ_API_KEY",
+    },
+    EndpointPreset {
+        name: "together",
+        display: "Together",
+        base_url: "https://api.together.xyz/v1",
+        env_var: "TOGETHER_API_KEY",
+    },
+];
+
+impl EndpointPreset {
+    /// Look up a preset by its short name (case-insensitive).
+    pub fn by_name(name: &str) -> Option<&'static EndpointPreset> {
+        let lower = name.to_lowercase();
+        ENDPOINT_PRESETS.iter().find(|p| p.name == lower)
+    }
+
+    /// Find the preset whose base URL matches the given endpoint (ignoring
+    /// trailing slashes and scheme case).
+    pub fn for_url(url: &str) -> Option<&'static EndpointPreset> {
+        let normalized = url.trim().trim_end_matches('/').to_lowercase();
+        ENDPOINT_PRESETS
+            .iter()
+            .find(|p| normalized.starts_with(&p.base_url.to_lowercase()))
+    }
+
+    /// Short names of all presets, for help text.
+    pub fn names() -> Vec<&'static str> {
+        ENDPOINT_PRESETS.iter().map(|p| p.name).collect()
+    }
 }
 
 /// Enrichment mode configuration.
@@ -368,6 +476,11 @@ pub enum EnrichmentMode {
         /// None = use provider default model.
         #[serde(default)]
         model: Option<String>,
+        /// Base URL override. Required in spirit for `OpenAICompatible`
+        /// (falls back to `DEFAULT_COMPATIBLE_BASE_URL`); optional proxy
+        /// override for the first-party providers.
+        #[serde(default)]
+        base_url: Option<String>,
     },
     Local {
         ollama_endpoint: String,
@@ -381,6 +494,7 @@ impl Default for EnrichmentMode {
             provider: CloudProvider::Anthropic,
             api_key: String::new(),
             model: None,
+            base_url: None,
         }
     }
 }
@@ -407,6 +521,9 @@ pub struct EnrichmentConfig {
     /// Per-provider model selections so switching providers doesn't lose model choice.
     #[serde(default)]
     pub cloud_models: HashMap<String, String>,
+    /// Per-provider base URLs so switching providers doesn't lose the endpoint.
+    #[serde(default)]
+    pub cloud_base_urls: HashMap<String, String>,
 
     /// Preserved Ollama endpoint so cycling away from Local doesn't lose it.
     #[serde(default)]
@@ -449,6 +566,7 @@ impl Default for EnrichmentConfig {
             ollama_model: None,
             cloud_api_keys: HashMap::new(),
             cloud_models: HashMap::new(),
+            cloud_base_urls: HashMap::new(),
             last_ollama_endpoint: None,
             last_ollama_model: None,
             auto_link_threshold: 0.8,
@@ -521,6 +639,75 @@ impl EnrichmentConfig {
         self.cloud_models.get(&provider.to_string()).cloned()
     }
 
+    /// Save a base URL for a specific provider into the per-provider map.
+    pub fn save_base_url_for_provider(&mut self, provider: &CloudProvider, base_url: &Option<String>) {
+        match base_url.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+            Some(u) => {
+                self.cloud_base_urls.insert(provider.to_string(), u.to_string());
+            }
+            None => {
+                self.cloud_base_urls.remove(&provider.to_string());
+            }
+        }
+    }
+
+    /// Load a previously-stored base URL for a specific provider.
+    pub fn load_base_url_for_provider(&self, provider: &CloudProvider) -> Option<String> {
+        self.cloud_base_urls.get(&provider.to_string()).cloned()
+    }
+
+    /// Explicitly configured base URL, if any.
+    pub fn base_url(&self) -> Option<&str> {
+        match &self.mode {
+            EnrichmentMode::Cloud { base_url: Some(u), .. } if !u.trim().is_empty() => Some(u.trim()),
+            _ => None,
+        }
+    }
+
+    /// Base URL that will actually be used: the explicit override, or the
+    /// default host for `OpenAICompatible`. `None` means the provider's own
+    /// first-party endpoint.
+    pub fn effective_base_url(&self) -> Option<String> {
+        if let Some(u) = self.base_url() {
+            return Some(u.to_string());
+        }
+        match &self.mode {
+            EnrichmentMode::Cloud { provider, .. } if provider.uses_custom_endpoint() => {
+                Some(DEFAULT_COMPATIBLE_BASE_URL.to_string())
+            }
+            _ => None,
+        }
+    }
+
+    /// Set the base URL (only effective in Cloud mode). Empty clears it.
+    pub fn set_base_url(&mut self, url: Option<String>) {
+        if let EnrichmentMode::Cloud { base_url, .. } = &mut self.mode {
+            *base_url = url.map(|u| u.trim().trim_end_matches('/').to_string()).filter(|u| !u.is_empty());
+        }
+    }
+
+    /// Whether the current provider needs a user-supplied endpoint.
+    pub fn has_custom_endpoint(&self) -> bool {
+        matches!(&self.mode, EnrichmentMode::Cloud { provider, .. } if provider.uses_custom_endpoint())
+    }
+
+    /// Environment variable consulted for the API key: the known host's
+    /// conventional variable when the endpoint matches a preset, otherwise the
+    /// provider's own.
+    pub fn api_key_env_var(&self) -> Option<String> {
+        match &self.mode {
+            EnrichmentMode::Cloud { provider, .. } => {
+                if provider.uses_custom_endpoint()
+                    && let Some(preset) = self.effective_base_url().as_deref().and_then(EndpointPreset::for_url)
+                {
+                    return Some(preset.env_var.to_string());
+                }
+                Some(provider.env_var_name().to_string())
+            }
+            EnrichmentMode::Local { .. } => None,
+        }
+    }
+
     /// Get the current cloud provider, if in cloud mode.
     pub fn cloud_provider(&self) -> Option<&CloudProvider> {
         match &self.mode {
@@ -529,11 +716,18 @@ impl EnrichmentConfig {
         }
     }
 
-    /// Get the provider display name.
-    pub fn provider_display_name(&self) -> &str {
+    /// Get the provider display name. For OpenAI-compatible endpoints this
+    /// names the host when it is a known preset (e.g. "DeepInfra").
+    pub fn provider_display_name(&self) -> String {
         match &self.mode {
-            EnrichmentMode::Cloud { provider, .. } => provider.display_name(),
-            EnrichmentMode::Local { .. } => "Ollama (Local)",
+            EnrichmentMode::Cloud { provider, .. } if provider.uses_custom_endpoint() => {
+                match self.effective_base_url().as_deref().and_then(EndpointPreset::for_url) {
+                    Some(preset) => format!("{} (OpenAI-compatible)", preset.display),
+                    None => provider.display_name().to_string(),
+                }
+            }
+            EnrichmentMode::Cloud { provider, .. } => provider.display_name().to_string(),
+            EnrichmentMode::Local { .. } => "Ollama (Local)".to_string(),
         }
     }
 
@@ -553,12 +747,13 @@ impl EnrichmentConfig {
     /// Resolve the effective API key: config value > env var.
     pub fn resolve_api_key(&self) -> Option<String> {
         match &self.mode {
-            EnrichmentMode::Cloud { provider, api_key, .. } => {
+            EnrichmentMode::Cloud { api_key, .. } => {
                 if !api_key.is_empty() {
                     return Some(api_key.clone());
                 }
                 // Fallback to env var
-                std::env::var(provider.env_var_name()).ok()
+                let env = self.api_key_env_var()?;
+                std::env::var(env).ok().filter(|k| !k.trim().is_empty())
             }
             EnrichmentMode::Local { .. } => None,
         }
@@ -787,4 +982,102 @@ pub fn resolve_transcription_mode(
 
     // Use config default
     Ok(config.transcription.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[allow(clippy::field_reassign_with_default)]
+    fn cloud(provider: CloudProvider, base_url: Option<&str>) -> EnrichmentConfig {
+        let mut config = EnrichmentConfig::default();
+        config.mode = EnrichmentMode::Cloud {
+            provider,
+            api_key: String::new(),
+            model: None,
+            base_url: base_url.map(str::to_string),
+        };
+        config
+    }
+
+    #[test]
+    fn provider_names_parse() {
+        assert_eq!("claude".parse::<CloudProvider>().unwrap(), CloudProvider::Anthropic);
+        assert_eq!("custom".parse::<CloudProvider>().unwrap(), CloudProvider::OpenAICompatible);
+        assert_eq!("DeepInfra".parse::<CloudProvider>().unwrap(), CloudProvider::OpenAICompatible);
+        assert_eq!("groq".parse::<CloudProvider>().unwrap(), CloudProvider::OpenAICompatible);
+        assert!("nope".parse::<CloudProvider>().is_err());
+    }
+
+    #[test]
+    fn provider_cycle_visits_every_provider_once() {
+        let mut seen = vec![CloudProvider::Anthropic];
+        let mut cur = CloudProvider::Anthropic;
+        for _ in 0..CloudProvider::ALL.len() - 1 {
+            cur = cur.next();
+            assert!(!seen.contains(&cur));
+            seen.push(cur.clone());
+        }
+        assert_eq!(cur.next(), CloudProvider::Anthropic);
+    }
+
+    #[test]
+    fn presets_match_urls_loosely() {
+        assert_eq!(EndpointPreset::for_url("https://api.deepinfra.com/v1/openai/").unwrap().name, "deepinfra");
+        assert_eq!(EndpointPreset::for_url("HTTPS://openrouter.ai/api/v1").unwrap().name, "openrouter");
+        assert!(EndpointPreset::for_url("http://localhost:8000/v1").is_none());
+        assert_eq!(EndpointPreset::by_name("Together").unwrap().base_url, "https://api.together.xyz/v1");
+    }
+
+    #[test]
+    fn compatible_provider_defaults_and_env_var() {
+        let config = cloud(CloudProvider::OpenAICompatible, None);
+        assert!(config.has_custom_endpoint());
+        assert_eq!(config.effective_base_url().as_deref(), Some(DEFAULT_COMPATIBLE_BASE_URL));
+        assert_eq!(config.api_key_env_var().as_deref(), Some("DEEPINFRA_API_KEY"));
+        assert_eq!(config.provider_display_name(), "DeepInfra (OpenAI-compatible)");
+        assert_eq!(config.model_name(), DEFAULT_COMPATIBLE_MODEL);
+
+        let config = cloud(CloudProvider::OpenAICompatible, Some("http://localhost:8000/v1/"));
+        assert_eq!(config.base_url(), Some("http://localhost:8000/v1/"));
+        assert_eq!(config.api_key_env_var().as_deref(), Some("SCRIBA_LLM_API_KEY"));
+        assert_eq!(config.provider_display_name(), "OpenAI-compatible");
+    }
+
+    #[test]
+    fn first_party_providers_ignore_base_url_defaults() {
+        let config = cloud(CloudProvider::Anthropic, None);
+        assert!(!config.has_custom_endpoint());
+        assert!(config.effective_base_url().is_none());
+        assert_eq!(config.api_key_env_var().as_deref(), Some("ANTHROPIC_API_KEY"));
+        assert_eq!(config.provider_display_name(), "Anthropic (Claude)");
+    }
+
+    #[test]
+    fn set_base_url_normalizes_and_clears() {
+        let mut config = cloud(CloudProvider::OpenAICompatible, None);
+        config.set_base_url(Some("  https://openrouter.ai/api/v1/  ".to_string()));
+        assert_eq!(config.base_url(), Some("https://openrouter.ai/api/v1"));
+        assert_eq!(config.provider_display_name(), "OpenRouter (OpenAI-compatible)");
+        config.set_base_url(Some("   ".to_string()));
+        assert!(config.base_url().is_none());
+    }
+
+    #[test]
+    fn base_urls_persist_per_provider() {
+        let mut config = cloud(CloudProvider::OpenAICompatible, None);
+        let p = CloudProvider::OpenAICompatible;
+        config.save_base_url_for_provider(&p, &Some("http://box:8000/v1".to_string()));
+        assert_eq!(config.load_base_url_for_provider(&p).as_deref(), Some("http://box:8000/v1"));
+        config.save_base_url_for_provider(&p, &None);
+        assert!(config.load_base_url_for_provider(&p).is_none());
+    }
+
+    #[test]
+    fn legacy_cloud_config_without_base_url_deserializes() {
+        let json = r#"{"enabled":true,"mode":{"Cloud":{"provider":"Anthropic","api_key":"k","model":null}},"auto_link_threshold":0.8}"#;
+        let config: EnrichmentConfig = serde_json::from_str(json).unwrap();
+        assert!(matches!(config.mode, EnrichmentMode::Cloud { base_url: None, .. }));
+        assert_eq!(config.api_key(), Some("k"));
+    }
 }

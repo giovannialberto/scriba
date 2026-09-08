@@ -28,7 +28,7 @@ src/
     autopilot.rs       Meeting autopilot: detect -> confirm -> record -> instant stop; shared RecordingStatus
     notify.rs          Desktop notifications + Record/Ignore prompt (native panel helper, AppleScript fallback)
     notify_panel.swift Notification-style panel, compiled at runtime by notify.rs (macOS)
-    config.rs          ScribaConfig, TranscriptionMode, EnrichmentMode, MeetingDetectionConfig
+    config.rs          ScribaConfig, TranscriptionMode, EnrichmentMode (Cloud has provider + optional base_url; CloudProvider::OpenAICompatible + EndpointPreset for DeepInfra/OpenRouter/Groq/Together), MeetingDetectionConfig
   database/            SQLite persistence (schema.sql at repo root, included at compile time)
   llm/                 Unified model transport on genai: LlmTarget resolution, GenaiProvider, error mapping
   enrichment/          Extraction, world evolution, prompts (model calls go through llm/)

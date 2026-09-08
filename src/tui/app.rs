@@ -79,7 +79,7 @@ pub struct Dashboard {
     pub(super) model_picker_items: Vec<ModelPickerItem>,
     pub(super) model_picker_selection: usize,
     pub(super) model_picker_custom_input: String,
-    pub(super) ollama_models_rx: Option<mpsc::Receiver<Result<Vec<String>, String>>>,
+    pub(super) model_list_rx: Option<mpsc::Receiver<Result<Vec<String>, String>>>,
     pub(super) editing_enrichment_endpoint: bool,     // Whether we're editing Ollama endpoint (local mode)
     pub(super) enrichment_endpoint_input: String,     // Ollama endpoint input buffer (local mode)
     pub(super) editing_enrichment_api_key: bool,      // Whether we're editing enrichment API key
@@ -211,7 +211,7 @@ impl Dashboard {
             model_picker_items: Vec::new(),
             model_picker_selection: 0,
             model_picker_custom_input: String::new(),
-            ollama_models_rx: None,
+            model_list_rx: None,
             editing_enrichment_endpoint: false,
             enrichment_endpoint_input: String::new(),
             editing_enrichment_api_key: false,
@@ -501,8 +501,8 @@ impl Dashboard {
                 }
             }
 
-            // Check for Ollama model list completion
-            if let Some(ref mut rx) = self.ollama_models_rx {
+            // Check for model list completion (Ollama or an OpenAI-compatible endpoint)
+            if let Some(ref mut rx) = self.model_list_rx {
                 if let Ok(result) = rx.try_recv() {
                     // Check if we're in onboarding ModelSetup phase 1 -- populate onboarding models
                     let in_onboarding_model_setup = self.onboarding.as_ref()
@@ -572,7 +572,7 @@ impl Dashboard {
                             }
                         }
                     }
-                    self.ollama_models_rx = None;
+                    self.model_list_rx = None;
                 }
             }
 
@@ -706,7 +706,7 @@ impl Dashboard {
                                 "http://localhost:11434".to_string()
                             };
                             let (tx, rx) = mpsc::channel(1);
-                            self.ollama_models_rx = Some(rx);
+                            self.model_list_rx = Some(rx);
                             tokio::spawn(async move {
                                 let result = OllamaClient::fetch_models(&endpoint).await;
                                 let _ = tx.send(result.map_err(|e| e.to_string())).await;
