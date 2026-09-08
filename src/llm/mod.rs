@@ -284,6 +284,52 @@ pub async fn list_models(target: &LlmTarget) -> Result<Vec<String>, ProviderErro
     Ok(names)
 }
 
+/// Best-effort context window (in tokens) for the target's model, used to
+/// size the context bar and trigger compaction. Ollama is asked directly;
+/// cloud models use a small table keyed by model family. `None` means the
+/// caller should keep its current value.
+pub async fn context_window(target: &LlmTarget) -> Option<u32> {
+    match target.protocol {
+        Protocol::Ollama => OllamaClient::context_window(&target.endpoint, &target.model)
+            .await
+            .ok()
+            .flatten(),
+        _ => Some(cloud_context_window(target.protocol, &target.model)),
+    }
+}
+
+/// Context windows of the cloud model families Scriba offers. Conservative
+/// for anything unrecognized, including OpenAI-compatible open-weight hosts.
+fn cloud_context_window(protocol: Protocol, model: &str) -> u32 {
+    let m = model.to_ascii_lowercase();
+    match protocol {
+        Protocol::Anthropic => {
+            let one_million = m.contains("fable")
+                || m.contains("mythos")
+                || m.contains("claude-opus-5")
+                || m.contains("claude-sonnet-5")
+                || m.contains("claude-opus-4-6")
+                || m.contains("claude-opus-4-7")
+                || m.contains("claude-opus-4-8")
+                || m.contains("claude-sonnet-4-6");
+            if one_million { 1_000_000 } else { 200_000 }
+        }
+        Protocol::Gemini => 1_048_576,
+        Protocol::OpenAI => {
+            if m.starts_with("gpt-5") {
+                400_000
+            } else if m.starts_with("gpt-4.1") {
+                1_047_576
+            } else if m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4") {
+                200_000
+            } else {
+                128_000
+            }
+        }
+        Protocol::Ollama => crate::enrichment::ollama::OLLAMA_DEFAULT_NUM_CTX,
+    }
+}
+
 /// Ensure a base URL ends with exactly one slash so adapters can append paths.
 fn normalize_base_url(url: &str) -> String {
     let trimmed = url.trim().trim_end_matches('/');
@@ -579,7 +625,9 @@ impl AgentProvider for GenaiProvider {
         all.push(system);
         all.extend(messages.iter().cloned());
         let mut request = ChatRequest::new(all);
-        if self.tools_supported().await {
+        if tools.is_empty() {
+            // Caller wants a plain answer (e.g. the wrap-up turn).
+        } else if self.tools_supported().await {
             request = request.with_tools(tools.to_vec());
         } else {
             let _ = tx
@@ -798,6 +846,18 @@ mod tests {
             display_name: "Ollama (Local)".to_string(),
         };
         assert!(GenaiProvider::new(target).ensure_credentials().is_ok());
+    }
+
+    #[test]
+    fn cloud_context_windows_follow_model_families() {
+        assert_eq!(cloud_context_window(Protocol::Anthropic, "claude-haiku-4-5-20251001"), 200_000);
+        assert_eq!(cloud_context_window(Protocol::Anthropic, "claude-opus-4-5"), 200_000);
+        assert_eq!(cloud_context_window(Protocol::Anthropic, "claude-sonnet-4-6"), 1_000_000);
+        assert_eq!(cloud_context_window(Protocol::Anthropic, "claude-fable-5-1"), 1_000_000);
+        assert_eq!(cloud_context_window(Protocol::OpenAI, "gpt-5.2"), 400_000);
+        assert_eq!(cloud_context_window(Protocol::OpenAI, "o4-mini"), 200_000);
+        assert_eq!(cloud_context_window(Protocol::OpenAI, "Qwen/Qwen3.5-397B-A17B"), 128_000);
+        assert_eq!(cloud_context_window(Protocol::Gemini, "gemini-2.5-flash"), 1_048_576);
     }
 
     #[test]

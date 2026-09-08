@@ -122,6 +122,8 @@ pub struct Dashboard {
     // Chat state ("Ask Scriba")
     pub(super) chat: ChatState,
     pub(super) global_chat_messages: Vec<ChatMessage>,
+    pub(super) global_agent_history: Vec<genai::chat::ChatMessage>,
+    pub(super) global_compaction_summary: Option<String>,
     // Track the currently-viewed recording for chat context
     pub(super) current_transcript_recording: Option<Recording>,
 
@@ -254,6 +256,8 @@ impl Dashboard {
             // Chat
             chat: ChatState::new(),
             global_chat_messages: Vec::new(),
+            global_agent_history: Vec::new(),
+            global_compaction_summary: None,
             current_transcript_recording: None,
 
             // Greeting
@@ -1439,8 +1443,10 @@ impl Dashboard {
     }
 
     pub(super) fn init_recording_chat(&mut self, recording: &Recording) {
-        // Stash global messages
+        // Stash global messages (display and model transcript)
         self.global_chat_messages = self.chat.messages.clone();
+        self.global_agent_history = self.chat.agent_history.clone();
+        self.global_compaction_summary = self.chat.compaction_summary.clone();
 
         let world = WorldContext::load().ok()
             .and_then(|wc| WorldData::from_json(&wc.content).ok())
@@ -1470,7 +1476,7 @@ impl Dashboard {
             recording_id: recording.id.unwrap_or(0),
             recording_name,
         };
-        self.chat.messages.clear();
+        self.chat.clear_conversation();
         self.chat.input_buffer.clear();
         self.chat.pending_blocks.clear();
         self.chat.current_status = None;
@@ -1486,6 +1492,8 @@ impl Dashboard {
 
     pub(super) fn restore_global_chat(&mut self) {
         self.chat.messages = std::mem::take(&mut self.global_chat_messages);
+        self.chat.agent_history = std::mem::take(&mut self.global_agent_history);
+        self.chat.compaction_summary = self.global_compaction_summary.take();
         self.chat.context = ChatContext::Global;
         self.chat.input_buffer.clear();
         self.chat.pending_blocks.clear();
@@ -1547,20 +1555,16 @@ impl Dashboard {
         self.chat.current_status = Some("Preparing...".to_string());
 
         let config = self.config.enrichment.clone();
+        // The base prompt only: the pipeline adds the compaction summary itself
+        // so a fresh compaction can replace an older one.
         let system_prompt = self.chat.system_prompt.clone();
-        let messages: Vec<(String, String)> = self.chat.messages.iter().map(|m| {
-            let role = match m.role {
-                ChatRole::User => "User",
-                ChatRole::Assistant => "Assistant",
-                ChatRole::System => "System",
-            };
-            (role.to_string(), m.content())
-        }).collect();
+        let history = self.chat.agent_history.clone();
+        let previous_summary = self.chat.compaction_summary.clone();
 
         let needs_compaction = self.chat.needs_compaction();
         self.chat.pending_blocks.clear();
         self.chat.generation_task = Some(tokio::spawn(async move {
-            chat_agent_pipeline(config, system_prompt, messages, user_msg, needs_compaction, event_tx).await;
+            chat_agent_pipeline(config, system_prompt, history, previous_summary, user_msg, needs_compaction, event_tx).await;
         }));
     }
 
@@ -1591,7 +1595,7 @@ impl Dashboard {
             }
             1 | 2 => {
                 // Fresh chat for this recording
-                self.chat.messages.clear();
+                self.chat.clear_conversation();
                 self.chat.pending_blocks.clear();
                 self.chat.current_status = None;
                 self.chat.scroll_offset = 0;
@@ -1600,6 +1604,8 @@ impl Dashboard {
                 self.chat.show_home_screen = false;
                 self.chat.show_suggestions = false;
                 self.global_chat_messages.clear();
+                self.global_agent_history.clear();
+                self.global_compaction_summary = None;
 
                 if self.chat.action_menu_selection == 1 {
                     // Summarize -- send immediately
@@ -1661,7 +1667,7 @@ impl Dashboard {
                             && !self.chat.is_generating
                         {
                             // Return to home screen from chat
-                            self.chat.messages.clear();
+                            self.chat.clear_conversation();
                             self.chat.pending_blocks.clear();
                             self.chat.current_status = None;
                             self.chat.scroll_offset = 0;

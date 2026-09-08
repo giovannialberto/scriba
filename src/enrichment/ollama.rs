@@ -56,6 +56,40 @@ fn parse_capabilities(body: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Ollama's server-side default `num_ctx` when the Modelfile sets none
+/// (0.31.x); requests cannot raise it through genai yet.
+pub const OLLAMA_DEFAULT_NUM_CTX: u32 = 32_768;
+
+/// Derive the effective context window from an `/api/show` response body.
+fn parse_context_window(body: &serde_json::Value) -> Option<u32> {
+    // Explicit Modelfile parameter wins: "num_ctx  8192" among other lines.
+    let num_ctx = body
+        .get("parameters")
+        .and_then(|p| p.as_str())
+        .and_then(|params| {
+            params.lines().find_map(|line| {
+                let mut it = line.split_whitespace();
+                match (it.next(), it.next()) {
+                    (Some("num_ctx"), Some(v)) => v.parse::<u32>().ok(),
+                    _ => None,
+                }
+            })
+        });
+    if let Some(n) = num_ctx {
+        return Some(n);
+    }
+    let arch_len = body
+        .get("model_info")
+        .and_then(|mi| mi.as_object())
+        .and_then(|mi| {
+            mi.iter()
+                .find(|(k, _)| k.ends_with(".context_length"))
+                .and_then(|(_, v)| v.as_u64())
+        })
+        .map(|v| v.min(u32::MAX as u64) as u32)?;
+    Some(arch_len.min(OLLAMA_DEFAULT_NUM_CTX))
+}
+
 /// Structured diagnosis of Ollama readiness.
 #[derive(Debug)]
 pub enum OllamaStatus {
@@ -272,6 +306,32 @@ impl OllamaClient {
         Ok(parse_capabilities(&body))
     }
 
+    /// Context window Ollama will use for a model: the Modelfile's `num_ctx`
+    /// if set, otherwise the architecture's context length capped at the
+    /// server default (Scriba cannot raise `num_ctx` per request yet).
+    pub async fn context_window(endpoint: &str, model: &str) -> Result<Option<u32>, OllamaError> {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .map_err(|e| OllamaError::RequestFailed { message: e.to_string() })?;
+        let url = format!("{}/api/show", endpoint.trim_end_matches('/'));
+        let response = client
+            .post(&url)
+            .json(&serde_json::json!({ "model": model }))
+            .send()
+            .await
+            .map_err(|_| OllamaError::NotRunning { endpoint: endpoint.to_string() })?;
+        if !response.status().is_success() {
+            return Err(OllamaError::RequestFailed {
+                message: format!("HTTP {} from /api/show", response.status()),
+            });
+        }
+        let body: serde_json::Value = response.json().await.map_err(|e| OllamaError::ParseError {
+            message: e.to_string(),
+        })?;
+        Ok(parse_context_window(&body))
+    }
+
     /// Whether the configured model can call tools. `Ok(None)` means Ollama
     /// did not report capabilities (older server), so nothing can be assumed.
     pub async fn supports_tools(&self) -> Result<Option<bool>, OllamaError> {
@@ -395,6 +455,22 @@ mod tests {
         assert_eq!(parse_capabilities(&body), vec!["completion", "tools", "thinking"]);
         assert!(parse_capabilities(&serde_json::json!({"details": {}})).is_empty());
         assert!(parse_capabilities(&serde_json::json!({"capabilities": "tools"})).is_empty());
+    }
+
+    #[test]
+    fn context_window_prefers_modelfile_then_caps_arch_length() {
+        let arch_only = serde_json::json!({
+            "model_info": {"gemma4.context_length": 262144, "general.architecture": "gemma4"}
+        });
+        assert_eq!(parse_context_window(&arch_only), Some(OLLAMA_DEFAULT_NUM_CTX));
+        let small_arch = serde_json::json!({"model_info": {"llama.context_length": 8192}});
+        assert_eq!(parse_context_window(&small_arch), Some(8192));
+        let modelfile = serde_json::json!({
+            "parameters": "stop \"<|eot|>\"\nnum_ctx                        65536\ntemperature 0.7",
+            "model_info": {"llama.context_length": 131072}
+        });
+        assert_eq!(parse_context_window(&modelfile), Some(65536));
+        assert_eq!(parse_context_window(&serde_json::json!({})), None);
     }
 
     #[test]
