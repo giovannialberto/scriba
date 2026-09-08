@@ -30,7 +30,7 @@ serde = { version = "1.0", features = ["derive"] }
 crossterm = "0.27"
 ratatui = "0.26"
 arboard = "3.3"
-sherpa-onnx = "1.12"
+sherpa-onnx = "1.13"
 tar = "0.4"
 bzip2 = "0.4"
 futures-util = "0.3"
