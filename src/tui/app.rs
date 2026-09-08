@@ -461,9 +461,11 @@ impl Dashboard {
                             let _ = self.load_stats();
                         }
                         Ok(Err(err)) => {
+                            // The row now carries the failed state and reason.
+                            let _ = self.load_recordings();
                             self.notification_message = Some((
                                 format!("Transcription failed ({}): {}", name, err),
-                                50,
+                                80,
                             ));
                         }
                         Err(_) => {
@@ -1377,7 +1379,8 @@ impl Dashboard {
             });
             let recording_id = r.id.unwrap_or(0);
             let directory_name = r.directory_name.clone();
-            HomeRecording { recording_id, directory_name, name, duration_mins, summary_line, busy: false }
+            let failed = r.transcript_status == "failed";
+            HomeRecording { recording_id, directory_name, name, duration_mins, summary_line, busy: false, failed }
         }).collect();
         // If no duration info, show at least 1m
         for rec in &mut home_recs {

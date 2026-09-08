@@ -66,6 +66,7 @@ impl DatabaseManager {
                 .unwrap()
                 .to_string_lossy()
                 .to_string(),
+            transcript_error: None,
             transcript_path: recording
                 .transcript_path
                 .as_ref()
@@ -76,6 +77,13 @@ impl DatabaseManager {
         self.db
             .insert_recording(&db_recording)
             .context("Failed to insert recording into database")
+    }
+
+    /// Record why a transcription failed (shown in the TUI with a retry hint).
+    pub fn mark_transcript_failed(&mut self, directory_name: &str, error: &str) -> Result<()> {
+        self.db
+            .mark_transcript_failed(directory_name, error)
+            .context("Failed to record transcription failure")
     }
 
     /// Update recording with transcription info.
@@ -285,9 +293,14 @@ impl WorkflowManager {
         verbose: bool,
     ) -> Result<ManagedRecording> {
         let directory_path = PathBuf::from(&recording.directory_name);
-        transcribe_audio(&directory_path, Some(mode), verbose)
-            .await
-            .context("Transcription failed")?;
+        if let Err(e) = transcribe_audio(&directory_path, Some(mode), verbose).await {
+            // Persist the reason: the row shows a failed state with the error
+            // instead of sitting in "pending" forever, and T retries it.
+            let _ = self
+                .db_manager
+                .mark_transcript_failed(&recording.directory_name, &format!("{e:#}"));
+            return Err(e.context("Transcription failed"));
+        }
 
         let transcript_path = BASE_PATH
             .join(&recording.directory_name)

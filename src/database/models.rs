@@ -31,6 +31,8 @@ pub struct Recording {
     pub confidence_score: Option<f64>,
     pub audio_path: String,
     pub transcript_path: Option<String>,
+    /// Error message from the last failed transcription attempt.
+    pub transcript_error: Option<String>,
 }
 
 /// A transcript entry in the database.

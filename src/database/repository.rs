@@ -37,6 +37,7 @@ fn row_to_recording(row: &Row) -> rusqlite::Result<Recording> {
         confidence_score: row.get(22)?,
         audio_path: row.get(23)?,
         transcript_path: row.get(24)?,
+        transcript_error: row.get("transcript_error")?,
     })
 }
 
@@ -58,8 +59,13 @@ fn row_to_transcript(row: &Row) -> rusqlite::Result<Transcript> {
     })
 }
 
-/// Maps a combined row (recordings + transcripts join) to both structs.
+/// Maps a combined row (`SELECT r.*, t.*` over recordings + transcripts) to
+/// both structs. Transcript columns are the trailing block, so their offset is
+/// derived from the column count rather than assuming a fixed recordings
+/// width (which breaks whenever recordings gains a column).
 fn row_to_recording_and_transcript(row: &Row) -> rusqlite::Result<(Recording, Transcript)> {
+    const TRANSCRIPT_COLUMNS: usize = 12;
+    let t0 = row.as_ref().column_count() - TRANSCRIPT_COLUMNS;
     let recording = Recording {
         id: Some(row.get(0)?),
         directory_name: row.get(1)?,
@@ -86,21 +92,22 @@ fn row_to_recording_and_transcript(row: &Row) -> rusqlite::Result<(Recording, Tr
         confidence_score: row.get(22)?,
         audio_path: row.get(23)?,
         transcript_path: row.get(24)?,
+        transcript_error: row.get("transcript_error")?,
     };
 
     let transcript = Transcript {
-        id: Some(row.get(25)?),
-        recording_id: row.get(26)?,
-        content: row.get(27)?,
-        created_at: row.get(28)?,
-        updated_at: row.get(29)?,
-        word_count: row.get(30)?,
-        character_count: row.get(31)?,
-        language_detected: row.get(32)?,
-        confidence_scores: row.get(33)?,
-        segments: row.get(34)?,
-        entities: row.get(35)?,
-        topics: row.get(36)?,
+        id: Some(row.get(t0)?),
+        recording_id: row.get(t0 + 1)?,
+        content: row.get(t0 + 2)?,
+        created_at: row.get(t0 + 3)?,
+        updated_at: row.get(t0 + 4)?,
+        word_count: row.get(t0 + 5)?,
+        character_count: row.get(t0 + 6)?,
+        language_detected: row.get(t0 + 7)?,
+        confidence_scores: row.get(t0 + 8)?,
+        segments: row.get(t0 + 9)?,
+        entities: row.get(t0 + 10)?,
+        topics: row.get(t0 + 11)?,
     };
 
     Ok((recording, transcript))
@@ -160,7 +167,7 @@ impl Database {
                 let schema = include_str!("../../schema.sql");
                 tx.execute_batch(schema)
                     .context("Failed to initialize database schema")?;
-                tx.execute("PRAGMA user_version = 3", [])
+                tx.execute("PRAGMA user_version = 4", [])
                     .context("Failed to set user_version")?;
                 tx.commit()
                     .context("Failed to commit schema initialization")?;
@@ -245,6 +252,33 @@ impl Database {
                     .context("Failed to set user_version")?;
                 tx.commit()
                     .context("Failed to commit v3 migration")?;
+            }
+        }
+
+        // Migration v3 → v4: persist why a transcription failed
+        {
+            let user_version: i64 = self
+                .conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap_or(0);
+
+            if user_version == 3 {
+                let has_error: bool = self
+                    .conn
+                    .prepare("SELECT transcript_error FROM recordings LIMIT 0")
+                    .is_ok();
+                let tx = self
+                    .conn
+                    .transaction()
+                    .context("Failed to start v4 migration transaction")?;
+                if !has_error {
+                    tx.execute_batch("ALTER TABLE recordings ADD COLUMN transcript_error TEXT;")
+                        .context("Failed to add transcript_error column")?;
+                }
+                tx.execute("PRAGMA user_version = 4", [])
+                    .context("Failed to set user_version")?;
+                tx.commit()
+                    .context("Failed to commit v4 migration")?;
             }
         }
 
@@ -402,13 +436,23 @@ impl Database {
         Ok(recordings)
     }
 
+    /// Record a failed transcription attempt and why, so the UI can show it
+    /// and offer a retry.
+    pub fn mark_transcript_failed(&self, directory_name: &str, error: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE recordings SET transcript_status = 'failed', has_transcript = 0, transcript_error = ?1, updated_at = ?2 WHERE directory_name = ?3",
+            params![error, Utc::now(), directory_name],
+        )?;
+        Ok(())
+    }
+
     pub fn update_recording_transcript_status(
         &mut self,
         id: i64,
         status: &str,
         has_transcript: bool,
     ) -> Result<()> {
-        let sql = "UPDATE recordings SET transcript_status = ?1, has_transcript = ?2, updated_at = ?3 WHERE id = ?4";
+        let sql = "UPDATE recordings SET transcript_status = ?1, has_transcript = ?2, transcript_error = NULL, updated_at = ?3 WHERE id = ?4";
         self.conn
             .execute(sql, params![status, has_transcript, Utc::now(), id])?;
         Ok(())
@@ -421,7 +465,7 @@ impl Database {
         has_transcript: bool,
         model_used: &str,
     ) -> Result<()> {
-        let sql = "UPDATE recordings SET transcript_status = ?1, has_transcript = ?2, model_used = ?3, updated_at = ?4 WHERE id = ?5";
+        let sql = "UPDATE recordings SET transcript_status = ?1, has_transcript = ?2, model_used = ?3, transcript_error = NULL, updated_at = ?4 WHERE id = ?5";
         self.conn.execute(
             sql,
             params![status, has_transcript, model_used, Utc::now(), id],

@@ -510,13 +510,29 @@ impl Dashboard {
             format!("{}m", total_m)
         };
 
-        let left_spans = vec![
+        let mut left_spans = vec![
             Span::styled(" \u{25B8} ", Style::default().fg(ACCENT)),
             Span::styled(
                 format!("scriba \u{00B7} v{} \u{00B7} {} recordings \u{00B7} {}", version, rec_count, duration_str),
                 Style::default().fg(Color::DarkGray),
             ),
         ];
+        // Why the selected recording's transcription failed, with the retry key.
+        if let Some(rec) = self.table_state.selected().and_then(|i| self.recordings.get(i))
+            && rec.transcript_status == "failed"
+        {
+            let reason = rec.transcript_error.as_deref().unwrap_or("unknown error");
+            let reason = reason.lines().next().unwrap_or(reason);
+            let reason: String = if reason.chars().count() > 70 {
+                reason.chars().take(69).collect::<String>() + "\u{2026}"
+            } else {
+                reason.to_string()
+            };
+            left_spans.push(Span::styled(
+                format!("  \u{2715} transcription failed: {reason} \u{2014} T to retry"),
+                Style::default().fg(Color::Red),
+            ));
+        }
 
         // Right side: shortcuts + page indicator (only shown when >1 page)
         let total_pages = if self.page_size > 0 {
@@ -631,6 +647,8 @@ impl Dashboard {
                 (spinner, Style::default().fg(Color::Yellow))
             } else if is_queued {
                 ("\u{25CB}", Style::default().fg(Color::Yellow))
+            } else if recording.transcript_status == "failed" {
+                ("\u{2715}", Style::default().fg(Color::Red))
             } else if recording.has_transcript {
                 ("\u{25CF}", Style::default().fg(ACCENT))
             } else {

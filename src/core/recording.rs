@@ -227,6 +227,7 @@ fn create_recording_entry(
             .unwrap()
             .to_string_lossy()
             .to_string(),
+        transcript_error: None,
         transcript_path: None,
     })
 }
