@@ -35,7 +35,7 @@ use super::browse::FileDialogStage;
 use super::entities::{EntityMode, EntityEditField};
 use super::onboarding::{OnboardingState, OnboardingStep, OnboardingTickResult};
 use super::recording::{RecordingMode, ActiveTranscription, PendingTranscription};
-use super::settings::{ModelPickerState, ModelPickerItem};
+use super::settings::{Card, KeyStatus, SettingsEdit};
 
 pub struct Dashboard {
     pub(super) db: Database,
@@ -73,19 +73,12 @@ pub struct Dashboard {
     pub(super) volume_history: VecDeque<f32>,         // Recent volume samples for waveform display
     pub(super) config: ScribaConfig,                  // App configuration
     pub(super) settings_selection: usize,             // Current setting selection
-    pub(super) editing_api_key: bool,                 // Whether we're editing API key
-    pub(super) api_key_input: String,                 // API key input buffer
-    pub(super) model_picker_state: ModelPickerState,
-    pub(super) model_picker_items: Vec<ModelPickerItem>,
-    pub(super) model_picker_selection: usize,
-    pub(super) model_picker_custom_input: String,
+    pub(super) settings_edit: SettingsEdit,           // Inline text edit or picker open on the settings screen
     pub(super) model_list_rx: Option<mpsc::Receiver<Result<Vec<crate::llm::ModelListEntry>, String>>>,
-    pub(super) editing_enrichment_endpoint: bool,     // Whether we're editing Ollama endpoint (local mode)
-    pub(super) enrichment_endpoint_input: String,     // Ollama endpoint input buffer (local mode)
-    pub(super) editing_enrichment_api_key: bool,      // Whether we're editing enrichment API key
-    pub(super) enrichment_api_key_input: String,      // Enrichment API key input buffer
-    pub(super) editing_stt_field: Option<super::settings::SttField>, // Cloud transcription model/endpoint being edited
-    pub(super) stt_field_input: String,               // Input buffer for the field above
+    pub(super) speech_key_status: Option<KeyStatus>,  // Result of probing the transcription key
+    pub(super) assistant_key_status: Option<KeyStatus>, // Result of probing the assistant key
+    pub(super) key_probe_tx: mpsc::Sender<(Card, Result<(), String>)>,
+    pub(super) key_probe_rx: mpsc::Receiver<(Card, Result<(), String>)>,
     pub(super) return_to_view: Option<DashboardView>, // View to return to after message dismissal
     // File import dialog state
     pub(super) show_file_dialog: bool,
@@ -168,6 +161,7 @@ pub(super) enum DashboardAction {
 
 impl Dashboard {
     pub fn new() -> Result<Self> {
+        let (key_probe_tx, key_probe_rx) = mpsc::channel::<(Card, Result<(), String>)>(8);
         let db = Database::new()?;
         let mut table_state = TableState::default();
         table_state.select(Some(0));
@@ -209,19 +203,12 @@ impl Dashboard {
             volume_history: VecDeque::with_capacity(48),
             config,
             settings_selection: 0,
-            editing_api_key: false,
-            api_key_input: String::new(),
-            model_picker_state: ModelPickerState::Closed,
-            model_picker_items: Vec::new(),
-            model_picker_selection: 0,
-            model_picker_custom_input: String::new(),
+            settings_edit: SettingsEdit::None,
             model_list_rx: None,
-            editing_enrichment_endpoint: false,
-            enrichment_endpoint_input: String::new(),
-            editing_enrichment_api_key: false,
-            enrichment_api_key_input: String::new(),
-            editing_stt_field: None,
-            stt_field_input: String::new(),
+            speech_key_status: None,
+            assistant_key_status: None,
+            key_probe_tx,
+            key_probe_rx,
             return_to_view: None,
             // File import dialog state
             show_file_dialog: false,
@@ -551,39 +538,15 @@ impl Dashboard {
                             ob.ollama_model_selection = 0;
                         }
                     } else {
-                        let current_model = self.config.enrichment.model_name().to_string();
-                        match result {
-                            Ok(entries) if !entries.is_empty() => {
-                                let mut items: Vec<ModelPickerItem> = entries
-                                    .iter()
-                                    .map(|e| ModelPickerItem {
-                                        display_name: e.display_name(),
-                                        model_id: Some(e.id.clone()),
-                                    })
-                                    .collect();
-                                items.push(ModelPickerItem {
-                                    display_name: "Custom...".into(),
-                                    model_id: None,
-                                });
-                                let sel = entries
-                                    .iter()
-                                    .position(|e| e.id == current_model)
-                                    .unwrap_or(items.len() - 1);
-                                self.model_picker_items = items;
-                                self.model_picker_selection = sel;
-                            }
-                            _ => {
-                                // Error or empty -- show only Custom...
-                                self.model_picker_items = vec![ModelPickerItem {
-                                    display_name: "Custom...".into(),
-                                    model_id: None,
-                                }];
-                                self.model_picker_selection = 0;
-                            }
-                        }
+                        self.on_model_list(result);
                     }
                     self.model_list_rx = None;
                 }
+            }
+
+            // Key probe results for the settings screen
+            while let Ok((card, result)) = self.key_probe_rx.try_recv() {
+                self.on_key_probe(card, result);
             }
 
             // Handle chat-triggered recording
@@ -924,7 +887,7 @@ impl Dashboard {
             match key_code {
                 KeyCode::Char('s') => {
                     self.current_view = DashboardView::Settings;
-                    self.settings_selection = 0;
+                    self.on_settings_opened();
                     return Ok(DashboardAction::Continue);
                 }
                 // Also match 'z' — on Italian (and other non-US QWERTY) keyboards,

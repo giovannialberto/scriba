@@ -1507,8 +1507,8 @@ impl Dashboard {
             let sel_bg = Color::Indexed(236);
 
             let mode_blocks: [(&str, &str); 2] = [
-                ("Private (Local)", "Local STT + Ollama on your machine. No data leaves your computer."),
-                ("Cloud", "Whisper API + Anthropic/OpenAI/Google. Best quality. Needs an API key."),
+                ("Private (Local)", "Local speech + Ollama on your machine. No data leaves your computer."),
+                ("Cloud", "OpenAI speech + Claude, GPT, Gemini or open-weight hosts. Needs an API key."),
             ];
             // Use the header text width so the highlight box spans the full content area
             let header_width = visible.split('\n').map(|l| l.chars().count()).max().unwrap_or(0);

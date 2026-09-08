@@ -235,6 +235,15 @@ pub struct ScribaConfig {
     /// Preserved cloud transcription model when switching to Private mode.
     #[serde(default)]
     pub last_transcription_model: Option<String>,
+    /// Transcription API keys per host slot ("openai", "groq", "deepinfra", "custom").
+    #[serde(default)]
+    pub stt_api_keys: HashMap<String, String>,
+    /// Transcription model per host slot.
+    #[serde(default)]
+    pub stt_models: HashMap<String, String>,
+    /// Last endpoint typed for the "custom" transcription slot.
+    #[serde(default)]
+    pub stt_custom_base_url: Option<String>,
     /// Check for updates on launch (default: true).
     #[serde(default = "default_true")]
     pub check_for_updates: bool,
@@ -706,13 +715,95 @@ impl EnrichmentConfig {
         }
     }
 
+    /// Storage slot for a provider: the provider name, except OpenAI-compatible
+    /// hosts get their preset name ("deepinfra", "groq", ...) or "custom", so
+    /// keys and models for different hosts do not overwrite each other.
+    pub fn provider_slot(provider: &CloudProvider, base_url: Option<&str>) -> String {
+        if provider.uses_custom_endpoint() {
+            let url = base_url
+                .map(str::to_string)
+                .unwrap_or_else(|| DEFAULT_COMPATIBLE_BASE_URL.to_string());
+            EndpointPreset::for_url(&url)
+                .map(|p| p.name.to_string())
+                .unwrap_or_else(|| "custom".to_string())
+        } else {
+            provider.to_string()
+        }
+    }
+
+    /// Slot of the current cloud configuration, if any.
+    pub fn current_slot(&self) -> Option<String> {
+        match &self.mode {
+            EnrichmentMode::Cloud { provider, base_url, .. } => {
+                Some(Self::provider_slot(provider, base_url.as_deref()))
+            }
+            EnrichmentMode::Local { .. } => None,
+        }
+    }
+
+    /// Remember the current cloud key, model and endpoint under their slot.
+    pub fn remember_cloud_settings(&mut self) {
+        if let EnrichmentMode::Cloud { provider, api_key, model, base_url } = self.mode.clone() {
+            let slot = Self::provider_slot(&provider, base_url.as_deref());
+            self.save_key_for_slot(&slot, &api_key);
+            self.save_model_for_slot(&slot, &model);
+            if slot == "custom" {
+                self.save_base_url_for_slot(&slot, &base_url);
+            }
+        }
+    }
+
+    pub fn save_key_for_slot(&mut self, slot: &str, key: &str) {
+        if key.trim().is_empty() {
+            self.cloud_api_keys.remove(slot);
+        } else {
+            self.cloud_api_keys.insert(slot.to_string(), key.trim().to_string());
+        }
+    }
+
+    /// Key for a slot; OpenAI-compatible hosts fall back to the shared
+    /// "custom" slot older configs used.
+    pub fn load_key_for_slot(&self, slot: &str) -> String {
+        self.cloud_api_keys
+            .get(slot)
+            .or_else(|| if slot != "custom" { self.cloud_api_keys.get("custom") } else { None })
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn save_model_for_slot(&mut self, slot: &str, model: &Option<String>) {
+        match model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+            Some(m) => {
+                self.cloud_models.insert(slot.to_string(), m.to_string());
+            }
+            None => {
+                self.cloud_models.remove(slot);
+            }
+        }
+    }
+
+    pub fn load_model_for_slot(&self, slot: &str) -> Option<String> {
+        self.cloud_models.get(slot).cloned()
+    }
+
+    pub fn save_base_url_for_slot(&mut self, slot: &str, base_url: &Option<String>) {
+        match base_url.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+            Some(u) => {
+                self.cloud_base_urls.insert(slot.to_string(), u.to_string());
+            }
+            None => {
+                self.cloud_base_urls.remove(slot);
+            }
+        }
+    }
+
+    pub fn load_base_url_for_slot(&self, slot: &str) -> Option<String> {
+        self.cloud_base_urls.get(slot).cloned()
+    }
+
     /// Save an API key for a specific provider into the per-provider map.
     pub fn save_key_for_provider(&mut self, provider: &CloudProvider, key: &str) {
-        if key.is_empty() {
-            self.cloud_api_keys.remove(&provider.to_string());
-        } else {
-            self.cloud_api_keys.insert(provider.to_string(), key.to_string());
-        }
+        self.save_key_for_slot(&provider.to_string(), key);
     }
 
     /// Load a previously-stored API key for a specific provider.
@@ -969,6 +1060,9 @@ impl Default for ScribaConfig {
             last_cloud_provider: None,
             last_transcription_base_url: None,
             last_transcription_model: None,
+            stt_api_keys: HashMap::new(),
+            stt_models: HashMap::new(),
+            stt_custom_base_url: None,
             check_for_updates: true,
         }
     }
@@ -1094,6 +1188,56 @@ impl ScribaConfig {
             .and_then(|rest| rest.split('/').next())
             .unwrap_or(&url)
             .to_string()
+    }
+
+    /// Host slot of the current cloud transcription endpoint: a preset name
+    /// ("openai", "groq", "deepinfra") or "custom". `None` in Local mode.
+    pub fn stt_slot(&self) -> Option<String> {
+        match &self.transcription {
+            TranscriptionMode::Local { .. } => None,
+            TranscriptionMode::Api { .. } => Some(Self::stt_slot_for_url(&self.transcription_base_url())),
+        }
+    }
+
+    /// Slot name for a transcription endpoint URL.
+    pub fn stt_slot_for_url(url: &str) -> String {
+        TranscriptionPreset::for_url(url)
+            .map(|p| p.name.to_string())
+            .unwrap_or_else(|| "custom".to_string())
+    }
+
+    /// Remember the current cloud transcription key, model and custom endpoint
+    /// under their host slot so switching hosts never loses them.
+    pub fn remember_stt_settings(&mut self) {
+        if let TranscriptionMode::Api { api_key, model, base_url } = &self.transcription {
+            let slot = Self::stt_slot_for_url(&self.transcription_base_url());
+            if api_key.trim().is_empty() {
+                self.stt_api_keys.remove(&slot);
+            } else {
+                self.stt_api_keys.insert(slot.clone(), api_key.clone());
+            }
+            match model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+                Some(m) => {
+                    self.stt_models.insert(slot.clone(), m.to_string());
+                }
+                None => {
+                    self.stt_models.remove(&slot);
+                }
+            }
+            if slot == "custom" {
+                self.stt_custom_base_url = base_url.clone();
+            }
+        }
+    }
+
+    /// Stored transcription key for a host slot.
+    pub fn stt_key_for_slot(&self, slot: &str) -> Option<String> {
+        self.stt_api_keys.get(slot).cloned().filter(|k| !k.is_empty())
+    }
+
+    /// Stored transcription model for a host slot.
+    pub fn stt_model_for_slot(&self, slot: &str) -> Option<String> {
+        self.stt_models.get(slot).cloned().filter(|m| !m.is_empty())
     }
 
     /// API mode with `key`, keeping the configured (or last used) endpoint and model.
@@ -1239,6 +1383,43 @@ mod tests {
         assert!(matches!(mode, TranscriptionMode::Api { base_url: None, model: None, .. }));
         assert_eq!(TranscriptionPreset::by_name("Groq").unwrap().model, "whisper-large-v3-turbo");
         assert!(TranscriptionPreset::for_url("https://api.deepinfra.com/v1/openai/").is_some());
+    }
+
+    #[test]
+    fn slots_keep_compatible_hosts_apart() {
+        assert_eq!(EnrichmentConfig::provider_slot(&CloudProvider::Anthropic, None), "anthropic");
+        assert_eq!(
+            EnrichmentConfig::provider_slot(&CloudProvider::OpenAICompatible, Some("https://api.groq.com/openai/v1")),
+            "groq"
+        );
+        assert_eq!(EnrichmentConfig::provider_slot(&CloudProvider::OpenAICompatible, None), "deepinfra");
+        assert_eq!(
+            EnrichmentConfig::provider_slot(&CloudProvider::OpenAICompatible, Some("http://box:8000/v1")),
+            "custom"
+        );
+        let mut e = EnrichmentConfig::default();
+        e.save_key_for_slot("custom", "old-shared-key");
+        assert_eq!(e.load_key_for_slot("groq"), "old-shared-key", "legacy shared slot is a fallback");
+        e.save_key_for_slot("groq", "gsk");
+        assert_eq!(e.load_key_for_slot("groq"), "gsk");
+        assert_eq!(ScribaConfig::stt_slot_for_url("https://api.deepinfra.com/v1/openai"), "deepinfra");
+        assert_eq!(ScribaConfig::stt_slot_for_url("http://stt.local/v1"), "custom");
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn stt_settings_are_remembered_per_host() {
+        let mut config = ScribaConfig::default();
+        config.transcription = TranscriptionMode::Api {
+            api_key: "gsk".into(),
+            base_url: Some("https://api.groq.com/openai/v1".into()),
+            model: Some("whisper-large-v3-turbo".into()),
+        };
+        config.remember_stt_settings();
+        assert_eq!(config.stt_slot().as_deref(), Some("groq"));
+        assert_eq!(config.stt_key_for_slot("groq").as_deref(), Some("gsk"));
+        assert_eq!(config.stt_model_for_slot("groq").as_deref(), Some("whisper-large-v3-turbo"));
+        assert!(config.stt_key_for_slot("openai").is_none());
     }
 
     #[test]
