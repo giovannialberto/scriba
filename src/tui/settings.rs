@@ -1,5 +1,5 @@
 use crate::core::{
-    CloudProvider, EnrichmentMode, LocalModel, TranscriptionMode,
+    CloudProvider, EnrichmentMode, LocalModel, TranscriptionMode, DEFAULT_OLLAMA_ENDPOINT, DEFAULT_OLLAMA_MODEL,
 };
 use crate::enrichment::OllamaClient;
 use anyhow::Result;
@@ -105,6 +105,7 @@ impl Dashboard {
                 tokio::spawn(async move {
                     let result = crate::llm::list_models(&target)
                         .await
+                        .map(|names| names.into_iter().map(Into::into).collect())
                         .map_err(|e| e.to_string());
                     let _ = tx.send(result).await;
                 });
@@ -147,8 +148,9 @@ impl Dashboard {
                 self.model_list_rx = Some(rx);
 
                 tokio::spawn(async move {
-                    let result = OllamaClient::fetch_models(&endpoint)
+                    let result = OllamaClient::fetch_model_infos(&endpoint)
                         .await
+                        .map(|infos| infos.into_iter().map(Into::into).collect())
                         .map_err(|e| e.to_string());
                     let _ = tx.send(result).await;
                 });
@@ -335,9 +337,9 @@ impl Dashboard {
                             }
                             let model = new_cfg.last_local_model.unwrap_or(LocalModel::ParakeetTdt);
                             let ep = new_cfg.enrichment.last_ollama_endpoint.clone()
-                                .unwrap_or_else(|| "http://localhost:11434".to_string());
+                                .unwrap_or_else(|| DEFAULT_OLLAMA_ENDPOINT.to_string());
                             let mdl = new_cfg.enrichment.last_ollama_model.clone()
-                                .unwrap_or_else(|| "mistral:latest".to_string());
+                                .unwrap_or_else(|| DEFAULT_OLLAMA_MODEL.to_string());
                             new_cfg.enrichment.mode = EnrichmentMode::Local {
                                 ollama_endpoint: ep,
                                 ollama_model: mdl,

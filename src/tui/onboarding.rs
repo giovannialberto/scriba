@@ -1,6 +1,6 @@
 use crate::core::{
     CloudProvider, EnrichmentMode, LocalModel,
-    TranscriptionMode, initialize_world_from_seed, DEFAULT_COMPATIBLE_BASE_URL,};
+    TranscriptionMode, initialize_world_from_seed, DEFAULT_COMPATIBLE_BASE_URL, DEFAULT_OLLAMA_ENDPOINT, DEFAULT_OLLAMA_MODEL};
 use crate::database::Database;
 use crate::enrichment::{OllamaClient, WorldContext, WorldData, WorldEntityExtractionResult};
 use anyhow::Result;
@@ -82,18 +82,23 @@ pub(super) const LOCAL_MODELS: &[(LocalModel, &str, &str)] = &[
     (LocalModel::ParakeetTdt, "Parakeet TDT 0.6B (Recommended)", "~465 MB"),
     (LocalModel::WhisperTurbo, "Whisper Turbo", "~540 MB"),
     (LocalModel::WhisperLarge, "Whisper Large v3", "~3.1 GB"),
-    (LocalModel::WhisperMedium, "Whisper Medium", "~1.5 MB"),
+    (LocalModel::WhisperMedium, "Whisper Medium", "~1.5 GB"),
     (LocalModel::WhisperSmall, "Whisper Small", "~500 MB"),
     (LocalModel::SenseVoice, "SenseVoice", "~600 MB"),
 ];
 
-/// Recommended Ollama models for knowledge extraction, suitable for self-hosting.
+/// Suffix shown next to models that cannot call tools (the agent needs tools to read recordings).
+pub(super) const NO_TOOLS_MARK: &str = " (no tools)";
+
+/// Recommended Ollama models for knowledge extraction and the agent.
+/// Every entry supports Ollama tool calling; the first one is the default.
+/// Sizes are the Ollama library's default quantization (Sept 2026).
 pub(super) const RECOMMENDED_OLLAMA_MODELS: &[(&str, &str, &str)] = &[
-    ("mistral:latest", "Mistral 7B (Recommended)", "~4.1 GB"),
-    ("gemma3:4b", "Gemma 3 4B", "~3.3 GB"),
+    (DEFAULT_OLLAMA_MODEL, "Gemma 4 12B (Recommended)", "~7.6 GB"),
+    ("gpt-oss:20b", "GPT-OSS 20B", "~14 GB"),
+    ("qwen3:8b", "Qwen 3 8B", "~5.2 GB"),
+    ("granite4.1:8b", "Granite 4.1 8B", "~5.3 GB"),
     ("llama3.2:3b", "Llama 3.2 3B", "~2.0 GB"),
-    ("phi4-mini:latest", "Phi-4 Mini 3.8B", "~2.5 GB"),
-    ("qwen3:4b", "Qwen 3 4B", "~2.6 GB"),
 ];
 
 #[derive(Clone, Debug)]
@@ -102,6 +107,8 @@ pub(super) struct OllamaModelOption {
     pub label: String,
     pub size: String,
     pub installed: bool,
+    /// `Some(false)` when Ollama reports the model cannot call tools.
+    pub supports_tools: Option<bool>,
 }
 
 pub(super) struct OnboardingState {
@@ -600,7 +607,7 @@ impl OnboardingState {
                 }
             };
             let server_ok = client
-                .get("http://localhost:11434/api/tags")
+                .get(format!("{}/api/tags", DEFAULT_OLLAMA_ENDPOINT))
                 .send()
                 .await
                 .map(|r| r.status().is_success())
@@ -650,8 +657,8 @@ impl Dashboard {
                         if ob.selected_mode == 0 {
                             // Private (Local) mode
                             self.config.enrichment.mode = EnrichmentMode::Local {
-                                ollama_endpoint: "http://localhost:11434".to_string(),
-                                ollama_model: "mistral:latest".to_string(),
+                                ollama_endpoint: DEFAULT_OLLAMA_ENDPOINT.to_string(),
+                                ollama_model: DEFAULT_OLLAMA_MODEL.to_string(),
                             };
                             let _ = self.config.save();
 
@@ -962,6 +969,7 @@ impl Dashboard {
                                                 label: label.to_string(),
                                                 size: size.to_string(),
                                                 installed: false,
+                                                supports_tools: Some(true),
                                             }
                                         }).collect();
                                         ob.ollama_model_selection = 0;
@@ -969,15 +977,13 @@ impl Dashboard {
                                     // Fetch installed models to update status
                                     if !ob.ollama_models_fetched {
                                         ob.ollama_models_fetched = true;
-                                        let endpoint = if let EnrichmentMode::Local { ollama_endpoint, .. } = &self.config.enrichment.mode {
-                                            ollama_endpoint.clone()
-                                        } else {
-                                            "http://localhost:11434".to_string()
-                                        };
+                                        let endpoint = self.config.enrichment.ollama_endpoint();
                                         let (tx, rx) = mpsc::channel(1);
                                         self.model_list_rx = Some(rx);
                                         tokio::spawn(async move {
-                                            let result = OllamaClient::fetch_models(&endpoint).await;
+                                            let result = OllamaClient::fetch_model_infos(&endpoint)
+                                                .await
+                                                .map(|infos| infos.into_iter().map(Into::into).collect());
                                             let _ = tx.send(result.map_err(|e| e.to_string())).await;
                                         });
                                     }
@@ -1046,11 +1052,7 @@ impl Dashboard {
                                         if model_already { DownloadStatus::Done } else { DownloadStatus::Pending },
                                     ));
 
-                                    let ollama_model = if let EnrichmentMode::Local { ollama_model, .. } = &self.config.enrichment.mode {
-                                        ollama_model.clone()
-                                    } else {
-                                        "mistral:latest".to_string()
-                                    };
+                                    let ollama_model = self.config.enrichment.ollama_model();
 
                                     let need_ollama_pull = ob.ollama_reachable
                                         && !ob.ollama_available_models.get(ob.ollama_model_selection)
@@ -1068,11 +1070,7 @@ impl Dashboard {
                                     let (tx, rx) = mpsc::unbounded_channel();
                                     ob.download_rx = Some(rx);
 
-                                    let endpoint = if let EnrichmentMode::Local { ollama_endpoint, .. } = &self.config.enrichment.mode {
-                                        ollama_endpoint.clone()
-                                    } else {
-                                        "http://localhost:11434".to_string()
-                                    };
+                                    let endpoint = self.config.enrichment.ollama_endpoint();
                                     let ollama_model_clone = ollama_model.clone();
 
                                     ob.download_task = Some(tokio::spawn(async move {
@@ -1680,13 +1678,15 @@ impl Dashboard {
                         ob.ollama_available_models.iter()
                             .map(|m| {
                                 let status = if m.installed { " \u{2713}" } else { "" };
-                                m.label.chars().count() + status.len() + m.size.chars().count() + 2
+                                let tools = if m.supports_tools == Some(false) { NO_TOOLS_MARK } else { "" };
+                                m.label.chars().count() + status.chars().count() + tools.chars().count() + m.size.chars().count() + 2
                             })
                             .max().unwrap_or(0)
                     );
                     for (i, option) in ob.ollama_available_models.iter().enumerate() {
                         let status_str = if option.installed { " \u{2713}" } else { "" };
-                        let name_part = format!("{}{}", option.label, status_str);
+                        let tools_str = if option.supports_tools == Some(false) { NO_TOOLS_MARK } else { "" };
+                        let name_part = format!("{}{}{}", option.label, status_str, tools_str);
                         let gap = block_width.saturating_sub(name_part.chars().count() + option.size.chars().count());
                         if ob.ollama_model_selection == i {
                             lines.push(Line::from(vec![
@@ -1699,6 +1699,9 @@ impl Dashboard {
                             ];
                             if option.installed {
                                 spans.push(Span::styled(" \u{2713}", Style::default().fg(Color::Green)));
+                            }
+                            if option.supports_tools == Some(false) {
+                                spans.push(Span::styled(NO_TOOLS_MARK, Style::default().fg(Color::Yellow)));
                             }
                             spans.push(Span::styled(format!("{}{}", " ".repeat(gap), option.size), Style::default().fg(Color::DarkGray)));
                             lines.push(Line::from(spans));
@@ -1714,11 +1717,7 @@ impl Dashboard {
                         .replace(" (Fast, Accurate)", "");
 
                     let ollama_model = if ob.ollama_reachable {
-                        Some(if let EnrichmentMode::Local { ollama_model, .. } = &self.config.enrichment.mode {
-                            ollama_model.clone()
-                        } else {
-                            "mistral:latest".to_string()
-                        })
+                        Some(self.config.enrichment.ollama_model())
                     } else {
                         None
                     };

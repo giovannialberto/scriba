@@ -1,6 +1,6 @@
 use anyhow::Result;
 use scriba::core::{
-    resolve_transcription_mode, AudioFormat, AutopilotOptions, CloudProvider, CompressionSettings, EndpointPreset,
+    resolve_transcription_mode, AudioFormat, AutopilotOptions, CloudProvider, CompressionSettings, EndpointPreset, DEFAULT_OLLAMA_ENDPOINT, DEFAULT_OLLAMA_MODEL,
     EnrichmentMode, LocalModel, RecordingStatus, ScribaConfig, TranscriptionMode, WorkflowManager,
     initialize_world_from_seed, run_autopilot, watcher_excludes_self,
 };
@@ -548,8 +548,8 @@ async fn main() -> Result<()> {
                         let mut config = ScribaConfig::load()?;
                         if provider.to_lowercase() == "ollama" {
                             config.enrichment.mode = EnrichmentMode::Local {
-                                ollama_endpoint: "http://localhost:11434".to_string(),
-                                ollama_model: "mistral:latest".to_string(),
+                                ollama_endpoint: config.enrichment.last_ollama_endpoint.clone().unwrap_or_else(|| DEFAULT_OLLAMA_ENDPOINT.to_string()),
+                                ollama_model: config.enrichment.last_ollama_model.clone().unwrap_or_else(|| DEFAULT_OLLAMA_MODEL.to_string()),
                             };
                         } else {
                             let cloud_provider: CloudProvider = provider.parse()?;
@@ -1155,8 +1155,8 @@ fn apply_enrichment_overrides(
     if let Some(provider_str) = provider {
         if provider_str.to_lowercase() == "ollama" {
             config.enrichment.mode = EnrichmentMode::Local {
-                ollama_endpoint: "http://localhost:11434".to_string(),
-                ollama_model: model.unwrap_or("mistral:latest").to_string(),
+                ollama_endpoint: config.enrichment.ollama_endpoint(),
+                ollama_model: model.map(str::to_string).unwrap_or_else(|| config.enrichment.ollama_model()),
             };
             return Ok(());
         }

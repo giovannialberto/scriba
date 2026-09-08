@@ -21,6 +21,8 @@ pub const ACCENT: Color = Color::Indexed(141);
 #[derive(Debug, Clone)]
 pub enum ChatStreamEvent {
     Status(String),
+    /// Non-fatal problem worth keeping in the transcript (generation continues).
+    Warning(String),
     Chunk(String),
     ToolCall { name: String, input_summary: String },
     ToolResult { name: String, output_summary: String },
@@ -270,6 +272,12 @@ impl ChatState {
         if let Some(ref mut rx) = self.stream_rx {
             while let Ok(event) = rx.try_recv() {
                 match event {
+                    ChatStreamEvent::Warning(msg) => {
+                        self.messages.push(ChatMessage::text(
+                            ChatRole::System,
+                            format!("\u{26A0} {}", msg),
+                        ));
+                    }
                     ChatStreamEvent::Status(msg) => {
                         self.current_status = Some(msg);
                     }
@@ -1586,6 +1594,7 @@ pub async fn chat_agent_pipeline(
     while let Some(event) = agent_rx.recv().await {
         let chat_event = match event {
             AgentEvent::Status(msg) => ChatStreamEvent::Status(msg),
+            AgentEvent::Warning(msg) => ChatStreamEvent::Warning(msg),
             AgentEvent::Chunk(text) => ChatStreamEvent::Chunk(text),
             AgentEvent::ToolCall { name, input_summary } => {
                 ChatStreamEvent::ToolCall { name, input_summary }

@@ -27,7 +27,7 @@ pub use autopilot::{run_autopilot, spawn_autopilot, AutopilotHandle, AutopilotOp
 pub use loopback::{detect_loopback_sources, start_loopback_capture};
 pub use playback::AudioPlayer;
 #[allow(deprecated)]
-pub use config::{resolve_transcription_mode, CloudProvider, EndpointPreset, EnrichmentConfig, EnrichmentMode, LocalModel, LocalModelSize, MeetingDetectionConfig, ModelDef, ScribaConfig, SilenceAutoStopConfig, TranscriptionMode, DEFAULT_COMPATIBLE_BASE_URL, DEFAULT_COMPATIBLE_MODEL, ENDPOINT_PRESETS};
+pub use config::{resolve_transcription_mode, CloudProvider, EndpointPreset, EnrichmentConfig, EnrichmentMode, LocalModel, LocalModelSize, MeetingDetectionConfig, ModelDef, ScribaConfig, SilenceAutoStopConfig, TranscriptionMode, DEFAULT_COMPATIBLE_BASE_URL, DEFAULT_COMPATIBLE_MODEL, DEFAULT_OLLAMA_ENDPOINT, DEFAULT_OLLAMA_MODEL, ENDPOINT_PRESETS};
 pub use files::FileManager;
 pub use meeting::{capturing_processes, friendly_process_name, meeting_signal, notify_event, run_meeting_watcher, watcher_excludes_self, MeetingEvent, MeetingWatcherConfig};
 pub use notify::{confirm as desktop_confirm, notification_helper_ready, notify as desktop_notify, prepare_notification_helper};

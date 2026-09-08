@@ -85,6 +85,7 @@ async fn main() {
     while let Some(ev) = rx.recv().await {
         match ev {
             AgentEvent::Status(s) => println!("   [status] {s}"),
+            AgentEvent::Warning(w) => println!("   [warning] {w}"),
             AgentEvent::Chunk(c) => text.push_str(&c),
             AgentEvent::ToolCall {
                 name,

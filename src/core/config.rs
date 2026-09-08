@@ -398,6 +398,11 @@ pub struct ModelDef {
     pub model_id: String,
 }
 
+/// Default Ollama server for Private mode.
+pub const DEFAULT_OLLAMA_ENDPOINT: &str = "http://localhost:11434";
+/// Default Ollama model for Private mode: current, tool-capable, fits a 16 GB machine.
+pub const DEFAULT_OLLAMA_MODEL: &str = "gemma4:12b";
+
 /// Default endpoint for `CloudProvider::OpenAICompatible` when none is configured.
 pub const DEFAULT_COMPATIBLE_BASE_URL: &str = "https://api.deepinfra.com/v1/openai";
 /// Default model for `CloudProvider::OpenAICompatible` (open-weight, tool-capable, hosted on DeepInfra).
@@ -584,7 +589,7 @@ impl EnrichmentConfig {
         // If legacy fields are present and mode is the default Cloud with empty key,
         // this was an old config — convert to Local mode.
         if let Some(endpoint) = self.ollama_endpoint.take() {
-            let model = self.ollama_model.take().unwrap_or_else(|| "mistral:latest".to_string());
+            let model = self.ollama_model.take().unwrap_or_else(|| DEFAULT_OLLAMA_MODEL.to_string());
             // Only migrate if mode looks like the default (empty cloud key)
             if matches!(&self.mode, EnrichmentMode::Cloud { api_key, .. } if api_key.is_empty()) {
                 self.mode = EnrichmentMode::Local {
@@ -779,7 +784,7 @@ impl EnrichmentConfig {
     pub fn ollama_endpoint(&self) -> String {
         match &self.mode {
             EnrichmentMode::Local { ollama_endpoint, .. } => ollama_endpoint.clone(),
-            _ => "http://localhost:11434".to_string(),
+            _ => DEFAULT_OLLAMA_ENDPOINT.to_string(),
         }
     }
 
@@ -788,7 +793,7 @@ impl EnrichmentConfig {
     pub fn ollama_model(&self) -> String {
         match &self.mode {
             EnrichmentMode::Local { ollama_model, .. } => ollama_model.clone(),
-            _ => "mistral:latest".to_string(),
+            _ => DEFAULT_OLLAMA_MODEL.to_string(),
         }
     }
 

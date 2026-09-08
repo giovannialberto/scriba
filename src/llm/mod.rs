@@ -22,7 +22,8 @@ use tokio::sync::mpsc;
 use crate::agent::loop_runner::AgentEvent;
 use crate::agent::provider::{AgentProvider, AgentTurnResult};
 use crate::core::config::{CloudProvider, EnrichmentConfig, EnrichmentMode};
-use crate::enrichment::{LlmProvider, OllamaClient, ProviderError};
+use crate::enrichment::{LlmProvider, OllamaClient, OllamaModelInfo, ProviderError};
+use tokio::sync::OnceCell;
 
 /// Overall HTTP timeout for a single model call.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
@@ -69,7 +70,7 @@ impl Protocol {
             Protocol::Anthropic => "https://api.anthropic.com/v1/",
             Protocol::OpenAI => "https://api.openai.com/v1/",
             Protocol::Gemini => "https://generativelanguage.googleapis.com/v1beta/",
-            Protocol::Ollama => "http://localhost:11434/",
+            Protocol::Ollama => crate::core::config::DEFAULT_OLLAMA_ENDPOINT,
         }
     }
 
@@ -154,6 +155,43 @@ impl LlmTarget {
             endpoint: Endpoint::from_owned(self.endpoint.clone()),
             auth,
             model: ModelIden::new(self.protocol.adapter_kind(), self.model.as_str()),
+        }
+    }
+}
+
+/// One model offered by an endpoint, as shown in model pickers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelListEntry {
+    pub id: String,
+    /// `Some(false)` when the host says the model cannot call tools.
+    pub supports_tools: Option<bool>,
+}
+
+impl ModelListEntry {
+    /// Label for pickers: the id, flagged when the agent cannot use the model.
+    pub fn display_name(&self) -> String {
+        if self.supports_tools == Some(false) {
+            format!("{} (no tools)", self.id)
+        } else {
+            self.id.clone()
+        }
+    }
+}
+
+impl From<OllamaModelInfo> for ModelListEntry {
+    fn from(info: OllamaModelInfo) -> Self {
+        Self {
+            id: info.name,
+            supports_tools: info.supports_tools,
+        }
+    }
+}
+
+impl From<String> for ModelListEntry {
+    fn from(id: String) -> Self {
+        Self {
+            id,
+            supports_tools: None,
         }
     }
 }
@@ -275,6 +313,8 @@ pub struct GenaiProvider {
     target: LlmTarget,
     service_target: ServiceTarget,
     client: Client,
+    /// Cached result of the Ollama tool-capability probe.
+    tools_supported: OnceCell<bool>,
 }
 
 impl GenaiProvider {
@@ -288,7 +328,28 @@ impl GenaiProvider {
             target,
             service_target,
             client,
+            tools_supported: OnceCell::new(),
         }
+    }
+
+    /// Whether the model can take tool definitions. Ollama rejects requests
+    /// that include tools for models without the capability, so ask once and
+    /// remember. Cloud providers are assumed capable; a probe failure is too.
+    async fn tools_supported(&self) -> bool {
+        if self.target.protocol != Protocol::Ollama {
+            return true;
+        }
+        *self
+            .tools_supported
+            .get_or_init(|| async {
+                OllamaClient::new(&self.target.endpoint, &self.target.model)
+                    .supports_tools()
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or(true)
+            })
+            .await
     }
 
     /// Build a provider from the enrichment configuration.
@@ -418,7 +479,19 @@ impl AgentProvider for GenaiProvider {
         let mut all = Vec::with_capacity(messages.len() + 1);
         all.push(system);
         all.extend(messages.iter().cloned());
-        let request = ChatRequest::new(all).with_tools(tools.to_vec());
+        let mut request = ChatRequest::new(all);
+        if self.tools_supported().await {
+            request = request.with_tools(tools.to_vec());
+        } else {
+            let _ = tx
+                .send(AgentEvent::Warning(format!(
+                    "{} cannot call tools, so Scriba is answering without looking at your \
+                     recordings. Pick a tools-capable model in Settings (for example {}).",
+                    self.target.model,
+                    crate::core::config::DEFAULT_OLLAMA_MODEL
+                )))
+                .await;
+        }
 
         let options = self
             .base_options()
@@ -457,6 +530,8 @@ impl AgentProvider for GenaiProvider {
             .filter(|c| !c.is_empty())
             .unwrap_or_else(|| MessageContent::from_text(streamed_text));
         let has_tool_calls = !content.tool_calls().is_empty();
+        // Local models may write a tool call as text instead of a tool_use part; only
+        // real tool calls continue the loop.
 
         let truncated = matches!(end.captured_stop_reason, Some(StopReason::MaxTokens(_)));
         if truncated {
@@ -602,6 +677,17 @@ mod tests {
             display_name: "Ollama (Local)".to_string(),
         };
         assert!(GenaiProvider::new(target).ensure_credentials().is_ok());
+    }
+
+    #[test]
+    fn model_list_entries_flag_missing_tool_support() {
+        let capable: ModelListEntry = "gemma4:12b".to_string().into();
+        assert_eq!(capable.display_name(), "gemma4:12b");
+        let entry = ModelListEntry::from(OllamaModelInfo {
+            name: "gemma3:12b".to_string(),
+            supports_tools: Some(false),
+        });
+        assert_eq!(entry.display_name(), "gemma3:12b (no tools)");
     }
 
     #[test]

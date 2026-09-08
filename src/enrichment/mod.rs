@@ -21,7 +21,7 @@ pub use extractor::{
     EnrichmentService, ExtractedEntity, ExtractionResult, WorldEntityExtractionResult,
     WorldEntityOrganization, WorldEntityPerson,
 };
-pub use ollama::{OllamaClient, OllamaError, OllamaStatus, pull_model_with_progress};
+pub use ollama::{OllamaClient, OllamaError, OllamaModelInfo, OllamaStatus, pull_model_with_progress};
 pub use provider::{LlmProvider, ProviderError};
 pub use world::{WorldContext, WorldData, append_new_facts};
 
