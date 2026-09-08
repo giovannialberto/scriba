@@ -1,7 +1,10 @@
-//! Common LLM provider trait and types.
+//! Common LLM provider trait and error type.
+//!
+//! The single implementation lives in [`crate::llm::GenaiProvider`]; this
+//! trait exists so enrichment code can be tested against fakes without a
+//! network.
 
 use async_trait::async_trait;
-use std::fmt;
 use thiserror::Error;
 
 /// Errors that can occur when interacting with an LLM provider.
@@ -12,6 +15,9 @@ pub enum ProviderError {
 
     #[error("Rate limited: {message}")]
     RateLimited { message: String },
+
+    #[error("API error ({status}): {message}")]
+    HttpStatus { status: u16, message: String },
 
     #[error("Request timeout after {seconds}s")]
     Timeout { seconds: u64 },
@@ -26,34 +32,18 @@ pub enum ProviderError {
     Other { message: String },
 }
 
-/// Supported LLM provider kinds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProviderKind {
-    Anthropic,
-    OpenAI,
-    Google,
-    Ollama,
-}
-
-impl fmt::Display for ProviderKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl ProviderError {
+    /// Whether retrying the same request later has a reasonable chance of
+    /// succeeding (rate limits, timeouts, transport errors, server errors).
+    pub fn is_retryable(&self) -> bool {
         match self {
-            ProviderKind::Anthropic => write!(f, "Anthropic"),
-            ProviderKind::OpenAI => write!(f, "OpenAI"),
-            ProviderKind::Google => write!(f, "Google"),
-            ProviderKind::Ollama => write!(f, "Ollama"),
-        }
-    }
-}
-
-impl ProviderKind {
-    /// Default model for this provider.
-    pub fn default_model(&self) -> &str {
-        match self {
-            ProviderKind::Anthropic => "claude-sonnet-4-6",
-            ProviderKind::OpenAI => "gpt-5.2",
-            ProviderKind::Google => "gemini-2.5-flash",
-            ProviderKind::Ollama => "mistral:latest",
+            ProviderError::RateLimited { .. }
+            | ProviderError::Timeout { .. }
+            | ProviderError::Network { .. } => true,
+            ProviderError::HttpStatus { status, .. } => *status >= 500,
+            ProviderError::AuthFailure { .. }
+            | ProviderError::ParseError { .. }
+            | ProviderError::Other { .. } => false,
         }
     }
 }
@@ -67,18 +57,6 @@ pub trait LlmProvider: Send + Sync {
     /// Generate a plain text response (no JSON format constraint).
     async fn generate_text(&self, prompt: &str) -> Result<String, ProviderError>;
 
-    /// Stream a plain text response, sending chunks through the channel.
-    /// Default implementation falls back to non-streaming (one big chunk).
-    async fn generate_text_stream(
-        &self,
-        prompt: &str,
-        tx: tokio::sync::mpsc::Sender<String>,
-    ) -> Result<(), ProviderError> {
-        let response = self.generate_text(prompt).await?;
-        let _ = tx.send(response).await;
-        Ok(())
-    }
-
     /// Check if the provider is reachable and configured.
     async fn health_check(&self) -> Result<(), ProviderError>;
 
@@ -87,4 +65,52 @@ pub trait LlmProvider: Send + Sync {
 
     /// Model name in use.
     fn model(&self) -> &str;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retryable_classification() {
+        assert!(
+            ProviderError::RateLimited {
+                message: String::new()
+            }
+            .is_retryable()
+        );
+        assert!(ProviderError::Timeout { seconds: 1 }.is_retryable());
+        assert!(
+            ProviderError::Network {
+                message: String::new()
+            }
+            .is_retryable()
+        );
+        assert!(
+            ProviderError::HttpStatus {
+                status: 503,
+                message: String::new()
+            }
+            .is_retryable()
+        );
+        assert!(
+            !ProviderError::HttpStatus {
+                status: 400,
+                message: String::new()
+            }
+            .is_retryable()
+        );
+        assert!(
+            !ProviderError::AuthFailure {
+                message: String::new()
+            }
+            .is_retryable()
+        );
+        assert!(
+            !ProviderError::ParseError {
+                message: String::new()
+            }
+            .is_retryable()
+        );
+    }
 }

@@ -1529,7 +1529,7 @@ pub async fn chat_agent_pipeline(
     tx: mpsc::Sender<ChatStreamEvent>,
 ) {
     use crate::agent::loop_runner::{AgentEvent, run_agent_loop};
-    use crate::agent::providers::create_agent_provider;
+    use crate::agent::create_agent_provider;
 
     let provider = create_agent_provider(&config);
 

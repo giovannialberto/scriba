@@ -1,13 +1,13 @@
-//! Ollama API client for local LLM inference.
+//! Ollama management client: health checks, diagnostics, model listing and pulls.
+//!
+//! Inference itself goes through [`crate::llm`].
 
-use anyhow::Result;
-use async_trait::async_trait;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::time::Duration;
 use thiserror::Error;
 
-use super::provider::{LlmProvider, ProviderError};
+use super::provider::ProviderError;
 
 /// Errors that can occur when interacting with Ollama.
 #[derive(Error, Debug)]
@@ -26,33 +26,6 @@ pub enum OllamaError {
 
     #[error("Request timeout after {seconds}s")]
     Timeout { seconds: u64 },
-}
-
-/// Request body for Ollama generate API.
-#[derive(Debug, Serialize)]
-struct GenerateRequest<'a> {
-    model: &'a str,
-    prompt: &'a str,
-    stream: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    format: Option<&'a str>,
-    options: GenerateOptions,
-}
-
-/// Generation options for Ollama.
-#[derive(Debug, Serialize)]
-struct GenerateOptions {
-    temperature: f32,
-    num_predict: i32,
-}
-
-/// Response from Ollama generate API.
-#[derive(Debug, Deserialize)]
-struct GenerateResponse {
-    response: String,
-    #[allow(dead_code)]
-    #[serde(default)]
-    done: bool,
 }
 
 /// Response from Ollama tags API (list models).
@@ -105,7 +78,6 @@ pub struct OllamaClient {
     client: Client,
     endpoint: String,
     model: String,
-    timeout_seconds: u64,
 }
 
 impl OllamaClient {
@@ -120,7 +92,6 @@ impl OllamaClient {
             client,
             endpoint: endpoint.trim_end_matches('/').to_string(),
             model: model.to_string(),
-            timeout_seconds: 300,
         }
     }
 
@@ -209,114 +180,6 @@ impl OllamaClient {
         }
 
         OllamaStatus::Ready
-    }
-
-    /// Generate a response from the LLM.
-    pub async fn generate(&self, prompt: &str) -> Result<String, OllamaError> {
-        let url = format!("{}/api/generate", self.endpoint);
-
-        let request = GenerateRequest {
-            model: &self.model,
-            prompt,
-            stream: false,
-            format: Some("json"),
-            options: GenerateOptions {
-                temperature: 0.3, // Low temperature for more consistent extraction
-                num_predict: 4096, // Allow enough tokens for full extraction
-            },
-        };
-
-        let response = self
-            .client
-            .post(&url)
-            .json(&request)
-            .timeout(Duration::from_secs(self.timeout_seconds))
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    OllamaError::Timeout {
-                        seconds: self.timeout_seconds,
-                    }
-                } else if e.is_connect() {
-                    OllamaError::NotRunning {
-                        endpoint: self.endpoint.clone(),
-                    }
-                } else {
-                    OllamaError::RequestFailed {
-                        message: e.to_string(),
-                    }
-                }
-            })?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(OllamaError::RequestFailed {
-                message: format!("HTTP {}: {}", status, body),
-            });
-        }
-
-        let result: GenerateResponse =
-            response.json().await.map_err(|e| OllamaError::ParseError {
-                message: e.to_string(),
-            })?;
-
-        Ok(result.response)
-    }
-
-    /// Generate a response without JSON format constraint.
-    pub async fn generate_text(&self, prompt: &str) -> Result<String, OllamaError> {
-        let url = format!("{}/api/generate", self.endpoint);
-
-        let request = GenerateRequest {
-            model: &self.model,
-            prompt,
-            stream: false,
-            format: None,
-            options: GenerateOptions {
-                temperature: 0.3,
-                num_predict: 2048,
-            },
-        };
-
-        let response = self
-            .client
-            .post(&url)
-            .json(&request)
-            .timeout(Duration::from_secs(self.timeout_seconds))
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    OllamaError::Timeout {
-                        seconds: self.timeout_seconds,
-                    }
-                } else if e.is_connect() {
-                    OllamaError::NotRunning {
-                        endpoint: self.endpoint.clone(),
-                    }
-                } else {
-                    OllamaError::RequestFailed {
-                        message: e.to_string(),
-                    }
-                }
-            })?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(OllamaError::RequestFailed {
-                message: format!("HTTP {}: {}", status, body),
-            });
-        }
-
-        let result: GenerateResponse =
-            response.json().await.map_err(|e| OllamaError::ParseError {
-                message: e.to_string(),
-            })?;
-
-        Ok(result.response)
     }
 
     /// Fetch available model names from an Ollama endpoint.
@@ -443,104 +306,6 @@ impl From<OllamaError> for ProviderError {
             OllamaError::ParseError { message } => ProviderError::ParseError { message },
             OllamaError::Timeout { seconds } => ProviderError::Timeout { seconds },
         }
-    }
-}
-
-#[async_trait]
-impl LlmProvider for OllamaClient {
-    async fn generate(&self, prompt: &str) -> Result<String, ProviderError> {
-        OllamaClient::generate(self, prompt).await.map_err(Into::into)
-    }
-
-    async fn generate_text(&self, prompt: &str) -> Result<String, ProviderError> {
-        OllamaClient::generate_text(self, prompt).await.map_err(Into::into)
-    }
-
-    async fn generate_text_stream(
-        &self,
-        prompt: &str,
-        tx: tokio::sync::mpsc::Sender<String>,
-    ) -> Result<(), ProviderError> {
-        use futures_util::StreamExt;
-
-        let url = format!("{}/api/generate", self.endpoint);
-
-        let request = GenerateRequest {
-            model: &self.model,
-            prompt,
-            stream: true,
-            format: None,
-            options: GenerateOptions {
-                temperature: 0.3,
-                num_predict: 4096,
-            },
-        };
-
-        let response = self
-            .client
-            .post(&url)
-            .json(&request)
-            .timeout(std::time::Duration::from_secs(self.timeout_seconds))
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    ProviderError::Timeout { seconds: self.timeout_seconds }
-                } else if e.is_connect() {
-                    ProviderError::Network { message: format!("Ollama not running at {}", self.endpoint) }
-                } else {
-                    ProviderError::Other { message: e.to_string() }
-                }
-            })?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(ProviderError::Other {
-                message: format!("HTTP {}: {}", status, body),
-            });
-        }
-
-        let mut stream = response.bytes_stream();
-        let mut buffer = String::new();
-
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| ProviderError::Network { message: e.to_string() })?;
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-            // Process complete lines (NDJSON)
-            while let Some(newline_pos) = buffer.find('\n') {
-                let line = buffer[..newline_pos].trim().to_string();
-                buffer = buffer[newline_pos + 1..].to_string();
-
-                if line.is_empty() {
-                    continue;
-                }
-
-                if let Ok(resp) = serde_json::from_str::<GenerateResponse>(&line) {
-                    if !resp.response.is_empty() {
-                        let _ = tx.send(resp.response).await;
-                    }
-                    if resp.done {
-                        return Ok(());
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn health_check(&self) -> Result<(), ProviderError> {
-        OllamaClient::health_check(self).await.map_err(Into::into)
-    }
-
-    fn display_name(&self) -> &str {
-        "Ollama (Local)"
-    }
-
-    fn model(&self) -> &str {
-        OllamaClient::model(self)
     }
 }
 

@@ -12,6 +12,7 @@ pub mod core;
 pub mod database;
 pub mod enrichment;
 pub mod entities;
+pub mod llm;
 pub mod errors;
 pub mod mcp;
 pub mod tools;
