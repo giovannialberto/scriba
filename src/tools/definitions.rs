@@ -43,11 +43,16 @@ pub struct GetTranscriptParams {
     pub recording_id: Option<i64>,
     /// Directory name to fetch transcript for.
     pub directory_name: Option<String>,
+    /// Word offset to start from (for paging through long transcripts). Default: 0.
+    pub offset_words: Option<usize>,
+    /// Maximum words to return in this page. Default: 4000, max: 12000.
+    pub max_words: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SearchTranscriptsParams {
-    /// Search query (FTS5 syntax supported).
+    /// Words or phrases to look for. Plain words work best; every word must
+    /// appear. FTS5 syntax (OR, NEAR, "quoted phrases", prefix*) is accepted.
     pub query: String,
     /// Maximum results to return. Default: 10.
     pub limit: Option<i64>,
@@ -150,12 +155,12 @@ pub fn all_tool_schemas() -> Vec<ToolSchema> {
         },
         ToolSchema {
             name: "get_transcript",
-            description: "Fetch the full transcript text for a recording. Returns the entire content with no word limit.",
+            description: "Fetch the transcript text for a recording, one page at a time. Returns JSON with total_words, the page content (default 4000 words) and, when has_more is true, next_offset_words to pass as offset_words for the next page. Use search_transcripts first when you only need a specific passage.",
             input_schema: serde_json::to_value(schemars::schema_for!(GetTranscriptParams)).unwrap(),
         },
         ToolSchema {
             name: "search_transcripts",
-            description: "Full-text search across all transcripts. Returns matching recording IDs with snippets. Supports date filtering with from_date/to_date (ISO 8601). Use this to find recordings about a topic.",
+            description: "Full-text search across all transcripts. Returns matching recording IDs with snippets, best matches first. Use plain words (all must appear); quote a phrase to match it exactly. Supports date filtering with from_date/to_date (ISO 8601). Use this to find recordings about a topic before fetching whole transcripts.",
             input_schema: serde_json::to_value(schemars::schema_for!(SearchTranscriptsParams)).unwrap(),
         },
         ToolSchema {

@@ -137,6 +137,15 @@ impl Database {
         Ok(db)
     }
 
+    /// In-memory database with the full schema, for tests.
+    #[cfg(test)]
+    pub fn open_in_memory() -> Result<Self> {
+        let conn = Connection::open_in_memory().context("Failed to open in-memory database")?;
+        let mut db = Database { conn };
+        db.initialize()?;
+        Ok(db)
+    }
+
     fn get_database_path() -> Result<PathBuf> {
         let home = home_dir().context("Could not find home directory")?;
         Ok(home.join("scriba_recordings").join("scriba.db"))
@@ -718,14 +727,30 @@ impl Database {
         }
 
         let mut stmt = self.conn.prepare(&sql)?;
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
-        let rows = stmt.query_map(param_refs.as_slice(), row_to_recording_and_transcript)?;
+        let run = |stmt: &mut rusqlite::Statement<'_>, params: &[Box<dyn rusqlite::types::ToSql>]| -> Result<Vec<(Recording, Transcript)>> {
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+            let rows = stmt.query_map(param_refs.as_slice(), row_to_recording_and_transcript)?;
+            let mut results = Vec::new();
+            for row in rows {
+                results.push(row?);
+            }
+            Ok(results)
+        };
 
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
+        // Try the query as written so FTS5 operators keep working; if SQLite
+        // rejects the syntax (unbalanced quotes, stray operators), fall back to
+        // a plain all-words search instead of surfacing a parser error.
+        match run(&mut stmt, &params_vec) {
+            Ok(results) => Ok(results),
+            Err(_) => {
+                let sanitized = sanitize_fts_query(query);
+                if sanitized.is_empty() {
+                    return Ok(Vec::new());
+                }
+                params_vec[0] = Box::new(sanitized);
+                run(&mut stmt, &params_vec)
+            }
         }
-        Ok(results)
     }
 
     // =========================================================================
@@ -1258,5 +1283,100 @@ impl Database {
             .execute(sql, params![speakers_json, Utc::now(), recording_id])?;
 
         Ok(())
+    }
+}
+
+/// Turn free text into a safe FTS5 MATCH expression: every word becomes a
+/// quoted term (implicit AND), so punctuation and operators the model might
+/// emit can never produce a syntax error.
+pub fn sanitize_fts_query(raw: &str) -> String {
+    raw.split(|c: char| !c.is_alphanumeric() && c != '\'' && c != '_')
+        .filter(|w| !w.is_empty())
+        .map(|w| format!("\"{}\"", w.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(test)]
+mod fts_tests {
+    use super::*;
+
+    fn seed_transcript(db: &mut Database, content: &str) {
+        use chrono::Utc;
+        let now = Utc::now();
+        let recording = Recording {
+            id: None,
+            directory_name: "rec-1".into(),
+            display_name: Some("Budget sync".into()),
+            created_at: now,
+            updated_at: now,
+            duration_seconds: Some(60),
+            file_size_bytes: Some(1),
+            audio_format: "wav".into(),
+            sample_rate: 16000,
+            channels: 1,
+            has_transcript: true,
+            transcript_status: "completed".into(),
+            language_code: "en".into(),
+            model_used: "test".into(),
+            tags: None,
+            summary: None,
+            key_points: None,
+            action_items: None,
+            speakers: None,
+            sentiment_score: None,
+            search_index: None,
+            categories: None,
+            confidence_score: None,
+            audio_path: "rec-1/audio.wav".into(),
+            transcript_path: None,
+            transcript_error: None,
+        };
+        let recording_id = db.insert_recording(&recording).unwrap();
+        let transcript = Transcript {
+            id: None,
+            recording_id,
+            content: content.into(),
+            created_at: now,
+            updated_at: now,
+            word_count: Some(content.split_whitespace().count() as i64),
+            character_count: Some(content.len() as i64),
+            language_detected: None,
+            confidence_scores: None,
+            segments: None,
+            entities: None,
+            topics: None,
+        };
+        db.insert_transcript(&transcript).unwrap();
+    }
+
+    #[test]
+    fn malformed_fts_queries_fall_back_to_plain_word_search() {
+        let mut db = Database::open_in_memory().unwrap();
+        seed_transcript(&mut db, "We agreed the budget plan ships next quarter.");
+
+        // Valid FTS5 syntax keeps working as written.
+        let hits = db.search_transcripts_filtered("budget OR nothing", None, None, None).unwrap();
+        assert_eq!(hits.len(), 1);
+
+        // Unbalanced quote would be a syntax error; sanitized form still finds it.
+        let hits = db.search_transcripts_filtered("budget \"plan", None, None, None).unwrap();
+        assert_eq!(hits.len(), 1);
+
+        // Only punctuation: no error, no results.
+        let hits = db.search_transcripts_filtered("!!! (((", None, None, None).unwrap();
+        assert!(hits.is_empty());
+
+        // Words that are not all present do not match.
+        let hits = db.search_transcripts_filtered("budget unicorn", None, None, None).unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn fts_sanitizer_quotes_every_word() {
+        assert_eq!(sanitize_fts_query("budget migration"), "\"budget\" \"migration\"");
+        assert_eq!(sanitize_fts_query("  \"unbalanced OR (weird*"), "\"unbalanced\" \"OR\" \"weird\"");
+        assert_eq!(sanitize_fts_query("O'Brien's plan"), "\"O'Brien's\" \"plan\"");
+        assert_eq!(sanitize_fts_query("!!! ---"), "");
     }
 }
