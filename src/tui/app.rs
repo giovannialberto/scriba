@@ -1,6 +1,6 @@
 use crate::core::{
     AudioPlayer, AutopilotHandle, AutopilotOptions, RecordingGuard,
-    RecordingKind, RecordingPhase, RecordingResult, RecordingStatus, ScribaConfig, TranscriptionMode,
+    RecordingKind, RecordingPhase, RecordingResult, RecordingStatus, ScribaConfig,
     rebuild_world_from_entities, spawn_autopilot,
 };
 use crate::database::{Database, Entity, Recording, RecordingStats};
@@ -84,6 +84,8 @@ pub struct Dashboard {
     pub(super) enrichment_endpoint_input: String,     // Ollama endpoint input buffer (local mode)
     pub(super) editing_enrichment_api_key: bool,      // Whether we're editing enrichment API key
     pub(super) enrichment_api_key_input: String,      // Enrichment API key input buffer
+    pub(super) editing_stt_field: Option<super::settings::SttField>, // Cloud transcription model/endpoint being edited
+    pub(super) stt_field_input: String,               // Input buffer for the field above
     pub(super) return_to_view: Option<DashboardView>, // View to return to after message dismissal
     // File import dialog state
     pub(super) show_file_dialog: bool,
@@ -218,6 +220,8 @@ impl Dashboard {
             enrichment_endpoint_input: String::new(),
             editing_enrichment_api_key: false,
             enrichment_api_key_input: String::new(),
+            editing_stt_field: None,
+            stt_field_input: String::new(),
             return_to_view: None,
             // File import dialog state
             show_file_dialog: false,
@@ -700,9 +704,7 @@ impl Dashboard {
                             self.init_global_chat();
                         }
                         OnboardingTickResult::SaveWhisperKey(key) => {
-                            self.config.transcription = TranscriptionMode::Api {
-                                api_key: key,
-                            };
+                            self.config.transcription = self.config.api_mode_with_key(key);
                             let _ = self.config.save();
                         }
                         OnboardingTickResult::FetchOllamaModels => {

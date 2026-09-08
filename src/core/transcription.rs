@@ -333,11 +333,93 @@ fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
-/// Transcribe a single audio chunk via the OpenAI API (one attempt).
+/// Where cloud transcription requests go: any OpenAI-compatible
+/// `/audio/transcriptions` endpoint.
+#[derive(Debug, Clone)]
+pub struct ApiTranscriptionTarget {
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+}
+
+impl ApiTranscriptionTarget {
+    /// Resolve endpoint, model and key from the configuration. The key may
+    /// come from the host's environment variable when not stored.
+    pub fn from_config(config: &ScribaConfig) -> Result<Self> {
+        let api_key = config.resolve_transcription_api_key().ok_or_else(|| {
+            anyhow::anyhow!(
+                "No transcription API key configured for {}. Add one in Settings or set {}.",
+                config.transcription_host_display(),
+                config.transcription_api_key_env()
+            )
+        })?;
+        Ok(Self {
+            base_url: config.transcription_base_url(),
+            api_key,
+            model: config.transcription_model(),
+        })
+    }
+
+    fn transcriptions_url(&self) -> String {
+        format!("{}/audio/transcriptions", self.base_url.trim_end_matches('/'))
+    }
+
+    /// Diarizing models return speaker-labelled segments instead of plain text.
+    fn diarizes(&self) -> bool {
+        self.model.contains("diarize")
+    }
+
+    fn host_display(&self) -> String {
+        super::config::TranscriptionPreset::for_url(&self.base_url)
+            .map(|p| p.display.to_string())
+            .unwrap_or_else(|| self.base_url.clone())
+    }
+}
+
+/// Render a `diarized_json` response as "Speaker N: ..." lines, merging
+/// consecutive segments from the same speaker. Falls back to `text`.
+fn render_diarized(response: &Value) -> Option<String> {
+    let segments = response
+        .get("segments")
+        .and_then(|s| s.as_array())
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
+    let mut lines: Vec<(String, String)> = Vec::new();
+    for seg in segments {
+        let text = seg.get("text").and_then(|t| t.as_str()).unwrap_or("").trim();
+        if text.is_empty() {
+            continue;
+        }
+        let speaker = seg
+            .get("speaker")
+            .and_then(|sp| sp.as_str())
+            .unwrap_or("Unknown")
+            .to_string();
+        match lines.last_mut() {
+            Some((last_speaker, last_text)) if *last_speaker == speaker => {
+                last_text.push(' ');
+                last_text.push_str(text);
+            }
+            _ => lines.push((speaker, text.to_string())),
+        }
+    }
+    if lines.is_empty() {
+        return response.get("text").and_then(|t| t.as_str()).map(str::to_string);
+    }
+    Some(
+        lines
+            .into_iter()
+            .map(|(speaker, text)| format!("Speaker {}: {}", speaker, text))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+/// Transcribe a single audio chunk via the API (one attempt).
 async fn transcribe_single_chunk(
     client: &Client,
     audio_path: &Path,
-    api_key: &str,
+    target: &ApiTranscriptionTarget,
 ) -> Result<String, ChunkError> {
     let fatal = |error: anyhow::Error| ChunkError { retryable: false, error };
     let transient = |error: anyhow::Error| ChunkError { retryable: true, error };
@@ -358,15 +440,25 @@ async fn transcribe_single_chunk(
         .context("Failed to create multipart form data")
         .map_err(fatal)?;
 
-    let form = Form::new().part("file", part).text("model", "whisper-1");
+    let mut form = Form::new()
+        .part("file", part)
+        .text("model", target.model.clone());
+    if target.diarizes() {
+        form = form
+            .text("response_format", "diarized_json")
+            .text("chunking_strategy", "auto");
+    } else {
+        form = form.text("response_format", "json");
+    }
 
+    let host = target.host_display();
     let response = client
-        .post("https://api.openai.com/v1/audio/transcriptions")
-        .header("Authorization", format!("Bearer {}", api_key))
+        .post(target.transcriptions_url())
+        .header("Authorization", format!("Bearer {}", target.api_key))
         .multipart(form)
         .send()
         .await
-        .context("Failed to send transcription request to OpenAI")
+        .with_context(|| format!("Failed to send transcription request to {host}"))
         .map_err(transient)?;
 
     let status = response.status();
@@ -376,7 +468,8 @@ async fn transcribe_single_chunk(
             .await
             .unwrap_or_else(|_| "Unknown error".to_string());
         let error = anyhow::anyhow!(
-            "OpenAI API request failed with status {}: {}",
+            "{} transcription request failed with status {}: {}",
+            host,
             status,
             error_text.trim()
         );
@@ -389,27 +482,31 @@ async fn transcribe_single_chunk(
     let response_json: Value = response
         .json()
         .await
-        .context("Failed to parse OpenAI response as JSON")
+        .with_context(|| format!("Failed to parse {host} response as JSON"))
         .map_err(transient)?;
 
-    response_json
-        .get("text")
-        .and_then(|t| t.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| fatal(anyhow::anyhow!("No 'text' field found in OpenAI response")))
+    let text = if target.diarizes() {
+        render_diarized(&response_json)
+    } else {
+        response_json
+            .get("text")
+            .and_then(|t| t.as_str())
+            .map(|s| s.to_string())
+    };
+    text.ok_or_else(|| fatal(anyhow::anyhow!("No transcript text found in {host} response")))
 }
 
 /// Transcribe one chunk with exponential backoff on transient failures.
 async fn transcribe_chunk_with_retry(
     client: &Client,
     audio_path: &Path,
-    api_key: &str,
+    target: &ApiTranscriptionTarget,
     index: usize,
     total: usize,
 ) -> Result<String> {
     let mut attempt = 1;
     loop {
-        match transcribe_single_chunk(client, audio_path, api_key).await {
+        match transcribe_single_chunk(client, audio_path, target).await {
             Ok(text) => return Ok(text),
             Err(ChunkError { retryable: true, .. }) if attempt < API_MAX_ATTEMPTS => {
                 sleep(Duration::from_secs(2u64.pow(attempt))).await;
@@ -809,7 +906,7 @@ fn run_sherpa_transcription(model: LocalModel, model_dir: &Path, wav_path: &Path
     Ok(all_text)
 }
 
-async fn transcribe_with_openai_api(audio_path: &PathBuf, api_key: &str) -> Result<String> {
+async fn transcribe_with_api(audio_path: &PathBuf, target: ApiTranscriptionTarget) -> Result<String> {
     let file_size = std::fs::metadata(audio_path)
         .context("Failed to read audio file metadata")?
         .len();
@@ -819,7 +916,7 @@ async fn transcribe_with_openai_api(audio_path: &PathBuf, api_key: &str) -> Resu
     let client = api_client()?;
 
     if num_chunks <= 1 {
-        return transcribe_chunk_with_retry(&client, audio_path, api_key, 0, 1).await;
+        return transcribe_chunk_with_retry(&client, audio_path, &target, 0, 1).await;
     }
 
     // Long or large file: split, transcribe chunks concurrently (bounded by a
@@ -827,17 +924,17 @@ async fn transcribe_with_openai_api(audio_path: &PathBuf, api_key: &str) -> Resu
     let chunk_paths = split_audio_into_chunks(audio_path, duration_secs, num_chunks)?;
     let tmp_dir = chunk_paths.first().and_then(|p| p.parent()).map(Path::to_path_buf);
 
-    let api_key: Arc<str> = Arc::from(api_key);
+    let target = Arc::new(target);
     let semaphore = Arc::new(tokio::sync::Semaphore::new(API_CHUNK_CONCURRENCY));
     let mut tasks = tokio::task::JoinSet::new();
     for (i, chunk_path) in chunk_paths.iter().cloned().enumerate() {
         let client = client.clone();
-        let api_key = api_key.clone();
+        let target = target.clone();
         let semaphore = semaphore.clone();
         tasks.spawn(async move {
             let _permit = semaphore.acquire_owned().await;
             let text =
-                transcribe_chunk_with_retry(&client, &chunk_path, &api_key, i, num_chunks).await;
+                transcribe_chunk_with_retry(&client, &chunk_path, &target, i, num_chunks).await;
             (i, text)
         });
     }
@@ -885,6 +982,9 @@ pub async fn transcribe_audio(
     let audio_file_path = FileManager::resolve_audio_path(input_path)?;
     let config = ScribaConfig::load()?;
     let transcription_mode = mode_override.unwrap_or_else(|| config.transcription.clone());
+    // Endpoint/model/key resolution reads from a config carrying the effective mode.
+    let mut api_config = config.clone();
+    api_config.transcription = transcription_mode.clone();
 
     let progress = TranscriptionProgress::new();
 
@@ -897,7 +997,11 @@ pub async fn transcribe_audio(
                 )
             }
             TranscriptionMode::Api { .. } => {
-                "Transcribing using OpenAI Whisper API...".to_string()
+                format!(
+                    "Transcribing using {} ({})...",
+                    api_config.transcription_host_display(),
+                    api_config.transcription_model()
+                )
             }
         };
         println!("\n{}\n", mode_description);
@@ -952,14 +1056,17 @@ pub async fn transcribe_audio(
             let model_name = format!("sherpa-{}", model);
             (text, model_name)
         }
-        TranscriptionMode::Api { api_key } => {
+        TranscriptionMode::Api { .. } => {
+            let target = ApiTranscriptionTarget::from_config(&api_config)?;
+            let host = target.host_display();
+            let model_used = target.model.clone();
             let progress_task = if verbose {
                 let mut api_progress = progress;
                 Some(tokio::spawn(async move {
                     loop {
                         let message = match api_progress.start_time.elapsed().as_secs() {
                             0..=3 => Some("Uploading audio file"),
-                            4..=15 => Some("OpenAI is processing your audio"),
+                            4..=15 => Some("The speech API is processing your audio"),
                             16..=30 => Some("Converting speech to text"),
                             31..=60 => Some("Transcribing (large files are split into chunks)"),
                             _ => Some("Still transcribing, hang tight"),
@@ -971,13 +1078,13 @@ pub async fn transcribe_audio(
                 None
             };
 
-            let result = transcribe_with_openai_api(&audio_file_path, &api_key)
+            let result = transcribe_with_api(&audio_file_path, target)
                 .await
-                .context("OpenAI API transcription failed")?;
+                .with_context(|| format!("{host} transcription failed"))?;
             if let Some(task) = progress_task {
                 task.abort();
             }
-            (result, "whisper-1".to_string())
+            (result, model_used)
         }
     };
 
@@ -1043,5 +1150,39 @@ mod api_chunking_tests {
         assert!(!is_retryable_status(StatusCode::BAD_REQUEST));
         assert!(!is_retryable_status(StatusCode::UNAUTHORIZED));
         assert!(!is_retryable_status(StatusCode::PAYLOAD_TOO_LARGE));
+    }
+
+    #[test]
+    fn diarized_segments_render_as_speaker_lines() {
+        let body = serde_json::json!({
+            "text": "hello there general kenobi",
+            "segments": [
+                {"speaker": "A", "text": "hello ", "start": 0.0, "end": 1.0},
+                {"speaker": "A", "text": "there", "start": 1.0, "end": 1.5},
+                {"speaker": "B", "text": "general kenobi", "start": 1.6, "end": 3.0},
+                {"speaker": "B", "text": "   ", "start": 3.0, "end": 3.1}
+            ]
+        });
+        assert_eq!(
+            render_diarized(&body).unwrap(),
+            "Speaker A: hello there\nSpeaker B: general kenobi"
+        );
+        let plain = serde_json::json!({"text": "fallback"});
+        assert_eq!(render_diarized(&plain).unwrap(), "fallback");
+        assert!(render_diarized(&serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn api_target_builds_urls_and_detects_diarization() {
+        let t = ApiTranscriptionTarget {
+            base_url: "https://api.groq.com/openai/v1/".into(),
+            api_key: "k".into(),
+            model: "whisper-large-v3-turbo".into(),
+        };
+        assert_eq!(t.transcriptions_url(), "https://api.groq.com/openai/v1/audio/transcriptions");
+        assert!(!t.diarizes());
+        assert_eq!(t.host_display(), "Groq");
+        let d = ApiTranscriptionTarget { model: "gpt-4o-transcribe-diarize".into(), ..t.clone() };
+        assert!(d.diarizes());
     }
 }

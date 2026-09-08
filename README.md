@@ -83,6 +83,14 @@ scriba config set-provider custom --base-url http://localhost:8000/v1   # vLLM, 
 
 The Settings screen lists the models the endpoint advertises, so you can switch without looking up IDs.
 
+Cloud transcription is OpenAI-compatible too. OpenAI is the default; Groq and DeepInfra are one flag away, and any host with an `/audio/transcriptions` endpoint works:
+
+```bash
+scriba config set-api <your-key> --preset groq                       # whisper-large-v3-turbo on Groq
+scriba config set-api <your-key> --model gpt-4o-transcribe-diarize   # OpenAI, with speaker labels
+scriba config set-api <your-key> --base-url http://stt.local:8000/v1 --model whisper-1
+```
+
 ## Meeting detection
 
 Scriba notices when a meeting starts — Zoom, Meet, Teams, or any app that opens your microphone — and offers to record it. No audio is analyzed for this: it watches which process holds the mic, so talking at your desk never triggers it.

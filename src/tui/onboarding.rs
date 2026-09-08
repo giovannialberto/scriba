@@ -1,6 +1,6 @@
 use crate::core::{
     CloudProvider, EnrichmentMode, LocalModel,
-    TranscriptionMode, initialize_world_from_seed, DEFAULT_COMPATIBLE_BASE_URL, DEFAULT_OLLAMA_ENDPOINT, DEFAULT_OLLAMA_MODEL};
+    TranscriptionMode, initialize_world_from_seed, DEFAULT_COMPATIBLE_BASE_URL, DEFAULT_OLLAMA_ENDPOINT, DEFAULT_OLLAMA_MODEL, DEFAULT_TRANSCRIPTION_BASE_URL};
 use crate::database::Database;
 use crate::enrichment::{OllamaClient, WorldContext, WorldData, WorldEntityExtractionResult};
 use anyhow::Result;
@@ -670,7 +670,9 @@ impl Dashboard {
                             ob.step = OnboardingStep::WhisperApiKey;
                             ob.anim_frame = 0;
                             ob.set_step_text(
-                                "Cloud transcription uses the OpenAI Whisper API.\n\n\
+                                "Cloud transcription uses OpenAI's speech API by default.\n\
+                                 Groq, DeepInfra or any OpenAI-compatible host can be\n\
+                                 set later in Settings.\n\n\
                                  Enter your OpenAI API key for transcription:",
                                 false,
                             );
@@ -697,7 +699,7 @@ impl Dashboard {
                                     .timeout(std::time::Duration::from_secs(10))
                                     .build()?;
                                 let resp = client
-                                    .get("https://api.openai.com/v1/models")
+                                    .get(format!("{}/models", DEFAULT_TRANSCRIPTION_BASE_URL))
                                     .bearer_auth(&key_clone)
                                     .send()
                                     .await?;
