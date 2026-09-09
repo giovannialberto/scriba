@@ -110,10 +110,11 @@ pub(super) enum Card {
 fn settings_rows(config: &ScribaConfig) -> Vec<Row> {
     let mut rows = vec![Row::Setup, Row::SpeechProvider, Row::SpeechModel];
     match speech_provider(config) {
-        SpeechProvider::Local => rows.extend([Row::Speakers, Row::Voice]),
+        SpeechProvider::Local => {}
         SpeechProvider::Custom => rows.extend([Row::SpeechEndpoint, Row::SpeechKey]),
         _ => rows.push(Row::SpeechKey),
     }
+    rows.extend([Row::Speakers, Row::Voice]);
     rows.extend([Row::AssistantProvider, Row::AssistantModel]);
     match assistant_provider(config) {
         AssistantProvider::Ollama => rows.push(Row::AssistantServer),
@@ -1849,7 +1850,9 @@ impl Dashboard {
             }
             Row::Speakers => {
                 let detail = if config.diarization.enabled {
-                    if crate::core::diarization::models_downloaded() {
+                    if speech_provider(config) != SpeechProvider::Local {
+                        "who said what \u{00B7} local transcription only, for now"
+                    } else if crate::core::diarization::models_downloaded() {
                         "who said what \u{00B7} models installed \u{2713}"
                     } else {
                         "who said what \u{00B7} 40 MB download on first use"

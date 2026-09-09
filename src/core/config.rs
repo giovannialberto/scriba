@@ -220,6 +220,10 @@ pub struct ScribaConfig {
     /// Speaker diarization settings.
     #[serde(default)]
     pub diarization: DiarizationConfig,
+    /// Whether the one-time "learn your voice" introduction was shown to a
+    /// user who set up Scriba before voice profiles existed.
+    #[serde(default)]
+    pub voice_intro_seen: bool,
     /// Voice-activated recording settings (reserved for future use).
     #[serde(default, skip_serializing)]
     pub voice: VoiceConfig,
@@ -1061,6 +1065,7 @@ impl Default for ScribaConfig {
             silence_auto_stop: SilenceAutoStopConfig::default(),
             meeting_detection: MeetingDetectionConfig::default(),
             diarization: DiarizationConfig::default(),
+            voice_intro_seen: false,
             voice: VoiceConfig::default(),
             last_local_model: None,
             last_cloud_provider: None,
