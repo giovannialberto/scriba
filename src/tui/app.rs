@@ -549,6 +549,11 @@ impl Dashboard {
                 self.on_key_probe(card, result);
             }
 
+            // Voice enrollment running from Settings
+            if let SettingsEdit::Voice(v) = &mut self.settings_edit {
+                v.tick();
+            }
+
             // Handle chat-triggered recording
             if self.pending_record_from_chat {
                 self.pending_record_from_chat = false;

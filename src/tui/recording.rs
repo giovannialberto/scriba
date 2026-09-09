@@ -263,6 +263,7 @@ impl Dashboard {
                     silence_timeout,
                     input_device,
                     loopback_device,
+                    register_in_db: true,
                 },
             )
             .await

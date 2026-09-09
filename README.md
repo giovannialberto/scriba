@@ -21,7 +21,7 @@ Run entirely **offline** with local STT models (Parakeet, Whisper, SenseVoice) +
 ## How it works
 
 1. **Record** — capture your microphone or system audio
-2. **Transcribe** — local STT models (Parakeet, Whisper, SenseVoice) or a cloud speech API, with speaker labels (who said what) on local transcriptions
+2. **Transcribe** — local STT models (Parakeet, Whisper, SenseVoice) or a cloud speech API, with speaker labels (who said what) on local transcriptions. Scriba learns your voice during onboarding (or `scriba voice enroll <clip>`) and keeps learning it from your meetings, so it can name you in the transcript
 3. **Enrich** — an LLM extracts summaries, topics, entities, and action items from every recording
 4. **Ask** — an agent reasons across your entire history to answer questions, find connections, and take action
 

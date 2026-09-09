@@ -36,6 +36,19 @@ pub const OWNER_ENERGY_RATIO: f32 = 2.0;
 const SILENCE_RMS: f32 = 1e-4;
 /// Left/right correlation above which a "stereo" file is really a mono mix.
 const IDENTICAL_TRACKS_CORRELATION: f32 = 0.98;
+/// Cosine similarity above which a cluster is recognized as a known voice.
+pub const PROFILE_MATCH_THRESHOLD: f32 = 0.62;
+/// Owner voice samples harvested per meeting from the mic track.
+pub const OWNER_SAMPLES_PER_RECORDING: usize = 8;
+/// Newest owner samples kept in the database.
+pub const OWNER_SAMPLES_KEPT: usize = 80;
+/// Minimum length of a segment used as a voice sample.
+pub const MIN_SAMPLE_SECS: f32 = 2.0;
+/// Enrollment clips are cut into windows of this length before embedding.
+pub const ENROLLMENT_WINDOW_SECS: f32 = 3.0;
+/// Enrollment windows quieter than this RMS are skipped (silence, breaths).
+const ENROLLMENT_MIN_RMS: f32 = 0.01;
+
 /// A cluster with less speech than this (or than `MIN_CLUSTER_SHARE` of all
 /// speech, whichever is smaller) is absorbed into its most similar neighbour:
 /// it is far more likely a bad embedding than a real participant.
@@ -87,6 +100,29 @@ pub struct LabelledSegment {
     pub text: String,
 }
 
+/// A voice Scriba already knows, ready for matching.
+#[derive(Debug, Clone)]
+pub struct KnownSpeaker {
+    /// Label to use in transcripts (owner's name or entity name).
+    pub name: String,
+    pub is_owner: bool,
+    /// L2-normalized centroid embedding.
+    pub centroid: Vec<f32>,
+}
+
+impl KnownSpeaker {
+    pub fn similarity(&self, embedding: &[f32]) -> f32 {
+        cosine(&self.centroid, embedding)
+    }
+}
+
+/// A voice sample worth remembering: embedding plus how much speech backed it.
+#[derive(Debug, Clone)]
+pub struct VoiceSample {
+    pub embedding: Vec<f32>,
+    pub duration_secs: f32,
+}
+
 /// Result of diarizing a transcript.
 #[derive(Debug, Clone)]
 pub struct Diarized {
@@ -95,6 +131,8 @@ pub struct Diarized {
     pub segments: Vec<LabelledSegment>,
     /// Distinct speaker labels in order of first appearance.
     pub speakers: Vec<String>,
+    /// Owner voice samples taken from the mic track (two-track recordings only).
+    pub owner_samples: Vec<VoiceSample>,
 }
 
 /// Tunables, taken from `DiarizationConfig`.
@@ -458,22 +496,135 @@ pub fn speaker_names(segments: &[LabelledSegment]) -> Vec<String> {
     names
 }
 
+/// Recognize clusters: for each cluster id, the best-matching known speaker
+/// above `PROFILE_MATCH_THRESHOLD`, by centroid similarity.
+pub fn match_clusters(
+    assignment: &[Option<usize>],
+    embeddings: &[Option<Vec<f32>>],
+    known: &[KnownSpeaker],
+) -> std::collections::HashMap<usize, String> {
+    let mut matched = std::collections::HashMap::new();
+    if known.is_empty() {
+        return matched;
+    }
+    let mut ids: Vec<usize> = assignment.iter().flatten().copied().collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let dim = embeddings.iter().flatten().next().map(|e| e.len()).unwrap_or(0);
+    for id in ids {
+        let mut sum = vec![0f32; dim];
+        let mut n = 0;
+        for (i, a) in assignment.iter().enumerate() {
+            if *a == Some(id)
+                && let Some(e) = &embeddings[i]
+            {
+                for (acc, v) in sum.iter_mut().zip(e) {
+                    *acc += v;
+                }
+                n += 1;
+            }
+        }
+        if n == 0 {
+            continue;
+        }
+        let norm = sum.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
+        sum.iter_mut().for_each(|x| *x /= norm);
+        if let Some((best, sim)) = known
+            .iter()
+            .map(|k| (k, k.similarity(&sum)))
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            && sim >= PROFILE_MATCH_THRESHOLD
+        {
+            matched.insert(id, best.name.clone());
+        }
+    }
+    matched
+}
+
+/// Owner voice samples from a two-track recording: the longest owner segments
+/// on the mic track, embedded separately.
+pub fn owner_samples(
+    embedder: &SpeakerEmbedder,
+    left: &[f32],
+    rate: u32,
+    transcript: &[TranscriptSegment],
+    owner: &[bool],
+) -> Vec<VoiceSample> {
+    let mut candidates: Vec<&TranscriptSegment> = transcript
+        .iter()
+        .zip(owner)
+        .filter(|(t, is_owner)| **is_owner && t.end - t.start >= MIN_SAMPLE_SECS)
+        .map(|(t, _)| t)
+        .collect();
+    candidates.sort_by(|a, b| (b.end - b.start).total_cmp(&(a.end - a.start)));
+    candidates
+        .into_iter()
+        .take(OWNER_SAMPLES_PER_RECORDING)
+        .filter_map(|t| {
+            embedder
+                .embed(window(left, t.start, t.end, rate), rate)
+                .map(|embedding| VoiceSample { embedding, duration_secs: t.end - t.start })
+        })
+        .collect()
+}
+
+/// Cut a clip into fixed windows and keep the ones with speech in them.
+pub fn enrollment_windows(samples: &[f32], rate: u32) -> Vec<(usize, usize)> {
+    let win = (ENROLLMENT_WINDOW_SECS * rate as f32) as usize;
+    if win == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start + win / 2 <= samples.len() {
+        let end = (start + win).min(samples.len());
+        if rms(&samples[start..end]) >= ENROLLMENT_MIN_RMS {
+            out.push((start, end));
+        }
+        start += win;
+    }
+    out
+}
+
+/// Embed an enrollment clip (16 kHz mono WAV) into voice samples.
+pub fn embed_enrollment_clip(wav_16k: &Path, models: &DiarizationModels) -> Result<Vec<VoiceSample>> {
+    let (channels, rate) = read_wav_channels(wav_16k)?;
+    let mono = channels.first().ok_or_else(|| anyhow::anyhow!("Empty enrollment clip"))?;
+    let embedder = SpeakerEmbedder::load(models)?;
+    Ok(enrollment_windows(mono, rate)
+        .into_iter()
+        .filter_map(|(a, b)| {
+            embedder.embed(&mono[a..b], rate).map(|embedding| VoiceSample {
+                embedding,
+                duration_secs: (b - a) as f32 / rate as f32,
+            })
+        })
+        .collect())
+}
+
 /// Map cluster ids to "Speaker N" labels numbered by first appearance,
 /// starting at `first_number`.
-fn cluster_labels(assignment: &[Option<usize>], first_number: usize) -> Vec<String> {
+fn cluster_labels(
+    assignment: &[Option<usize>],
+    first_number: usize,
+    recognized: &std::collections::HashMap<usize, String>,
+) -> Vec<String> {
+    // Only unrecognized clusters consume "Speaker N" numbers.
     let mut order: Vec<usize> = Vec::new();
     for a in assignment.iter().flatten() {
-        if !order.contains(a) {
+        if !recognized.contains_key(a) && !order.contains(a) {
             order.push(*a);
         }
     }
     assignment
         .iter()
         .map(|a| match a {
-            Some(c) => format!(
-                "Speaker {}",
-                first_number + order.iter().position(|o| o == c).unwrap_or(0)
-            ),
+            Some(c) => recognized.get(c).cloned().unwrap_or_else(|| {
+                format!(
+                    "Speaker {}",
+                    first_number + order.iter().position(|o| o == c).unwrap_or(0)
+                )
+            }),
             None => "Speaker ?".to_string(),
         })
         .collect()
@@ -491,10 +642,12 @@ pub fn label_single_track(
     transcript: &[TranscriptSegment],
     embeddings: &[Option<Vec<f32>>],
     options: DiarizationOptions,
+    known: &[KnownSpeaker],
 ) -> Vec<LabelledSegment> {
     let mut assignment = cluster_speakers(embeddings, &durations(transcript), options);
+    let recognized = match_clusters(&assignment, embeddings, known);
     fill_gaps_by_neighbour(&mut assignment);
-    let labels = cluster_labels(&assignment, 1);
+    let labels = cluster_labels(&assignment, 1, &recognized);
     transcript
         .iter()
         .zip(labels)
@@ -515,6 +668,7 @@ pub fn label_two_track(
     other_embeddings: &[Option<Vec<f32>>],
     options: DiarizationOptions,
     owner_name: &str,
+    known: &[KnownSpeaker],
 ) -> Vec<LabelledSegment> {
     // Owner segments do not take part in clustering the others.
     let masked: Vec<Option<Vec<f32>>> = other_embeddings
@@ -523,7 +677,9 @@ pub fn label_two_track(
         .map(|(e, is_owner)| if *is_owner { None } else { e.clone() })
         .collect();
     let mut assignment = cluster_speakers(&masked, &durations(transcript), options);
-    // Gaps are filled among the non-owner segments only.
+    // Other participants may be voices we already know (never the owner here).
+    let others_known: Vec<KnownSpeaker> = known.iter().filter(|k| !k.is_owner).cloned().collect();
+    let recognized = match_clusters(&assignment, &masked, &others_known);
     let mut others_only: Vec<Option<usize>> = assignment
         .iter()
         .zip(owner)
@@ -542,6 +698,7 @@ pub fn label_two_track(
             .map(|(a, is_owner)| if *is_owner { None } else { *a })
             .collect::<Vec<_>>(),
         2,
+        &recognized,
     );
     transcript
         .iter()
@@ -563,6 +720,7 @@ pub fn label_two_track(
 ///
 /// `mono_16k` is the downmixed WAV the transcriber used; `stereo_16k` is the
 /// same audio with both tracks kept, present only for two-track recordings.
+/// `known` voices are recognized by centroid similarity.
 pub fn diarize_transcript(
     transcript: &[TranscriptSegment],
     mono_16k: &Path,
@@ -570,8 +728,10 @@ pub fn diarize_transcript(
     models: &DiarizationModels,
     options: DiarizationOptions,
     owner_name: &str,
+    known: &[KnownSpeaker],
 ) -> Result<Diarized> {
     let embedder = SpeakerEmbedder::load(models)?;
+    let mut owner_voice: Vec<VoiceSample> = Vec::new();
     let segments = match stereo_16k {
         Some(stereo) => {
             let (channels, rate) = read_wav_channels(stereo)?;
@@ -583,23 +743,25 @@ pub fn diarize_transcript(
                 // Plain stereo mix: nothing to learn from the channel split.
                 let (mono, rate) = read_wav_channels(mono_16k)?;
                 let embeddings = embedder.embed_segments(&mono[0], rate, transcript);
-                label_single_track(transcript, &embeddings, options)
+                label_single_track(transcript, &embeddings, options, known)
             } else {
                 let owner = owner_mask(left, right, rate, transcript, OWNER_ENERGY_RATIO);
                 let embeddings = embedder.embed_segments(right, rate, transcript);
-                label_two_track(transcript, &owner, &embeddings, options, owner_name)
+                owner_voice = owner_samples(&embedder, left, rate, transcript, &owner);
+                label_two_track(transcript, &owner, &embeddings, options, owner_name, known)
             }
         }
         None => {
             let (mono, rate) = read_wav_channels(mono_16k)?;
             let embeddings = embedder.embed_segments(&mono[0], rate, transcript);
-            label_single_track(transcript, &embeddings, options)
+            label_single_track(transcript, &embeddings, options, known)
         }
     };
     Ok(Diarized {
         text: render_transcript(&segments),
         speakers: speaker_names(&segments),
         segments,
+        owner_samples: owner_voice,
     })
 }
 
@@ -682,7 +844,7 @@ mod tests {
             t(100.0, 150.0, "again"),
         ];
         let embeddings = vec![unit(&[1.0, 0.0]), unit(&[0.0, 1.0]), unit(&[1.0, 0.0])];
-        let labelled = label_single_track(&transcript, &embeddings, DiarizationOptions::default());
+        let labelled = label_single_track(&transcript, &embeddings, DiarizationOptions::default(), &[]);
         let names: Vec<&str> = labelled.iter().map(|l| l.speaker.as_str()).collect();
         assert_eq!(names, vec!["Speaker 1", "Speaker 2", "Speaker 1"]);
         assert_eq!(
@@ -703,13 +865,7 @@ mod tests {
         ];
         let owner = vec![true, false, false, true, false];
         let embeddings = vec![None, unit(&[1.0, 0.0]), unit(&[0.0, 1.0]), None, None];
-        let labelled = label_two_track(
-            &transcript,
-            &owner,
-            &embeddings,
-            DiarizationOptions::default(),
-            "Giovanni",
-        );
+        let labelled = label_two_track(&transcript, &owner, &embeddings, DiarizationOptions::default(), "Giovanni", &[]);
         let names: Vec<&str> = labelled.iter().map(|l| l.speaker.as_str()).collect();
         assert_eq!(
             names,
@@ -725,6 +881,28 @@ mod tests {
             render_transcript(&labelled),
             "Giovanni: I think\nSpeaker 2: yes\nSpeaker 3: no\nGiovanni: ok\nSpeaker 3: mm"
         );
+    }
+
+    #[test]
+    fn known_voices_are_recognized_and_do_not_consume_numbers() {
+        let transcript = vec![t(0.0, 50.0, "a"), t(50.0, 100.0, "b"), t(100.0, 150.0, "c")];
+        let embeddings = vec![unit(&[1.0, 0.0, 0.0]), unit(&[0.0, 1.0, 0.0]), unit(&[0.0, 0.0, 1.0])];
+        let known = vec![KnownSpeaker { name: "Giovanni".into(), is_owner: true, centroid: unit(&[0.95, 0.05, 0.0]).unwrap() }];
+        let labelled = label_single_track(&transcript, &embeddings, DiarizationOptions::default(), &known);
+        let names: Vec<&str> = labelled.iter().map(|l| l.speaker.as_str()).collect();
+        assert_eq!(names, vec!["Giovanni", "Speaker 1", "Speaker 2"]);
+        let stranger = vec![KnownSpeaker { name: "Nobody".into(), is_owner: false, centroid: unit(&[1.0, 1.0, 1.0]).unwrap() }]; // 0.58 to every axis, below the threshold
+        let labelled = label_single_track(&transcript, &embeddings, DiarizationOptions::default(), &stranger);
+        assert!(labelled.iter().all(|l| l.speaker.starts_with("Speaker")));
+    }
+
+    #[test]
+    fn enrollment_windows_skip_silence() {
+        let rate = 100;
+        let mut clip = vec![0.2f32; 300];
+        clip.extend(vec![0.0f32; 300]);
+        clip.extend(vec![0.2f32; 200]);
+        assert_eq!(enrollment_windows(&clip, rate), vec![(0, 300), (600, 800)]);
     }
 
     #[test]

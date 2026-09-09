@@ -147,6 +147,20 @@ fn save_transcript_to_files_and_db(
                 if let Ok(speakers) = serde_json::to_string(&d.speakers) {
                     let _ = db.update_recording_speakers(recording_id, &speakers);
                 }
+                // Every meeting teaches Scriba a little more about the owner's voice.
+                for sample in &d.owner_samples {
+                    let _ = db.add_speaker_sample(
+                        "owner",
+                        true,
+                        &sample.embedding,
+                        sample.duration_secs,
+                        "mic-track",
+                        Some(recording_id),
+                    );
+                }
+                if !d.owner_samples.is_empty() {
+                    let _ = db.prune_speaker_samples("owner", diarization::OWNER_SAMPLES_KEPT);
+                }
             }
         }
     }
@@ -985,12 +999,13 @@ async fn diarize_local_transcript(
     let channels = get_audio_channels(audio_file_path).unwrap_or(1);
     let stereo = if channels >= 2 { Some(ensure_stereo_16k_wav(audio_file_path)?) } else { None };
     let owner = owner_label();
+    let known = known_speakers(&owner);
     let options = diarization::DiarizationOptions {
         similarity_threshold: diarization::DEFAULT_SIMILARITY_THRESHOLD,
         max_speakers: config.diarization.max_speakers.max(1) as usize,
     };
     let started = Instant::now();
-    let result = diarization::diarize_transcript(segments, wav_path, stereo.as_deref(), &models, options, &owner);
+    let result = diarization::diarize_transcript(segments, wav_path, stereo.as_deref(), &models, options, &owner, &known);
     if let Some(p) = stereo {
         let _ = std::fs::remove_file(p);
     }
@@ -1003,6 +1018,28 @@ async fn diarize_local_transcript(
         );
     }
     Ok(diarized)
+}
+
+/// Voices Scriba already knows, labelled with their current display names.
+fn known_speakers(owner_name: &str) -> Vec<diarization::KnownSpeaker> {
+    Database::new()
+        .and_then(|db| db.speaker_profiles())
+        .map(|profiles| {
+            profiles
+                .into_iter()
+                .map(|p| diarization::KnownSpeaker {
+                    name: if p.is_owner { owner_name.to_string() } else { p.speaker.clone() },
+                    is_owner: p.is_owner,
+                    centroid: p.centroid,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Owner's name for speaker labels, from the world; "You" until known.
+pub fn owner_display_name() -> String {
+    owner_label()
 }
 
 async fn ensure_diarization_models_with_timeout() -> Result<diarization::DiarizationModels> {

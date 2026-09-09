@@ -42,6 +42,8 @@ pub(super) enum OnboardingStep {
     // Shared
     AskName,
     AskRole,
+    /// Owner voice enrollment (optional).
+    VoiceEnrollment,
     Processing,
     Confirmation,
     Done,
@@ -155,6 +157,7 @@ pub(super) struct OnboardingState {
     pub(super) download_task: Option<tokio::task::JoinHandle<()>>,
     pub(super) download_rx: Option<mpsc::UnboundedReceiver<DownloadProgress>>,
     pub(super) download_items: Vec<(String, DownloadStatus)>,
+    pub(super) voice: Option<super::voice::VoiceEnrollment>,
 }
 
 impl OnboardingState {
@@ -205,6 +208,7 @@ impl OnboardingState {
             download_task: None,
             download_rx: None,
             download_items: Vec::new(),
+            voice: None,
         }
     }
 
@@ -299,6 +303,11 @@ impl OnboardingState {
             | OnboardingStep::ProviderSelection | OnboardingStep::EndpointEntry
             | OnboardingStep::ModelEntry | OnboardingStep::ApiKeyEntry => {
                 // Instant text -- no typewriter
+            }
+            OnboardingStep::VoiceEnrollment => {
+                if let Some(v) = &mut self.voice {
+                    v.tick();
+                }
             }
             OnboardingStep::ModelSetup => {
                 // Phase 3: drain download progress
@@ -1236,10 +1245,10 @@ impl Dashboard {
                     match key_code {
                         KeyCode::Enter => {
                             if !ob.user_role.trim().is_empty() {
-                                ob.step = OnboardingStep::Processing;
+                                ob.step = OnboardingStep::VoiceEnrollment;
                                 ob.anim_frame = 0;
-                                ob.set_step_text("Setting up your world...", false);
-                                self.start_onboarding_processing();
+                                ob.voice = Some(super::voice::VoiceEnrollment::new(&ob.user_name));
+                                ob.set_step_text("", false);
                             }
                         }
                         KeyCode::Char(c) => {
@@ -1250,6 +1259,19 @@ impl Dashboard {
                         }
                         _ => {}
                     }
+                }
+            }
+            OnboardingStep::VoiceEnrollment => {
+                let finished = match ob.voice.as_mut() {
+                    Some(v) => v.handle_key(key_code, &self.config) == super::voice::VoiceAction::Finished,
+                    None => true,
+                };
+                if finished {
+                    ob.voice = None;
+                    ob.step = OnboardingStep::Processing;
+                    ob.anim_frame = 0;
+                    ob.set_step_text("Setting up your world...", false);
+                    self.start_onboarding_processing();
                 }
             }
             OnboardingStep::Processing => {
@@ -1467,6 +1489,7 @@ impl Dashboard {
             OnboardingStep::SystemCheck => "Setup \u{00B7} System Check",
             OnboardingStep::ModelSetup => "Setup \u{00B7} Models",
             OnboardingStep::AskName | OnboardingStep::AskRole => "Setup \u{00B7} About You",
+            OnboardingStep::VoiceEnrollment => "Setup \u{00B7} Your voice",
             OnboardingStep::Processing => "Setup \u{00B7} Processing",
             OnboardingStep::Confirmation => "Setup \u{00B7} Confirm",
             OnboardingStep::Done => "Ready",
@@ -1842,6 +1865,10 @@ impl Dashboard {
                     lines.push(Line::from(Span::styled(format!("  {}{}", label, pad), Style::default().fg(Color::DarkGray))));
                 }
             }
+        } else if ob.step == OnboardingStep::VoiceEnrollment {
+            if let Some(v) = &ob.voice {
+                lines.extend(v.render_lines(body.width as usize));
+            }
         } else if ob.step == OnboardingStep::Confirmation {
             // Structured label/value layout
             for text_line in visible.split('\n') {
@@ -1993,7 +2020,7 @@ impl Dashboard {
                 OnboardingStep::ProviderSelection | OnboardingStep::EndpointEntry | OnboardingStep::ModelEntry => 3,
                 OnboardingStep::ApiKeyEntry | OnboardingStep::ApiKeyValidation => 4,
                 OnboardingStep::AskName => 5,
-                OnboardingStep::AskRole => 6,
+                OnboardingStep::AskRole | OnboardingStep::VoiceEnrollment => 6,
                 OnboardingStep::Processing => 7,
                 OnboardingStep::Confirmation => 8,
                 OnboardingStep::Done => 9,
@@ -2006,7 +2033,7 @@ impl Dashboard {
                 OnboardingStep::SystemCheck => 2,
                 OnboardingStep::ModelSetup => 3,
                 OnboardingStep::AskName => 4,
-                OnboardingStep::AskRole => 5,
+                OnboardingStep::AskRole | OnboardingStep::VoiceEnrollment => 5,
                 OnboardingStep::Processing => 6,
                 OnboardingStep::Confirmation => 7,
                 OnboardingStep::Done => 8,
@@ -2081,6 +2108,7 @@ impl Dashboard {
                 }
             }
             OnboardingStep::AskName | OnboardingStep::AskRole => "[Enter] Continue",
+            OnboardingStep::VoiceEnrollment => ob.voice.as_ref().map(|v| v.footer_hint()).unwrap_or("[Enter] Continue"),
             OnboardingStep::Processing => {
                 if ob.processing_task.is_some() { "" }
                 else if !ob.ollama_available { "[Enter] Continue" }

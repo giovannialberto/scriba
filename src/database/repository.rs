@@ -6,7 +6,7 @@ use dirs::home_dir;
 use rusqlite::{params, Connection, Row};
 use std::path::PathBuf;
 
-use super::models::{Entity, EntityMentionRecord, Recording, RecordingStats, Transcript};
+use super::models::{Entity, EntityMentionRecord, Recording, RecordingStats, Transcript, SpeakerProfile};
 
 /// Maps a SQLite row to a Recording struct.
 /// This eliminates the duplicate mapping code that was in 4+ places.
@@ -176,7 +176,7 @@ impl Database {
                 let schema = include_str!("../../schema.sql");
                 tx.execute_batch(schema)
                     .context("Failed to initialize database schema")?;
-                tx.execute("PRAGMA user_version = 4", [])
+                tx.execute("PRAGMA user_version = 5", [])
                     .context("Failed to set user_version")?;
                 tx.commit()
                     .context("Failed to commit schema initialization")?;
@@ -288,6 +288,40 @@ impl Database {
                     .context("Failed to set user_version")?;
                 tx.commit()
                     .context("Failed to commit v4 migration")?;
+            }
+        }
+
+        // Migration v4 → v5: voice samples for speaker recognition
+        {
+            let user_version: i64 = self
+                .conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap_or(0);
+
+            if user_version == 4 {
+                let tx = self
+                    .conn
+                    .transaction()
+                    .context("Failed to start v5 migration transaction")?;
+                tx.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS speaker_samples (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        speaker TEXT NOT NULL,
+                        is_owner INTEGER NOT NULL DEFAULT 0,
+                        embedding TEXT NOT NULL,
+                        duration_secs REAL NOT NULL DEFAULT 0,
+                        source TEXT NOT NULL,
+                        recording_id INTEGER,
+                        created_at DATETIME NOT NULL,
+                        FOREIGN KEY (recording_id) REFERENCES recordings(id) ON DELETE SET NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_speaker_samples_speaker ON speaker_samples(speaker);",
+                )
+                .context("Failed to create speaker_samples table")?;
+                tx.execute("PRAGMA user_version = 5", [])
+                    .context("Failed to set user_version")?;
+                tx.commit()
+                    .context("Failed to commit v5 migration")?;
             }
         }
 
@@ -751,6 +785,85 @@ impl Database {
                 run(&mut stmt, &params_vec)
             }
         }
+    }
+
+    // =========================================================================
+    // Speaker voice samples
+    // =========================================================================
+
+    /// Store one voice embedding for a speaker (`"owner"` for the owner).
+    pub fn add_speaker_sample(
+        &mut self,
+        speaker: &str,
+        is_owner: bool,
+        embedding: &[f32],
+        duration_secs: f32,
+        source: &str,
+        recording_id: Option<i64>,
+    ) -> Result<i64> {
+        let json = serde_json::to_string(embedding)?;
+        self.conn.execute(
+            "INSERT INTO speaker_samples (speaker, is_owner, embedding, duration_secs, source, recording_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![speaker, is_owner, json, duration_secs as f64, source, recording_id, Utc::now()],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Every speaker with stored voice samples, with a normalized centroid.
+    pub fn speaker_profiles(&self) -> Result<Vec<SpeakerProfile>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT speaker, is_owner, embedding, duration_secs FROM speaker_samples ORDER BY speaker, id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, bool>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, f64>(3)?,
+            ))
+        })?;
+        let mut profiles: Vec<SpeakerProfile> = Vec::new();
+        for row in rows {
+            let (speaker, is_owner, json, secs) = row?;
+            let embedding: Vec<f32> = match serde_json::from_str(&json) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            match profiles.iter_mut().find(|p| p.speaker == speaker) {
+                Some(p) => p.add(&embedding, secs as f32),
+                None => profiles.push(SpeakerProfile::new(speaker, is_owner, &embedding, secs as f32)),
+            }
+        }
+        for p in &mut profiles {
+            p.normalize();
+        }
+        Ok(profiles)
+    }
+
+    /// Number of samples and seconds of voice stored for a speaker.
+    pub fn speaker_sample_stats(&self, speaker: &str) -> Result<(usize, f32)> {
+        let (count, secs): (i64, f64) = self.conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(duration_secs), 0) FROM speaker_samples WHERE speaker = ?1",
+            params![speaker],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok((count as usize, secs as f32))
+    }
+
+    /// Keep only the newest `keep` samples of a speaker.
+    pub fn prune_speaker_samples(&mut self, speaker: &str, keep: usize) -> Result<usize> {
+        let deleted = self.conn.execute(
+            "DELETE FROM speaker_samples WHERE speaker = ?1 AND id NOT IN (
+                SELECT id FROM speaker_samples WHERE speaker = ?1 ORDER BY id DESC LIMIT ?2)",
+            params![speaker, keep as i64],
+        )?;
+        Ok(deleted)
+    }
+
+    /// Forget every sample of a speaker.
+    pub fn delete_speaker_samples(&mut self, speaker: &str) -> Result<usize> {
+        Ok(self.conn.execute("DELETE FROM speaker_samples WHERE speaker = ?1", params![speaker])?)
     }
 
     // =========================================================================
@@ -1370,6 +1483,29 @@ mod fts_tests {
         // Words that are not all present do not match.
         let hits = db.search_transcripts_filtered("budget unicorn", None, None, None).unwrap();
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn speaker_samples_round_trip_and_prune() {
+        let mut db = Database::open_in_memory().unwrap();
+        db.add_speaker_sample("owner", true, &[1.0, 0.0], 3.0, "enrollment", None).unwrap();
+        db.add_speaker_sample("owner", true, &[0.8, 0.6], 4.0, "mic-track", None).unwrap();
+        db.add_speaker_sample("Marco", false, &[0.0, 1.0], 2.0, "confirmed", None).unwrap();
+
+        let profiles = db.speaker_profiles().unwrap();
+        assert_eq!(profiles.len(), 2);
+        let owner = profiles.iter().find(|p| p.is_owner).unwrap();
+        assert_eq!(owner.speaker, "owner");
+        assert_eq!(owner.samples, 2);
+        let norm: f32 = owner.centroid.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-4);
+        assert!(owner.similarity(&[1.0, 0.0]) > owner.similarity(&[0.0, 1.0]));
+        assert_eq!(db.speaker_sample_stats("owner").unwrap(), (2, 7.0));
+
+        assert_eq!(db.prune_speaker_samples("owner", 1).unwrap(), 1);
+        assert_eq!(db.speaker_sample_stats("owner").unwrap().0, 1);
+        assert_eq!(db.delete_speaker_samples("Marco").unwrap(), 1);
+        assert_eq!(db.speaker_profiles().unwrap().len(), 1);
     }
 
     #[test]

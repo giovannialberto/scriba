@@ -189,6 +189,20 @@ CREATE TRIGGER transcripts_fts_update AFTER UPDATE ON transcripts BEGIN
     VALUES (new.id, new.content, new.recording_id);
 END;
 
+-- Voice samples used to recognize known speakers (embeddings only, never audio).
+CREATE TABLE IF NOT EXISTS speaker_samples (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    speaker TEXT NOT NULL,                -- 'owner' or an entity canonical name
+    is_owner INTEGER NOT NULL DEFAULT 0,
+    embedding TEXT NOT NULL,              -- JSON array of floats, L2-normalized
+    duration_secs REAL NOT NULL DEFAULT 0,
+    source TEXT NOT NULL,                 -- 'enrollment' | 'mic-track' | 'confirmed'
+    recording_id INTEGER,
+    created_at DATETIME NOT NULL,
+    FOREIGN KEY (recording_id) REFERENCES recordings(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_speaker_samples_speaker ON speaker_samples(speaker);
+
 -- Initial data (only insert if not already present)
 INSERT OR IGNORE INTO tags (name, color, created_at) VALUES
     ('meeting', '#3b82f6', datetime('now')),
