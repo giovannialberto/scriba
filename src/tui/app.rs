@@ -1,5 +1,5 @@
 use crate::core::{
-    AudioPlayer, AutopilotHandle, AutopilotOptions, EnrichmentMode, RecordingGuard,
+    AudioPlayer, AutopilotHandle, AutopilotOptions, RecordingGuard,
     RecordingKind, RecordingPhase, RecordingResult, RecordingStatus, ScribaConfig, TranscriptionMode,
     rebuild_world_from_entities, spawn_autopilot,
 };
@@ -79,7 +79,7 @@ pub struct Dashboard {
     pub(super) model_picker_items: Vec<ModelPickerItem>,
     pub(super) model_picker_selection: usize,
     pub(super) model_picker_custom_input: String,
-    pub(super) ollama_models_rx: Option<mpsc::Receiver<Result<Vec<String>, String>>>,
+    pub(super) model_list_rx: Option<mpsc::Receiver<Result<Vec<crate::llm::ModelListEntry>, String>>>,
     pub(super) editing_enrichment_endpoint: bool,     // Whether we're editing Ollama endpoint (local mode)
     pub(super) enrichment_endpoint_input: String,     // Ollama endpoint input buffer (local mode)
     pub(super) editing_enrichment_api_key: bool,      // Whether we're editing enrichment API key
@@ -211,7 +211,7 @@ impl Dashboard {
             model_picker_items: Vec::new(),
             model_picker_selection: 0,
             model_picker_custom_input: String::new(),
-            ollama_models_rx: None,
+            model_list_rx: None,
             editing_enrichment_endpoint: false,
             enrichment_endpoint_input: String::new(),
             editing_enrichment_api_key: false,
@@ -501,8 +501,8 @@ impl Dashboard {
                 }
             }
 
-            // Check for Ollama model list completion
-            if let Some(ref mut rx) = self.ollama_models_rx {
+            // Check for model list completion (Ollama or an OpenAI-compatible endpoint)
+            if let Some(ref mut rx) = self.model_list_rx {
                 if let Ok(result) = rx.try_recv() {
                     // Check if we're in onboarding ModelSetup phase 1 -- populate onboarding models
                     let in_onboarding_model_setup = self.onboarding.as_ref()
@@ -510,13 +510,13 @@ impl Dashboard {
                         .unwrap_or(false);
 
                     if in_onboarding_model_setup {
-                        let local_names: Vec<String> = match &result {
-                            Ok(names) => names.clone(),
+                        let local_entries: Vec<crate::llm::ModelListEntry> = match &result {
+                            Ok(entries) => entries.clone(),
                             Err(_) => Vec::new(),
                         };
                         if let Some(ref mut ob) = self.onboarding {
                             use super::onboarding::{RECOMMENDED_OLLAMA_MODELS, OllamaModelOption};
-                            let local_set: std::collections::HashSet<&str> = local_names.iter().map(|s| s.as_str()).collect();
+                            let local_set: std::collections::HashSet<&str> = local_entries.iter().map(|e| e.id.as_str()).collect();
                             // Build list: recommended models first, then extra local models
                             let mut options: Vec<OllamaModelOption> = RECOMMENDED_OLLAMA_MODELS.iter().map(|&(id, label, size)| {
                                 OllamaModelOption {
@@ -524,16 +524,18 @@ impl Dashboard {
                                     label: label.to_string(),
                                     size: size.to_string(),
                                     installed: local_set.contains(id),
+                                    supports_tools: Some(true),
                                 }
                             }).collect();
                             // Add locally installed models not in the recommended list
-                            for name in &local_names {
-                                if !RECOMMENDED_OLLAMA_MODELS.iter().any(|(id, _, _)| *id == name.as_str()) {
+                            for entry in &local_entries {
+                                if !RECOMMENDED_OLLAMA_MODELS.iter().any(|(id, _, _)| *id == entry.id.as_str()) {
                                     options.push(OllamaModelOption {
-                                        id: name.clone(),
-                                        label: name.clone(),
+                                        id: entry.id.clone(),
+                                        label: entry.id.clone(),
                                         size: String::new(),
                                         installed: true,
+                                        supports_tools: entry.supports_tools,
                                     });
                                 }
                             }
@@ -543,21 +545,21 @@ impl Dashboard {
                     } else {
                         let current_model = self.config.enrichment.model_name().to_string();
                         match result {
-                            Ok(names) if !names.is_empty() => {
-                                let mut items: Vec<ModelPickerItem> = names
+                            Ok(entries) if !entries.is_empty() => {
+                                let mut items: Vec<ModelPickerItem> = entries
                                     .iter()
-                                    .map(|n| ModelPickerItem {
-                                        display_name: n.clone(),
-                                        model_id: Some(n.clone()),
+                                    .map(|e| ModelPickerItem {
+                                        display_name: e.display_name(),
+                                        model_id: Some(e.id.clone()),
                                     })
                                     .collect();
                                 items.push(ModelPickerItem {
                                     display_name: "Custom...".into(),
                                     model_id: None,
                                 });
-                                let sel = names
+                                let sel = entries
                                     .iter()
-                                    .position(|n| *n == current_model)
+                                    .position(|e| e.id == current_model)
                                     .unwrap_or(items.len() - 1);
                                 self.model_picker_items = items;
                                 self.model_picker_selection = sel;
@@ -572,7 +574,7 @@ impl Dashboard {
                             }
                         }
                     }
-                    self.ollama_models_rx = None;
+                    self.model_list_rx = None;
                 }
             }
 
@@ -700,15 +702,13 @@ impl Dashboard {
                             let _ = self.config.save();
                         }
                         OnboardingTickResult::FetchOllamaModels => {
-                            let endpoint = if let EnrichmentMode::Local { ollama_endpoint, .. } = &self.config.enrichment.mode {
-                                ollama_endpoint.clone()
-                            } else {
-                                "http://localhost:11434".to_string()
-                            };
+                            let endpoint = self.config.enrichment.ollama_endpoint();
                             let (tx, rx) = mpsc::channel(1);
-                            self.ollama_models_rx = Some(rx);
+                            self.model_list_rx = Some(rx);
                             tokio::spawn(async move {
-                                let result = OllamaClient::fetch_models(&endpoint).await;
+                                let result = OllamaClient::fetch_model_infos(&endpoint)
+                                    .await
+                                    .map(|infos| infos.into_iter().map(Into::into).collect());
                                 let _ = tx.send(result.map_err(|e| e.to_string())).await;
                             });
                         }

@@ -9,6 +9,8 @@
 //! HOME=/tmp/scriba-smoke target/debug/examples/llm_smoke ollama qwen2.5:7b
 //! HOME=/tmp/scriba-smoke SMOKE_KEY=sk-... target/debug/examples/llm_smoke anthropic claude-sonnet-4-6
 //! HOME=/tmp/scriba-smoke SMOKE_KEY=...    target/debug/examples/llm_smoke google gemini-2.5-flash
+//! HOME=/tmp/scriba-smoke SMOKE_KEY=...    target/debug/examples/llm_smoke deepinfra Qwen/Qwen3.5-397B-A17B
+//! HOME=/tmp/scriba-smoke SMOKE_KEY=x SMOKE_BASE_URL=http://localhost:11434/v1 target/debug/examples/llm_smoke custom qwen2.5:7b
 //! ```
 
 use scriba::agent::loop_runner::AgentEvent;
@@ -35,6 +37,7 @@ async fn main() {
                 provider,
                 api_key: std::env::var("SMOKE_KEY").unwrap_or_default(),
                 model,
+                base_url: std::env::var("SMOKE_BASE_URL").ok(),
             }
         }
     };
@@ -45,6 +48,13 @@ async fn main() {
     match llm.health_check().await {
         Ok(()) => println!("== health: ok"),
         Err(e) => println!("== health: FAILED: {e}"),
+    }
+    if config.has_custom_endpoint() {
+        let target = scriba::llm::LlmTarget::from_config(&config);
+        match scriba::llm::list_models(&target).await {
+            Ok(names) => println!("== models: {} listed, e.g. {:?}", names.len(), names.iter().take(3).collect::<Vec<_>>()),
+            Err(e) => println!("== models: FAILED: {e}"),
+        }
     }
     match llm
         .generate("Return a JSON object with keys \"city\" (string) and \"population\" (integer) for Rome.")
@@ -75,6 +85,7 @@ async fn main() {
     while let Some(ev) = rx.recv().await {
         match ev {
             AgentEvent::Status(s) => println!("   [status] {s}"),
+            AgentEvent::Warning(w) => println!("   [warning] {w}"),
             AgentEvent::Chunk(c) => text.push_str(&c),
             AgentEvent::ToolCall {
                 name,

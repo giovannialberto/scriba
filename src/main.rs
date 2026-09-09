@@ -1,6 +1,6 @@
 use anyhow::Result;
 use scriba::core::{
-    resolve_transcription_mode, AudioFormat, AutopilotOptions, CloudProvider, CompressionSettings,
+    resolve_transcription_mode, AudioFormat, AutopilotOptions, CloudProvider, CompressionSettings, EndpointPreset, DEFAULT_OLLAMA_ENDPOINT, DEFAULT_OLLAMA_MODEL,
     EnrichmentMode, LocalModel, RecordingStatus, ScribaConfig, TranscriptionMode, WorkflowManager,
     initialize_world_from_seed, run_autopilot, watcher_excludes_self,
 };
@@ -183,7 +183,7 @@ enum Command {
         directory_name: String,
         #[structopt(
             long = "enrichment-provider",
-            help = "Override enrichment provider (anthropic|openai|google|ollama)"
+            help = "Override enrichment provider (anthropic|openai|google|ollama|custom|deepinfra|openrouter|groq|together)"
         )]
         enrichment_provider: Option<String>,
         #[structopt(
@@ -196,6 +196,11 @@ enum Command {
             help = "Override enrichment model"
         )]
         enrichment_model: Option<String>,
+        #[structopt(
+            long = "enrichment-base-url",
+            help = "Override the OpenAI-compatible base URL (with --enrichment-provider custom)"
+        )]
+        enrichment_base_url: Option<String>,
     },
     /// Manage entities (people, organizations)
     Entity {
@@ -234,10 +239,12 @@ enum ConfigCommand {
         #[structopt(help = "OpenAI API key")]
         api_key: String,
     },
-    /// Set the enrichment provider (anthropic, openai, google, ollama)
+    /// Set the enrichment provider (anthropic, openai, google, ollama, or an OpenAI-compatible host)
     SetProvider {
-        #[structopt(help = "Provider name (anthropic|openai|google|ollama)")]
+        #[structopt(help = "Provider name (anthropic|openai|google|ollama|custom|deepinfra|openrouter|groq|together)")]
         provider: String,
+        #[structopt(long = "base-url", help = "Base URL for an OpenAI-compatible endpoint (required with 'custom')")]
+        base_url: Option<String>,
     },
     /// Set the enrichment API key (for cloud providers)
     SetEnrichmentKey {
@@ -485,6 +492,9 @@ async fn main() -> Result<()> {
                             println!("\nEnrichment:");
                             println!("  Enabled: {}", config.enrichment.enabled);
                             println!("  Provider: {}", config.enrichment.provider_display_name());
+                            if let Some(url) = config.enrichment.effective_base_url() {
+                                println!("  Endpoint: {}", url);
+                            }
                             println!("  Model: {}", config.enrichment.model_name());
                             if config.enrichment.needs_api_key() {
                                 let key_status = if config.enrichment.resolve_api_key().is_some() {
@@ -534,21 +544,25 @@ async fn main() -> Result<()> {
                         println!("✅ Updated transcription mode to OpenAI API");
                         Ok(())
                     }
-                    ConfigCommand::SetProvider { provider } => {
+                    ConfigCommand::SetProvider { provider, base_url } => {
                         let mut config = ScribaConfig::load()?;
                         if provider.to_lowercase() == "ollama" {
                             config.enrichment.mode = EnrichmentMode::Local {
-                                ollama_endpoint: "http://localhost:11434".to_string(),
-                                ollama_model: "mistral:latest".to_string(),
+                                ollama_endpoint: config.enrichment.last_ollama_endpoint.clone().unwrap_or_else(|| DEFAULT_OLLAMA_ENDPOINT.to_string()),
+                                ollama_model: config.enrichment.last_ollama_model.clone().unwrap_or_else(|| DEFAULT_OLLAMA_MODEL.to_string()),
                             };
                         } else {
                             let cloud_provider: CloudProvider = provider.parse()?;
-                            let existing_key = config.enrichment.resolve_api_key().unwrap_or_default();
+                            let base_url = resolve_base_url(&provider, &cloud_provider, base_url.as_deref())?;
+                            let existing_key = config.enrichment.load_key_for_provider(&cloud_provider);
+                            let model = config.enrichment.load_model_for_provider(&cloud_provider);
                             config.enrichment.mode = EnrichmentMode::Cloud {
                                 provider: cloud_provider.clone(),
                                 api_key: existing_key,
-                                model: None,
+                                model,
+                                base_url: base_url.clone(),
                             };
+                            config.enrichment.save_base_url_for_provider(&cloud_provider, &base_url);
                         }
                         config.save()?;
                         println!("✅ Updated enrichment provider to {}", config.enrichment.provider_display_name());
@@ -562,7 +576,7 @@ async fn main() -> Result<()> {
                             }
                             EnrichmentMode::Local { .. } => {
                                 return Err(anyhow::anyhow!(
-                                    "Cannot set API key for local (Ollama) mode. Switch to a cloud provider first with: scriba config set-provider <anthropic|openai|google>"
+                                    "Cannot set API key for local (Ollama) mode. Switch to a cloud provider first with: scriba config set-provider <anthropic|openai|google|custom|deepinfra|...>"
                                 ));
                             }
                         }
@@ -626,13 +640,13 @@ async fn main() -> Result<()> {
                     )
                     .await
                 }
-                Command::Enrich { directory_name, enrichment_provider, enrichment_api_key, enrichment_model } => {
+                Command::Enrich { directory_name, enrichment_provider, enrichment_api_key, enrichment_model, enrichment_base_url } => {
                     println!("🧠 Running knowledge extraction on: {}", directory_name);
 
                     let mut workflow = if enrichment_provider.is_some() || enrichment_api_key.is_some() || enrichment_model.is_some() {
                         // Apply CLI overrides to config
                         let mut config = ScribaConfig::load()?;
-                        apply_enrichment_overrides(&mut config, enrichment_provider.as_deref(), enrichment_api_key.as_deref(), enrichment_model.as_deref())?;
+                        apply_enrichment_overrides(&mut config, enrichment_provider.as_deref(), enrichment_api_key.as_deref(), enrichment_model.as_deref(), enrichment_base_url.as_deref())?;
                         WorkflowManager::with_config(config)?
                     } else {
                         WorkflowManager::new()?
@@ -1108,31 +1122,57 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Resolve the base URL for a cloud provider chosen on the CLI: an explicit
+/// `--base-url` wins, then a preset named by the provider string, then none.
+fn resolve_base_url(
+    provider_str: &str,
+    provider: &CloudProvider,
+    explicit: Option<&str>,
+) -> Result<Option<String>> {
+    if let Some(url) = explicit.map(str::trim).filter(|u| !u.is_empty()) {
+        return Ok(Some(url.trim_end_matches('/').to_string()));
+    }
+    if let Some(preset) = EndpointPreset::by_name(provider_str) {
+        return Ok(Some(preset.base_url.to_string()));
+    }
+    if provider.uses_custom_endpoint() {
+        return Err(anyhow::anyhow!(
+            "Provider 'custom' needs --base-url <URL>, or name a known host: {}",
+            EndpointPreset::names().join(", ")
+        ));
+    }
+    Ok(None)
+}
+
 /// Apply CLI enrichment overrides to config (without persisting).
 fn apply_enrichment_overrides(
     config: &mut ScribaConfig,
     provider: Option<&str>,
     api_key: Option<&str>,
     model: Option<&str>,
+    base_url: Option<&str>,
 ) -> Result<()> {
     if let Some(provider_str) = provider {
         if provider_str.to_lowercase() == "ollama" {
             config.enrichment.mode = EnrichmentMode::Local {
-                ollama_endpoint: "http://localhost:11434".to_string(),
-                ollama_model: model.unwrap_or("mistral:latest").to_string(),
+                ollama_endpoint: config.enrichment.ollama_endpoint(),
+                ollama_model: model.map(str::to_string).unwrap_or_else(|| config.enrichment.ollama_model()),
             };
             return Ok(());
         }
 
         let cloud_provider: CloudProvider = provider_str.parse()?;
+        let base_url = resolve_base_url(provider_str, &cloud_provider, base_url)?;
         let key = api_key
             .map(|k| k.to_string())
-            .or_else(|| config.enrichment.resolve_api_key())
+            .or_else(|| Some(config.enrichment.load_key_for_provider(&cloud_provider)))
+            .filter(|k| !k.is_empty())
             .unwrap_or_default();
         config.enrichment.mode = EnrichmentMode::Cloud {
             provider: cloud_provider,
             api_key: key,
             model: model.map(|m| m.to_string()),
+            base_url,
         };
     } else {
         // No provider override, but possibly api_key or model override

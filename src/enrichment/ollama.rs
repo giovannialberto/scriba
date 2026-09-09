@@ -40,6 +40,22 @@ struct ModelInfo {
     name: String,
 }
 
+/// An installed Ollama model and whether it can call tools.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OllamaModelInfo {
+    pub name: String,
+    /// `None` when the server did not report capabilities.
+    pub supports_tools: Option<bool>,
+}
+
+/// Extract the `capabilities` array from an `/api/show` response body.
+fn parse_capabilities(body: &serde_json::Value) -> Vec<String> {
+    body.get("capabilities")
+        .and_then(|c| c.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
+}
+
 /// Structured diagnosis of Ollama readiness.
 #[derive(Debug)]
 pub enum OllamaStatus {
@@ -209,6 +225,63 @@ impl OllamaClient {
         Ok(names)
     }
 
+    /// Fetch the installed models together with whether each can call tools,
+    /// so the UI can steer users away from models the agent cannot use.
+    /// Falls back to `supports_tools: None` when `/api/show` is unavailable.
+    pub async fn fetch_model_infos(endpoint: &str) -> Result<Vec<OllamaModelInfo>, OllamaError> {
+        let names = Self::fetch_models(endpoint).await?;
+        let mut infos = Vec::with_capacity(names.len());
+        for name in names {
+            let supports_tools = Self::show_capabilities(endpoint, &name)
+                .await
+                .ok()
+                .map(|caps| caps.iter().any(|c| c == "tools"));
+            infos.push(OllamaModelInfo { name, supports_tools });
+        }
+        Ok(infos)
+    }
+
+    /// Capabilities Ollama reports for a model (`completion`, `tools`,
+    /// `thinking`, `vision`, ...), via `POST /api/show`.
+    pub async fn show_capabilities(endpoint: &str, model: &str) -> Result<Vec<String>, OllamaError> {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .map_err(|e| OllamaError::RequestFailed { message: e.to_string() })?;
+
+        let url = format!("{}/api/show", endpoint.trim_end_matches('/'));
+        let response = client
+            .post(&url)
+            .json(&serde_json::json!({ "model": model }))
+            .send()
+            .await
+            .map_err(|_| OllamaError::NotRunning { endpoint: endpoint.to_string() })?;
+
+        if response.status().as_u16() == 404 {
+            return Err(OllamaError::ModelNotFound { model: model.to_string() });
+        }
+        if !response.status().is_success() {
+            return Err(OllamaError::RequestFailed {
+                message: format!("HTTP {} from /api/show", response.status()),
+            });
+        }
+
+        let body: serde_json::Value = response.json().await.map_err(|e| OllamaError::ParseError {
+            message: e.to_string(),
+        })?;
+        Ok(parse_capabilities(&body))
+    }
+
+    /// Whether the configured model can call tools. `Ok(None)` means Ollama
+    /// did not report capabilities (older server), so nothing can be assumed.
+    pub async fn supports_tools(&self) -> Result<Option<bool>, OllamaError> {
+        let caps = Self::show_capabilities(&self.endpoint, &self.model).await?;
+        if caps.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(caps.iter().any(|c| c == "tools")))
+    }
+
     /// Get the configured model name.
     pub fn model(&self) -> &str {
         &self.model
@@ -312,6 +385,17 @@ impl From<OllamaError> for ProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capabilities_are_parsed_from_show_response() {
+        let body = serde_json::json!({
+            "capabilities": ["completion", "tools", "thinking"],
+            "model_info": {"gemma4.context_length": 262144}
+        });
+        assert_eq!(parse_capabilities(&body), vec!["completion", "tools", "thinking"]);
+        assert!(parse_capabilities(&serde_json::json!({"details": {}})).is_empty());
+        assert!(parse_capabilities(&serde_json::json!({"capabilities": "tools"})).is_empty());
+    }
 
     #[test]
     fn test_client_creation() {

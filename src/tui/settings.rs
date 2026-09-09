@@ -1,5 +1,5 @@
 use crate::core::{
-    CloudProvider, EnrichmentMode, LocalModel, TranscriptionMode,
+    CloudProvider, EnrichmentMode, LocalModel, TranscriptionMode, DEFAULT_OLLAMA_ENDPOINT, DEFAULT_OLLAMA_MODEL,
 };
 use crate::enrichment::OllamaClient;
 use anyhow::Result;
@@ -19,24 +19,35 @@ use super::chat::ACCENT;
 // ─── Settings index layout ───────────────────────────────────────────────────
 //
 // Index 0 is always the mode toggle. Mode-specific items follow (3 for Private,
-// 4 for Cloud), then 2 shared items (Recording).
+// 4 or 5 for Cloud), then the shared items (Recording, General).
 
 const IDX_MODE: usize = 0;
 /// Number of mode-specific items in Private mode (STT Model, Ollama Model, Ollama Server).
 const PRIVATE_MODE_ITEMS: usize = 3;
 /// Number of mode-specific items in Cloud mode (Whisper API Key, LLM Provider, Model, Provider API Key).
 const CLOUD_MODE_ITEMS: usize = 4;
+/// Cloud-mode index of the Endpoint row, shown only for OpenAI-compatible providers.
+const IDX_CLOUD_ENDPOINT: usize = 5;
 /// Number of shared items (Auto-Stop, Timeout, Meeting Watch, Check for Updates).
 const SHARED_ITEMS: usize = 4;
 
+/// Number of mode-specific items for the given mode.
+fn mode_items(is_private: bool, has_endpoint_row: bool) -> usize {
+    if is_private {
+        PRIVATE_MODE_ITEMS
+    } else {
+        CLOUD_MODE_ITEMS + usize::from(has_endpoint_row)
+    }
+}
+
 /// First shared-section index for a given mode.
-fn shared_offset(is_private: bool) -> usize {
-    1 + if is_private { PRIVATE_MODE_ITEMS } else { CLOUD_MODE_ITEMS }
+fn shared_offset(is_private: bool, has_endpoint_row: bool) -> usize {
+    1 + mode_items(is_private, has_endpoint_row)
 }
 
 /// Maximum selectable index for a given mode.
-fn max_index(is_private: bool) -> usize {
-    shared_offset(is_private) + SHARED_ITEMS - 1
+fn max_index(is_private: bool, has_endpoint_row: bool) -> usize {
+    shared_offset(is_private, has_endpoint_row) + SHARED_ITEMS - 1
 }
 
 // ─── Settings types ──────────────────────────────────────────────────────────
@@ -71,13 +82,34 @@ impl Dashboard {
         self.model_picker_items.clear();
         self.model_picker_selection = 0;
         self.model_picker_custom_input.clear();
-        self.ollama_models_rx = None;
+        self.model_list_rx = None;
     }
 
     pub(super) fn open_model_picker(&mut self) {
         let current_model = self.config.enrichment.model_name().to_string();
 
         match &self.config.enrichment.mode {
+            EnrichmentMode::Cloud { provider, .. } if provider.uses_custom_endpoint() => {
+                // Model catalogs differ per host: ask the endpoint itself.
+                self.model_picker_items = vec![ModelPickerItem {
+                    display_name: "Loading...".into(),
+                    model_id: None,
+                }];
+                self.model_picker_selection = 0;
+                self.model_picker_state = ModelPickerState::Open;
+
+                let target = crate::llm::LlmTarget::from_config(&self.config.enrichment);
+                let (tx, rx) = mpsc::channel(1);
+                self.model_list_rx = Some(rx);
+
+                tokio::spawn(async move {
+                    let result = crate::llm::list_models(&target)
+                        .await
+                        .map(|names| names.into_iter().map(Into::into).collect())
+                        .map_err(|e| e.to_string());
+                    let _ = tx.send(result).await;
+                });
+            }
             EnrichmentMode::Cloud { provider, .. } => {
                 let curated = provider.available_models();
                 let mut items: Vec<ModelPickerItem> = curated
@@ -113,11 +145,12 @@ impl Dashboard {
 
                 let endpoint = ollama_endpoint.clone();
                 let (tx, rx) = mpsc::channel(1);
-                self.ollama_models_rx = Some(rx);
+                self.model_list_rx = Some(rx);
 
                 tokio::spawn(async move {
-                    let result = OllamaClient::fetch_models(&endpoint)
+                    let result = OllamaClient::fetch_model_infos(&endpoint)
                         .await
+                        .map(|infos| infos.into_iter().map(Into::into).collect())
                         .map_err(|e| e.to_string());
                     let _ = tx.send(result).await;
                 });
@@ -128,8 +161,9 @@ impl Dashboard {
     pub(super) async fn handle_settings_keys(&mut self, key_code: KeyCode) -> Result<DashboardAction> {
         // Dual-mode settings layout:
         let is_private = self.config.is_private_mode();
-        let max_idx = max_index(is_private);
-        let shared_off = shared_offset(is_private);
+        let has_endpoint_row = self.config.enrichment.has_custom_endpoint();
+        let max_idx = max_index(is_private, has_endpoint_row);
+        let shared_off = shared_offset(is_private, has_endpoint_row);
 
         match key_code {
             KeyCode::Esc => {
@@ -225,9 +259,18 @@ impl Dashboard {
                 } else if self.editing_enrichment_endpoint {
                     let new_endpoint = self.enrichment_endpoint_input.trim().to_string();
                     if !new_endpoint.is_empty() {
-                        self.config.enrichment.set_ollama_endpoint(new_endpoint);
+                        if is_private {
+                            self.config.enrichment.set_ollama_endpoint(new_endpoint);
+                        } else {
+                            self.close_model_picker();
+                            self.config.enrichment.set_base_url(Some(new_endpoint));
+                            if let Some(p) = self.config.enrichment.cloud_provider().cloned() {
+                                let url = self.config.enrichment.base_url().map(str::to_string);
+                                self.config.enrichment.save_base_url_for_provider(&p, &url);
+                            }
+                        }
                         if let Err(e) = self.save_enrichment_config() {
-                            self.message = format!("Failed to save Ollama endpoint: {}", e);
+                            self.message = format!("Failed to save endpoint: {}", e);
                             self.show_message = true;
                             self.return_to_view = Some(DashboardView::Settings);
                         }
@@ -270,10 +313,12 @@ impl Dashboard {
                             let transcription_key = new_cfg.last_api_key.clone().unwrap_or_default();
                             let enrichment_key = new_cfg.enrichment.load_key_for_provider(&provider);
                             let enrichment_model = new_cfg.enrichment.load_model_for_provider(&provider);
+                            let enrichment_base_url = new_cfg.enrichment.load_base_url_for_provider(&provider);
                             new_cfg.enrichment.mode = EnrichmentMode::Cloud {
                                 provider,
                                 api_key: enrichment_key,
                                 model: enrichment_model,
+                                base_url: enrichment_base_url,
                             };
                             // set_transcription_mode preserves last_local_model_size & last_api_key, then saves
                             new_cfg.set_transcription_mode(TranscriptionMode::Api { api_key: transcription_key })?;
@@ -283,17 +328,18 @@ impl Dashboard {
                                 new_cfg.last_cloud_provider = Some(p.clone());
                                 let key = new_cfg.enrichment.api_key().unwrap_or("").to_string();
                                 new_cfg.enrichment.save_key_for_provider(&p, &key);
-                                let model = match &new_cfg.enrichment.mode {
-                                    EnrichmentMode::Cloud { model, .. } => model.clone(),
-                                    _ => None,
+                                let (model, base_url) = match &new_cfg.enrichment.mode {
+                                    EnrichmentMode::Cloud { model, base_url, .. } => (model.clone(), base_url.clone()),
+                                    _ => (None, None),
                                 };
                                 new_cfg.enrichment.save_model_for_provider(&p, &model);
+                                new_cfg.enrichment.save_base_url_for_provider(&p, &base_url);
                             }
                             let model = new_cfg.last_local_model.unwrap_or(LocalModel::ParakeetTdt);
                             let ep = new_cfg.enrichment.last_ollama_endpoint.clone()
-                                .unwrap_or_else(|| "http://localhost:11434".to_string());
+                                .unwrap_or_else(|| DEFAULT_OLLAMA_ENDPOINT.to_string());
                             let mdl = new_cfg.enrichment.last_ollama_model.clone()
-                                .unwrap_or_else(|| "mistral:latest".to_string());
+                                .unwrap_or_else(|| DEFAULT_OLLAMA_MODEL.to_string());
                             new_cfg.enrichment.mode = EnrichmentMode::Local {
                                 ollama_endpoint: ep,
                                 ollama_model: mdl,
@@ -340,27 +386,26 @@ impl Dashboard {
                                 };
                             }
                             (2, false) => {
-                                // Cycle cloud enrichment provider: Anthropic → OpenAI → Google → Anthropic
+                                // Cycle cloud enrichment provider (see CloudProvider::ALL for the order)
                                 self.close_model_picker();
-                                let (cur_provider, cur_key, cur_model) = match &self.config.enrichment.mode {
-                                    EnrichmentMode::Cloud { provider, api_key, model } => {
-                                        (provider.clone(), api_key.clone(), model.clone())
+                                let (cur_provider, cur_key, cur_model, cur_base_url) = match &self.config.enrichment.mode {
+                                    EnrichmentMode::Cloud { provider, api_key, model, base_url } => {
+                                        (provider.clone(), api_key.clone(), model.clone(), base_url.clone())
                                     }
-                                    _ => (CloudProvider::Anthropic, String::new(), None),
+                                    _ => (CloudProvider::Anthropic, String::new(), None, None),
                                 };
                                 self.config.enrichment.save_key_for_provider(&cur_provider, &cur_key);
                                 self.config.enrichment.save_model_for_provider(&cur_provider, &cur_model);
-                                let next_provider = match cur_provider {
-                                    CloudProvider::Anthropic => CloudProvider::OpenAI,
-                                    CloudProvider::OpenAI => CloudProvider::Google,
-                                    CloudProvider::Google => CloudProvider::Anthropic,
-                                };
+                                self.config.enrichment.save_base_url_for_provider(&cur_provider, &cur_base_url);
+                                let next_provider = cur_provider.next();
                                 let next_key = self.config.enrichment.load_key_for_provider(&next_provider);
                                 let next_model = self.config.enrichment.load_model_for_provider(&next_provider);
+                                let next_base_url = self.config.enrichment.load_base_url_for_provider(&next_provider);
                                 self.config.enrichment.mode = EnrichmentMode::Cloud {
                                     provider: next_provider,
                                     api_key: next_key,
                                     model: next_model,
+                                    base_url: next_base_url,
                                 };
                                 if let Err(e) = self.save_enrichment_config() {
                                     self.message = format!("Failed to save provider: {}", e);
@@ -376,6 +421,11 @@ impl Dashboard {
                                 // Edit enrichment API key
                                 self.editing_enrichment_api_key = true;
                                 self.enrichment_api_key_input = self.config.enrichment.api_key().unwrap_or("").to_string();
+                            }
+                            (IDX_CLOUD_ENDPOINT, false) if has_endpoint_row => {
+                                // Edit OpenAI-compatible base URL
+                                self.editing_enrichment_endpoint = true;
+                                self.enrichment_endpoint_input = self.config.enrichment.effective_base_url().unwrap_or_default();
                             }
                             _ => {}
                         }
@@ -539,11 +589,12 @@ impl Dashboard {
         let pad = 28; // label column width (must fit "Anthropic (Claude) API Key")
 
         let is_private = self.config.is_private_mode();
+        let has_endpoint_row = self.config.enrichment.has_custom_endpoint();
         let sel = self.settings_selection;
         let mut lines: Vec<Line> = Vec::new();
 
         // Shared section indices depend on mode
-        let shared_off = shared_offset(is_private);
+        let shared_off = shared_offset(is_private, has_endpoint_row);
 
         // Helper macro for building a setting line with ▸ selection marker
         macro_rules! setting_line {
@@ -665,11 +716,11 @@ impl Dashboard {
 
             // Index 4: Enrichment API Key
             let key_label = match self.config.enrichment.cloud_provider() {
-                Some(p) => format!("{} API Key", p.display_name()),
+                Some(_) => format!("{} API Key", self.config.enrichment.provider_display_name()),
                 None => "API Key".to_string(),
             };
-            let env_hint = match self.config.enrichment.cloud_provider() {
-                Some(p) => format!(" (or set {})", p.env_var_name()),
+            let env_hint = match self.config.enrichment.api_key_env_var() {
+                Some(env) => format!(" (or set {})", env),
                 None => String::new(),
             };
             let key_display = if self.editing_enrichment_api_key {
@@ -686,6 +737,17 @@ impl Dashboard {
             };
             let style_override = if sel == 4 && self.editing_enrichment_api_key { Some(val_editing) } else { None };
             setting_line!(key_label, key_display, 4, "\u{2190} Enter to edit", style_override);
+
+            // Index 5: Endpoint (OpenAI-compatible providers only)
+            if has_endpoint_row {
+                let endpoint_display = if self.editing_enrichment_endpoint {
+                    format!("{}_", self.enrichment_endpoint_input)
+                } else {
+                    self.config.enrichment.effective_base_url().unwrap_or_default()
+                };
+                let style_override = if sel == IDX_CLOUD_ENDPOINT && self.editing_enrichment_endpoint { Some(val_editing) } else { None };
+                setting_line!("Endpoint", endpoint_display, IDX_CLOUD_ENDPOINT, "\u{2190} Enter to edit (DeepInfra, OpenRouter, Groq, vLLM...)", style_override);
+            }
         }
 
         // ── RECORDING ───────────────────────────────────────────────

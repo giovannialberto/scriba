@@ -16,6 +16,8 @@ use crate::database::Database;
 pub enum AgentEvent {
     /// Status message (e.g. "Thinking...")
     Status(String),
+    /// Non-fatal problem the user should see and keep (e.g. degraded mode)
+    Warning(String),
     /// Text chunk from the assistant's response
     Chunk(String),
     /// Agent is calling a tool

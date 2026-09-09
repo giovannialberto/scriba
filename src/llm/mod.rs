@@ -15,14 +15,15 @@ use genai::chat::{
     CacheControl, ChatMessage, ChatOptions, ChatRequest, ChatResponseFormat, ChatStreamEvent,
     MessageContent, StopReason, Tool,
 };
-use genai::resolver::{AuthData, Endpoint};
+use genai::resolver::{AuthData, Endpoint, ProviderConfig};
 use genai::{Client, ModelIden, ServiceTarget, WebConfig};
 use tokio::sync::mpsc;
 
 use crate::agent::loop_runner::AgentEvent;
 use crate::agent::provider::{AgentProvider, AgentTurnResult};
 use crate::core::config::{CloudProvider, EnrichmentConfig, EnrichmentMode};
-use crate::enrichment::{LlmProvider, OllamaClient, ProviderError};
+use crate::enrichment::{LlmProvider, OllamaClient, OllamaModelInfo, ProviderError};
+use tokio::sync::OnceCell;
 
 /// Overall HTTP timeout for a single model call.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
@@ -69,7 +70,7 @@ impl Protocol {
             Protocol::Anthropic => "https://api.anthropic.com/v1/",
             Protocol::OpenAI => "https://api.openai.com/v1/",
             Protocol::Gemini => "https://generativelanguage.googleapis.com/v1beta/",
-            Protocol::Ollama => "http://localhost:11434/",
+            Protocol::Ollama => crate::core::config::DEFAULT_OLLAMA_ENDPOINT,
         }
     }
 
@@ -113,18 +114,21 @@ impl LlmTarget {
             } => {
                 let protocol = match provider {
                     CloudProvider::Anthropic => Protocol::Anthropic,
-                    CloudProvider::OpenAI => Protocol::OpenAI,
+                    CloudProvider::OpenAI | CloudProvider::OpenAICompatible => Protocol::OpenAI,
                     CloudProvider::Google => Protocol::Gemini,
                 };
+                let endpoint = config
+                    .effective_base_url()
+                    .unwrap_or_else(|| protocol.default_endpoint().to_string());
                 Self {
                     protocol,
-                    endpoint: normalize_base_url(protocol.default_endpoint()),
+                    endpoint: normalize_base_url(&endpoint),
                     api_key: config.resolve_api_key().filter(|k| !k.trim().is_empty()),
-                    api_key_env: Some(provider.env_var_name().to_string()),
+                    api_key_env: config.api_key_env_var(),
                     model: model
                         .clone()
                         .unwrap_or_else(|| provider.default_model().to_string()),
-                    display_name: provider.display_name().to_string(),
+                    display_name: config.provider_display_name(),
                 }
             }
             EnrichmentMode::Local {
@@ -153,6 +157,62 @@ impl LlmTarget {
             model: ModelIden::new(self.protocol.adapter_kind(), self.model.as_str()),
         }
     }
+}
+
+/// One model offered by an endpoint, as shown in model pickers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelListEntry {
+    pub id: String,
+    /// `Some(false)` when the host says the model cannot call tools.
+    pub supports_tools: Option<bool>,
+}
+
+impl ModelListEntry {
+    /// Label for pickers: the id, flagged when the agent cannot use the model.
+    pub fn display_name(&self) -> String {
+        if self.supports_tools == Some(false) {
+            format!("{} (no tools)", self.id)
+        } else {
+            self.id.clone()
+        }
+    }
+}
+
+impl From<OllamaModelInfo> for ModelListEntry {
+    fn from(info: OllamaModelInfo) -> Self {
+        Self {
+            id: info.name,
+            supports_tools: info.supports_tools,
+        }
+    }
+}
+
+impl From<String> for ModelListEntry {
+    fn from(id: String) -> Self {
+        Self {
+            id,
+            supports_tools: None,
+        }
+    }
+}
+
+/// List the models an endpoint advertises (`GET {base_url}/models` for
+/// OpenAI-compatible hosts). Ollama has its own listing in `OllamaClient`.
+pub async fn list_models(target: &LlmTarget) -> Result<Vec<String>, ProviderError> {
+    let auth = match &target.api_key {
+        Some(key) => AuthData::from_single(key.clone()),
+        None => AuthData::from_single("none"),
+    };
+    let provider_config =
+        ProviderConfig::from_endpoint(Endpoint::from_owned(target.endpoint.clone()))
+            .with_auth(auth);
+    let mut names = Client::default()
+        .all_model_names(target.protocol.adapter_kind(), provider_config)
+        .await
+        .map_err(map_error)?;
+    names.sort();
+    names.dedup();
+    Ok(names)
 }
 
 /// Ensure a base URL ends with exactly one slash so adapters can append paths.
@@ -253,6 +313,8 @@ pub struct GenaiProvider {
     target: LlmTarget,
     service_target: ServiceTarget,
     client: Client,
+    /// Cached result of the Ollama tool-capability probe.
+    tools_supported: OnceCell<bool>,
 }
 
 impl GenaiProvider {
@@ -266,7 +328,28 @@ impl GenaiProvider {
             target,
             service_target,
             client,
+            tools_supported: OnceCell::new(),
         }
+    }
+
+    /// Whether the model can take tool definitions. Ollama rejects requests
+    /// that include tools for models without the capability, so ask once and
+    /// remember. Cloud providers are assumed capable; a probe failure is too.
+    async fn tools_supported(&self) -> bool {
+        if self.target.protocol != Protocol::Ollama {
+            return true;
+        }
+        *self
+            .tools_supported
+            .get_or_init(|| async {
+                OllamaClient::new(&self.target.endpoint, &self.target.model)
+                    .supports_tools()
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or(true)
+            })
+            .await
     }
 
     /// Build a provider from the enrichment configuration.
@@ -396,7 +479,19 @@ impl AgentProvider for GenaiProvider {
         let mut all = Vec::with_capacity(messages.len() + 1);
         all.push(system);
         all.extend(messages.iter().cloned());
-        let request = ChatRequest::new(all).with_tools(tools.to_vec());
+        let mut request = ChatRequest::new(all);
+        if self.tools_supported().await {
+            request = request.with_tools(tools.to_vec());
+        } else {
+            let _ = tx
+                .send(AgentEvent::Warning(format!(
+                    "{} cannot call tools, so Scriba is answering without looking at your \
+                     recordings. Pick a tools-capable model in Settings (for example {}).",
+                    self.target.model,
+                    crate::core::config::DEFAULT_OLLAMA_MODEL
+                )))
+                .await;
+        }
 
         let options = self
             .base_options()
@@ -435,6 +530,8 @@ impl AgentProvider for GenaiProvider {
             .filter(|c| !c.is_empty())
             .unwrap_or_else(|| MessageContent::from_text(streamed_text));
         let has_tool_calls = !content.tool_calls().is_empty();
+        // Local models may write a tool call as text instead of a tool_use part; only
+        // real tool calls continue the loop.
 
         let truncated = matches!(end.captured_stop_reason, Some(StopReason::MaxTokens(_)));
         if truncated {
@@ -479,14 +576,46 @@ impl AgentProvider for GenaiProvider {
 mod tests {
     use super::*;
 
+    #[allow(clippy::field_reassign_with_default)]
     fn cloud_config(provider: CloudProvider, model: Option<&str>) -> EnrichmentConfig {
         let mut config = EnrichmentConfig::default();
         config.mode = EnrichmentMode::Cloud {
             provider,
             api_key: "sk-test".to_string(),
             model: model.map(str::to_string),
+            base_url: None,
         };
         config
+    }
+
+    #[test]
+    fn compatible_target_defaults_to_deepinfra() {
+        let target = LlmTarget::from_config(&cloud_config(CloudProvider::OpenAICompatible, None));
+        assert_eq!(target.protocol, Protocol::OpenAI);
+        assert_eq!(target.endpoint, "https://api.deepinfra.com/v1/openai/");
+        assert_eq!(target.model, crate::core::config::DEFAULT_COMPATIBLE_MODEL);
+        assert_eq!(target.api_key_env.as_deref(), Some("DEEPINFRA_API_KEY"));
+        assert_eq!(target.display_name, "DeepInfra (OpenAI-compatible)");
+    }
+
+    #[test]
+    fn compatible_target_honors_custom_base_url() {
+        let mut config = cloud_config(CloudProvider::OpenAICompatible, Some("my-model"));
+        config.set_base_url(Some("http://localhost:8000/v1/".to_string()));
+        let target = LlmTarget::from_config(&config);
+        assert_eq!(target.endpoint, "http://localhost:8000/v1/");
+        assert_eq!(target.model, "my-model");
+        assert_eq!(target.api_key_env.as_deref(), Some("SCRIBA_LLM_API_KEY"));
+        assert_eq!(target.display_name, "OpenAI-compatible");
+    }
+
+    #[test]
+    fn base_url_override_applies_to_first_party_providers() {
+        let mut config = cloud_config(CloudProvider::Anthropic, None);
+        config.set_base_url(Some("https://proxy.example.com/anthropic".to_string()));
+        let target = LlmTarget::from_config(&config);
+        assert_eq!(target.protocol, Protocol::Anthropic);
+        assert_eq!(target.endpoint, "https://proxy.example.com/anthropic/");
     }
 
     #[test]
@@ -507,6 +636,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn local_target_normalizes_endpoint() {
         let mut config = EnrichmentConfig::default();
         config.mode = EnrichmentMode::Local {
@@ -547,6 +677,17 @@ mod tests {
             display_name: "Ollama (Local)".to_string(),
         };
         assert!(GenaiProvider::new(target).ensure_credentials().is_ok());
+    }
+
+    #[test]
+    fn model_list_entries_flag_missing_tool_support() {
+        let capable: ModelListEntry = "gemma4:12b".to_string().into();
+        assert_eq!(capable.display_name(), "gemma4:12b");
+        let entry = ModelListEntry::from(OllamaModelInfo {
+            name: "gemma3:12b".to_string(),
+            supports_tools: Some(false),
+        });
+        assert_eq!(entry.display_name(), "gemma3:12b (no tools)");
     }
 
     #[test]

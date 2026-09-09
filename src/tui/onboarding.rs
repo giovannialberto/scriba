@@ -1,7 +1,6 @@
 use crate::core::{
     CloudProvider, EnrichmentMode, LocalModel,
-    TranscriptionMode, initialize_world_from_seed,
-};
+    TranscriptionMode, initialize_world_from_seed, DEFAULT_COMPATIBLE_BASE_URL, DEFAULT_OLLAMA_ENDPOINT, DEFAULT_OLLAMA_MODEL};
 use crate::database::Database;
 use crate::enrichment::{OllamaClient, WorldContext, WorldData, WorldEntityExtractionResult};
 use anyhow::Result;
@@ -31,6 +30,10 @@ pub(super) enum OnboardingStep {
     WhisperApiKey,
     WhisperApiKeyValidation,
     ProviderSelection,
+    /// OpenAI-compatible only: base URL of the endpoint.
+    EndpointEntry,
+    /// OpenAI-compatible only: model ID.
+    ModelEntry,
     ApiKeyEntry,
     ApiKeyValidation,
     // Privacy flow
@@ -79,18 +82,23 @@ pub(super) const LOCAL_MODELS: &[(LocalModel, &str, &str)] = &[
     (LocalModel::ParakeetTdt, "Parakeet TDT 0.6B (Recommended)", "~465 MB"),
     (LocalModel::WhisperTurbo, "Whisper Turbo", "~540 MB"),
     (LocalModel::WhisperLarge, "Whisper Large v3", "~3.1 GB"),
-    (LocalModel::WhisperMedium, "Whisper Medium", "~1.5 MB"),
+    (LocalModel::WhisperMedium, "Whisper Medium", "~1.5 GB"),
     (LocalModel::WhisperSmall, "Whisper Small", "~500 MB"),
     (LocalModel::SenseVoice, "SenseVoice", "~600 MB"),
 ];
 
-/// Recommended Ollama models for knowledge extraction, suitable for self-hosting.
+/// Suffix shown next to models that cannot call tools (the agent needs tools to read recordings).
+pub(super) const NO_TOOLS_MARK: &str = " (no tools)";
+
+/// Recommended Ollama models for knowledge extraction and the agent.
+/// Every entry supports Ollama tool calling; the first one is the default.
+/// Sizes are the Ollama library's default quantization (Sept 2026).
 pub(super) const RECOMMENDED_OLLAMA_MODELS: &[(&str, &str, &str)] = &[
-    ("mistral:latest", "Mistral 7B (Recommended)", "~4.1 GB"),
-    ("gemma3:4b", "Gemma 3 4B", "~3.3 GB"),
+    (DEFAULT_OLLAMA_MODEL, "Gemma 4 12B (Recommended)", "~7.6 GB"),
+    ("gpt-oss:20b", "GPT-OSS 20B", "~14 GB"),
+    ("qwen3:8b", "Qwen 3 8B", "~5.2 GB"),
+    ("granite4.1:8b", "Granite 4.1 8B", "~5.3 GB"),
     ("llama3.2:3b", "Llama 3.2 3B", "~2.0 GB"),
-    ("phi4-mini:latest", "Phi-4 Mini 3.8B", "~2.5 GB"),
-    ("qwen3:4b", "Qwen 3 4B", "~2.6 GB"),
 ];
 
 #[derive(Clone, Debug)]
@@ -99,6 +107,8 @@ pub(super) struct OllamaModelOption {
     pub label: String,
     pub size: String,
     pub installed: bool,
+    /// `Some(false)` when Ollama reports the model cannot call tools.
+    pub supports_tools: Option<bool>,
 }
 
 pub(super) struct OnboardingState {
@@ -112,6 +122,8 @@ pub(super) struct OnboardingState {
     pub(super) whisper_api_key_input: String,
     pub(super) whisper_key_valid: Option<bool>,
     pub(super) whisper_validation_task: Option<tokio::task::JoinHandle<Result<bool, anyhow::Error>>>,
+    pub(super) endpoint_input: String,
+    pub(super) model_input: String,
     pub(super) api_key_input: String,
     pub(super) api_key_valid: Option<bool>,
     pub(super) validation_fail_selection: usize,
@@ -158,6 +170,8 @@ impl OnboardingState {
             whisper_api_key_input: String::new(),
             whisper_key_valid: None,
             whisper_validation_task: None,
+            endpoint_input: String::new(),
+            model_input: String::new(),
             api_key_input: String::new(),
             api_key_valid: None,
             validation_fail_selection: 0,
@@ -282,7 +296,8 @@ impl OnboardingState {
                 self.tick_typewriter_lines();
             }
             OnboardingStep::ModeSelection | OnboardingStep::WhisperApiKey
-            | OnboardingStep::ProviderSelection | OnboardingStep::ApiKeyEntry => {
+            | OnboardingStep::ProviderSelection | OnboardingStep::EndpointEntry
+            | OnboardingStep::ModelEntry | OnboardingStep::ApiKeyEntry => {
                 // Instant text -- no typewriter
             }
             OnboardingStep::ModelSetup => {
@@ -592,7 +607,7 @@ impl OnboardingState {
                 }
             };
             let server_ok = client
-                .get("http://localhost:11434/api/tags")
+                .get(format!("{}/api/tags", DEFAULT_OLLAMA_ENDPOINT))
                 .send()
                 .await
                 .map(|r| r.status().is_success())
@@ -642,8 +657,8 @@ impl Dashboard {
                         if ob.selected_mode == 0 {
                             // Private (Local) mode
                             self.config.enrichment.mode = EnrichmentMode::Local {
-                                ollama_endpoint: "http://localhost:11434".to_string(),
-                                ollama_model: "mistral:latest".to_string(),
+                                ollama_endpoint: DEFAULT_OLLAMA_ENDPOINT.to_string(),
+                                ollama_model: DEFAULT_OLLAMA_MODEL.to_string(),
                             };
                             let _ = self.config.save();
 
@@ -708,14 +723,13 @@ impl Dashboard {
                         ob.selected_provider = ob.selected_provider.saturating_sub(1);
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        ob.selected_provider = (ob.selected_provider + 1).min(2);
+                        ob.selected_provider = (ob.selected_provider + 1).min(CloudProvider::ALL.len() - 1);
                     }
                     KeyCode::Enter => {
-                        let p = match ob.selected_provider {
-                            0 => CloudProvider::Anthropic,
-                            1 => CloudProvider::OpenAI,
-                            _ => CloudProvider::Google,
-                        };
+                        let p = CloudProvider::ALL
+                            .get(ob.selected_provider)
+                            .cloned()
+                            .unwrap_or(CloudProvider::Anthropic);
 
                         // If OpenAI, reuse the Whisper API key
                         let prefilled_key = if p == CloudProvider::OpenAI {
@@ -724,13 +738,32 @@ impl Dashboard {
                             String::new()
                         };
 
+                        let base_url = if p.uses_custom_endpoint() {
+                            Some(DEFAULT_COMPATIBLE_BASE_URL.to_string())
+                        } else {
+                            None
+                        };
                         self.config.enrichment.mode = EnrichmentMode::Cloud {
                             provider: p.clone(),
                             api_key: prefilled_key.clone(),
                             model: Some(p.default_model().to_string()),
+                            base_url,
                         };
 
-                        if !prefilled_key.is_empty() {
+                        if p.uses_custom_endpoint() {
+                            // Endpoint and model must be known before the key can be validated
+                            let _ = self.config.save();
+                            ob.step = OnboardingStep::EndpointEntry;
+                            ob.anim_frame = 0;
+                            ob.endpoint_input = DEFAULT_COMPATIBLE_BASE_URL.to_string();
+                            ob.set_step_text(
+                                "Enter the base URL of your OpenAI-compatible endpoint.\n\
+                                 Works with DeepInfra, OpenRouter, Groq, Together,\n\
+                                 vLLM, LM Studio, or any OpenAI-style server.\n\n\
+                                 Press Enter to accept the default (DeepInfra):",
+                                false,
+                            );
+                        } else if !prefilled_key.is_empty() {
                             // Same key as Whisper — already validated, skip to AskName
                             let _ = self.config.save();
                             ob.step = OnboardingStep::AskName;
@@ -751,6 +784,67 @@ impl Dashboard {
                                 p.display_name()
                             ), false);
                         }
+                    }
+                    _ => {}
+                }
+            }
+            OnboardingStep::EndpointEntry => {
+                match key_code {
+                    KeyCode::Enter => {
+                        let url = ob.endpoint_input.trim().to_string();
+                        if !url.is_empty() {
+                            self.config.enrichment.set_base_url(Some(url));
+                            let _ = self.config.save();
+                            ob.step = OnboardingStep::ModelEntry;
+                            ob.anim_frame = 0;
+                            ob.model_input = self.config.enrichment.model_name().to_string();
+                            ob.set_step_text(
+                                "Which model should Scriba use?\n\n\
+                                 Enter the model ID exactly as your provider lists it\n\
+                                 (you can change it later in Settings):",
+                                false,
+                            );
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        ob.endpoint_input.push(c);
+                    }
+                    KeyCode::Backspace => {
+                        ob.endpoint_input.pop();
+                    }
+                    _ => {}
+                }
+            }
+            OnboardingStep::ModelEntry => {
+                match key_code {
+                    KeyCode::Enter => {
+                        let model = ob.model_input.trim().to_string();
+                        if !model.is_empty() {
+                            if let EnrichmentMode::Cloud { model: m, .. } = &mut self.config.enrichment.mode {
+                                *m = Some(model);
+                            }
+                            let _ = self.config.save();
+                            ob.step = OnboardingStep::ApiKeyEntry;
+                            ob.anim_frame = 0;
+                            let provider_name = self.config.enrichment.provider_display_name();
+                            let env_hint = self
+                                .config
+                                .enrichment
+                                .api_key_env_var()
+                                .map(|e| format!(" (or leave empty later and set {})", e))
+                                .unwrap_or_default();
+                            ob.set_step_text(&format!(
+                                "Enter your {} API key{}.\n\n\
+                                 Paste it below:",
+                                provider_name, env_hint
+                            ), false);
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        ob.model_input.push(c);
+                    }
+                    KeyCode::Backspace => {
+                        ob.model_input.pop();
                     }
                     _ => {}
                 }
@@ -875,6 +969,7 @@ impl Dashboard {
                                                 label: label.to_string(),
                                                 size: size.to_string(),
                                                 installed: false,
+                                                supports_tools: Some(true),
                                             }
                                         }).collect();
                                         ob.ollama_model_selection = 0;
@@ -882,15 +977,13 @@ impl Dashboard {
                                     // Fetch installed models to update status
                                     if !ob.ollama_models_fetched {
                                         ob.ollama_models_fetched = true;
-                                        let endpoint = if let EnrichmentMode::Local { ollama_endpoint, .. } = &self.config.enrichment.mode {
-                                            ollama_endpoint.clone()
-                                        } else {
-                                            "http://localhost:11434".to_string()
-                                        };
+                                        let endpoint = self.config.enrichment.ollama_endpoint();
                                         let (tx, rx) = mpsc::channel(1);
-                                        self.ollama_models_rx = Some(rx);
+                                        self.model_list_rx = Some(rx);
                                         tokio::spawn(async move {
-                                            let result = OllamaClient::fetch_models(&endpoint).await;
+                                            let result = OllamaClient::fetch_model_infos(&endpoint)
+                                                .await
+                                                .map(|infos| infos.into_iter().map(Into::into).collect());
                                             let _ = tx.send(result.map_err(|e| e.to_string())).await;
                                         });
                                     }
@@ -959,11 +1052,7 @@ impl Dashboard {
                                         if model_already { DownloadStatus::Done } else { DownloadStatus::Pending },
                                     ));
 
-                                    let ollama_model = if let EnrichmentMode::Local { ollama_model, .. } = &self.config.enrichment.mode {
-                                        ollama_model.clone()
-                                    } else {
-                                        "mistral:latest".to_string()
-                                    };
+                                    let ollama_model = self.config.enrichment.ollama_model();
 
                                     let need_ollama_pull = ob.ollama_reachable
                                         && !ob.ollama_available_models.get(ob.ollama_model_selection)
@@ -981,11 +1070,7 @@ impl Dashboard {
                                     let (tx, rx) = mpsc::unbounded_channel();
                                     ob.download_rx = Some(rx);
 
-                                    let endpoint = if let EnrichmentMode::Local { ollama_endpoint, .. } = &self.config.enrichment.mode {
-                                        ollama_endpoint.clone()
-                                    } else {
-                                        "http://localhost:11434".to_string()
-                                    };
+                                    let endpoint = self.config.enrichment.ollama_endpoint();
                                     let ollama_model_clone = ollama_model.clone();
 
                                     ob.download_task = Some(tokio::spawn(async move {
@@ -1374,6 +1459,8 @@ impl Dashboard {
             OnboardingStep::ModeSelection => "Setup",
             OnboardingStep::WhisperApiKey | OnboardingStep::WhisperApiKeyValidation => "Setup \u{00B7} Transcription",
             OnboardingStep::ProviderSelection => "Setup \u{00B7} Provider",
+            OnboardingStep::EndpointEntry => "Setup \u{00B7} Endpoint",
+            OnboardingStep::ModelEntry => "Setup \u{00B7} Model",
             OnboardingStep::ApiKeyEntry | OnboardingStep::ApiKeyValidation => "Setup \u{00B7} API Key",
             OnboardingStep::SystemCheck => "Setup \u{00B7} System Check",
             OnboardingStep::ModelSetup => "Setup \u{00B7} Models",
@@ -1458,6 +1545,7 @@ impl Dashboard {
                 ("Anthropic (Claude)", "Best for nuanced understanding"),
                 ("OpenAI (GPT)", "Widely used, reliable"),
                 ("Google (Gemini)", "Fast and cost-effective"),
+                ("OpenAI-compatible", "DeepInfra, OpenRouter, Groq, vLLM... open-weight models"),
             ];
             let sel_bg = Color::Indexed(236);
             // Use header text width so highlight box spans the full content area
@@ -1590,13 +1678,15 @@ impl Dashboard {
                         ob.ollama_available_models.iter()
                             .map(|m| {
                                 let status = if m.installed { " \u{2713}" } else { "" };
-                                m.label.chars().count() + status.len() + m.size.chars().count() + 2
+                                let tools = if m.supports_tools == Some(false) { NO_TOOLS_MARK } else { "" };
+                                m.label.chars().count() + status.chars().count() + tools.chars().count() + m.size.chars().count() + 2
                             })
                             .max().unwrap_or(0)
                     );
                     for (i, option) in ob.ollama_available_models.iter().enumerate() {
                         let status_str = if option.installed { " \u{2713}" } else { "" };
-                        let name_part = format!("{}{}", option.label, status_str);
+                        let tools_str = if option.supports_tools == Some(false) { NO_TOOLS_MARK } else { "" };
+                        let name_part = format!("{}{}{}", option.label, status_str, tools_str);
                         let gap = block_width.saturating_sub(name_part.chars().count() + option.size.chars().count());
                         if ob.ollama_model_selection == i {
                             lines.push(Line::from(vec![
@@ -1609,6 +1699,9 @@ impl Dashboard {
                             ];
                             if option.installed {
                                 spans.push(Span::styled(" \u{2713}", Style::default().fg(Color::Green)));
+                            }
+                            if option.supports_tools == Some(false) {
+                                spans.push(Span::styled(NO_TOOLS_MARK, Style::default().fg(Color::Yellow)));
                             }
                             spans.push(Span::styled(format!("{}{}", " ".repeat(gap), option.size), Style::default().fg(Color::DarkGray)));
                             lines.push(Line::from(spans));
@@ -1624,11 +1717,7 @@ impl Dashboard {
                         .replace(" (Fast, Accurate)", "");
 
                     let ollama_model = if ob.ollama_reachable {
-                        Some(if let EnrichmentMode::Local { ollama_model, .. } = &self.config.enrichment.mode {
-                            ollama_model.clone()
-                        } else {
-                            "mistral:latest".to_string()
-                        })
+                        Some(self.config.enrichment.ollama_model())
                     } else {
                         None
                     };
@@ -1820,12 +1909,15 @@ impl Dashboard {
             // Input field for input steps (only after text reveal is complete)
             let show_input = ob.text_complete && matches!(
                 ob.step,
-                OnboardingStep::WhisperApiKey | OnboardingStep::ApiKeyEntry | OnboardingStep::AskName | OnboardingStep::AskRole
+                OnboardingStep::WhisperApiKey | OnboardingStep::EndpointEntry | OnboardingStep::ModelEntry
+                | OnboardingStep::ApiKeyEntry | OnboardingStep::AskName | OnboardingStep::AskRole
             );
 
             if show_input {
                 let input_value = match ob.step {
                     OnboardingStep::WhisperApiKey => &ob.whisper_api_key_input,
+                    OnboardingStep::EndpointEntry => &ob.endpoint_input,
+                    OnboardingStep::ModelEntry => &ob.model_input,
                     OnboardingStep::ApiKeyEntry => &ob.api_key_input,
                     OnboardingStep::AskName => &ob.user_name,
                     OnboardingStep::AskRole => &ob.user_role,
@@ -1887,6 +1979,7 @@ impl Dashboard {
         // Cloud:   Intro(0) → Mode(1) → WhisperKey(2) → Provider(3) → ApiKey(4) → Name(5) → Role(6) → Processing(7) → Confirm(8) → Done(9) = 10
         let is_cloud = matches!(ob.step,
             OnboardingStep::WhisperApiKey | OnboardingStep::ProviderSelection
+            | OnboardingStep::EndpointEntry | OnboardingStep::ModelEntry
             | OnboardingStep::ApiKeyEntry | OnboardingStep::ApiKeyValidation
         ) || matches!(self.config.enrichment.mode, EnrichmentMode::Cloud { .. });
         let step_count = if is_cloud { 10 } else { 9 };
@@ -1895,7 +1988,7 @@ impl Dashboard {
                 OnboardingStep::Entrance | OnboardingStep::Intro => 0,
                 OnboardingStep::ModeSelection => 1,
                 OnboardingStep::WhisperApiKey | OnboardingStep::WhisperApiKeyValidation => 2,
-                OnboardingStep::ProviderSelection => 3,
+                OnboardingStep::ProviderSelection | OnboardingStep::EndpointEntry | OnboardingStep::ModelEntry => 3,
                 OnboardingStep::ApiKeyEntry | OnboardingStep::ApiKeyValidation => 4,
                 OnboardingStep::AskName => 5,
                 OnboardingStep::AskRole => 6,
@@ -1962,6 +2055,7 @@ impl Dashboard {
                 if ob.whisper_validation_task.is_some() { "Validating..." }
                 else { "" }
             }
+            OnboardingStep::EndpointEntry | OnboardingStep::ModelEntry => "[Enter] Continue",
             OnboardingStep::ApiKeyEntry => "[Enter] Validate",
             OnboardingStep::ApiKeyValidation => {
                 if ob.validation_task.is_some() { "Validating..." }
