@@ -61,6 +61,23 @@ pub trait LlmProvider: Send + Sync {
     /// Generate a plain text response (no JSON format constraint).
     async fn generate_text(&self, prompt: &str) -> Result<String, ProviderError>;
 
+    /// Generate JSON constrained to `schema` where the provider supports
+    /// schema-enforced output. The default falls back to [`generate`].
+    ///
+    /// [`generate`]: LlmProvider::generate
+    async fn generate_structured(
+        &self,
+        prompt: &str,
+        _schema: &serde_json::Value,
+    ) -> Result<String, ProviderError> {
+        self.generate(prompt).await
+    }
+
+    /// Context window of the model in tokens, when known.
+    async fn context_window(&self) -> Option<u32> {
+        None
+    }
+
     /// Check if the provider is reachable and configured.
     async fn health_check(&self) -> Result<(), ProviderError>;
 

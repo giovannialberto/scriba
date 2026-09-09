@@ -14,7 +14,7 @@ use futures_util::StreamExt;
 use genai::adapter::AdapterKind;
 use genai::chat::{
     CacheControl, ChatMessage, ChatOptions, ChatRequest, ChatResponseFormat, ChatStreamEvent,
-    MessageContent, StopReason, Tool,
+    JsonSpec, MessageContent, StopReason, Tool,
 };
 use genai::resolver::{AuthData, Endpoint, ProviderConfig};
 use genai::{Client, ModelIden, ServiceTarget, WebConfig};
@@ -157,6 +157,14 @@ impl Protocol {
     /// Whether the adapter has a dedicated JSON-mode flag.
     fn supports_json_mode(self) -> bool {
         matches!(self, Protocol::OpenAI | Protocol::Ollama)
+    }
+
+    /// Whether the adapter can enforce a JSON schema on the output.
+    fn supports_json_schema(self) -> bool {
+        matches!(
+            self,
+            Protocol::Anthropic | Protocol::OpenAI | Protocol::Gemini
+        )
     }
 }
 
@@ -574,6 +582,42 @@ impl LlmProvider for GenaiProvider {
             .await
     }
 
+    async fn generate_structured(
+        &self,
+        prompt: &str,
+        schema: &serde_json::Value,
+    ) -> Result<String, ProviderError> {
+        if !self.target.protocol.supports_json_schema() {
+            // No enforcement available: spell the schema out so JSON mode still
+            // produces the right keys.
+            let prompt = format!(
+                "{prompt}\n\nThe JSON must match this JSON Schema exactly (same keys, same types):\n{}",
+                serde_json::to_string_pretty(schema).unwrap_or_default()
+            );
+            return self.generate(&prompt).await;
+        }
+        let options = self
+            .base_options()
+            .with_max_tokens(JSON_MAX_TOKENS)
+            .with_response_format(ChatResponseFormat::JsonSpec(JsonSpec::new(
+                "scriba_output",
+                schema.clone(),
+            )));
+        match self
+            .complete_text(ChatRequest::from_user(prompt), options)
+            .await
+        {
+            // OpenAI-compatible hosts that lack json_schema support answer 400;
+            // JSON mode plus the prompt's instructions is the next best thing.
+            Err(ProviderError::HttpStatus { status: 400, .. }) => self.generate(prompt).await,
+            other => other,
+        }
+    }
+
+    async fn context_window(&self) -> Option<u32> {
+        context_window(&self.target).await
+    }
+
     async fn health_check(&self) -> Result<(), ProviderError> {
         if self.target.protocol == Protocol::Ollama {
             return OllamaClient::new(&self.target.endpoint, &self.target.model)
@@ -850,14 +894,32 @@ mod tests {
 
     #[test]
     fn cloud_context_windows_follow_model_families() {
-        assert_eq!(cloud_context_window(Protocol::Anthropic, "claude-haiku-4-5-20251001"), 200_000);
-        assert_eq!(cloud_context_window(Protocol::Anthropic, "claude-opus-4-5"), 200_000);
-        assert_eq!(cloud_context_window(Protocol::Anthropic, "claude-sonnet-4-6"), 1_000_000);
-        assert_eq!(cloud_context_window(Protocol::Anthropic, "claude-fable-5-1"), 1_000_000);
+        assert_eq!(
+            cloud_context_window(Protocol::Anthropic, "claude-haiku-4-5-20251001"),
+            200_000
+        );
+        assert_eq!(
+            cloud_context_window(Protocol::Anthropic, "claude-opus-4-5"),
+            200_000
+        );
+        assert_eq!(
+            cloud_context_window(Protocol::Anthropic, "claude-sonnet-4-6"),
+            1_000_000
+        );
+        assert_eq!(
+            cloud_context_window(Protocol::Anthropic, "claude-fable-5-1"),
+            1_000_000
+        );
         assert_eq!(cloud_context_window(Protocol::OpenAI, "gpt-5.2"), 400_000);
         assert_eq!(cloud_context_window(Protocol::OpenAI, "o4-mini"), 200_000);
-        assert_eq!(cloud_context_window(Protocol::OpenAI, "Qwen/Qwen3.5-397B-A17B"), 128_000);
-        assert_eq!(cloud_context_window(Protocol::Gemini, "gemini-2.5-flash"), 1_048_576);
+        assert_eq!(
+            cloud_context_window(Protocol::OpenAI, "Qwen/Qwen3.5-397B-A17B"),
+            128_000
+        );
+        assert_eq!(
+            cloud_context_window(Protocol::Gemini, "gemini-2.5-flash"),
+            1_048_576
+        );
     }
 
     #[test]

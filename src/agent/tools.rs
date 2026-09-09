@@ -54,8 +54,19 @@ pub fn summarize_tool_result(name: &str, result: &str) -> String {
             }
         }
         "get_transcript" => {
-            let word_count = result.split_whitespace().count();
-            format!("transcript, {} words", word_count)
+            match serde_json::from_str::<Value>(result) {
+                Ok(v) => {
+                    let total = v.get("total_words").and_then(|n| n.as_u64()).unwrap_or(0);
+                    let offset = v.get("offset_words").and_then(|n| n.as_u64()).unwrap_or(0);
+                    let returned = v.get("returned_words").and_then(|n| n.as_u64()).unwrap_or(0);
+                    if returned >= total {
+                        format!("transcript, {} words", total)
+                    } else {
+                        format!("words {}-{} of {}", offset + 1, offset + returned, total)
+                    }
+                }
+                Err(_) => format!("transcript, {} words", result.split_whitespace().count()),
+            }
         }
         "search_transcripts" => {
             let count = result.matches("\"recording_id\"").count();

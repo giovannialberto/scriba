@@ -10,6 +10,13 @@ use serde_json::{json, Value};
 
 use super::definitions::*;
 
+/// Default page size for `get_transcript`, in words (roughly 5-6k tokens).
+pub const TRANSCRIPT_PAGE_WORDS: usize = 4_000;
+/// Hard cap on one `get_transcript` page.
+pub const TRANSCRIPT_MAX_PAGE_WORDS: usize = 12_000;
+/// Longest `world.md` dump handed to the model in one call.
+pub const WORLD_CONTEXT_MAX_CHARS: usize = 30_000;
+
 /// The result of executing a tool.
 pub struct ToolResult {
     /// JSON or plain-text output.
@@ -138,9 +145,55 @@ fn exec_get_transcript(input: &Value, db: &Database) -> ToolResult {
     };
 
     match db.get_transcript_by_recording_id(recording_id) {
-        Ok(Some(t)) => ToolResult::ok(t.content),
+        Ok(Some(t)) => {
+            let page = page_words(
+                &t.content,
+                params.offset_words.unwrap_or(0),
+                params.max_words.unwrap_or(TRANSCRIPT_PAGE_WORDS),
+            );
+            let body = json!({
+                "recording_id": recording_id,
+                "total_words": page.total_words,
+                "offset_words": page.offset_words,
+                "returned_words": page.returned_words,
+                "has_more": page.has_more,
+                "next_offset_words": page.next_offset_words,
+                "content": page.content,
+            });
+            ToolResult::ok(serde_json::to_string_pretty(&body).unwrap_or_default())
+        }
         Ok(None) => ToolResult::err(format!("No transcript found for recording {}", recording_id)),
         Err(e) => ToolResult::err(format!("Error: {}", e)),
+    }
+}
+
+/// One page of a transcript, sliced on word boundaries.
+#[derive(Debug, PartialEq, Eq)]
+pub struct TranscriptPage {
+    pub content: String,
+    pub total_words: usize,
+    pub offset_words: usize,
+    pub returned_words: usize,
+    pub has_more: bool,
+    pub next_offset_words: Option<usize>,
+}
+
+/// Slice `content` into a page of at most `max_words` words starting at
+/// `offset_words`. Never returns an unbounded payload.
+pub fn page_words(content: &str, offset_words: usize, max_words: usize) -> TranscriptPage {
+    let max_words = max_words.clamp(1, TRANSCRIPT_MAX_PAGE_WORDS);
+    let words: Vec<&str> = content.split_whitespace().collect();
+    let total_words = words.len();
+    let start = offset_words.min(total_words);
+    let end = (start + max_words).min(total_words);
+    let has_more = end < total_words;
+    TranscriptPage {
+        content: words[start..end].join(" "),
+        total_words,
+        offset_words: start,
+        returned_words: end - start,
+        has_more,
+        next_offset_words: if has_more { Some(end) } else { None },
     }
 }
 
@@ -278,11 +331,27 @@ fn exec_get_world_context() -> ToolResult {
             if wc.content.is_empty() {
                 ToolResult::ok("(no world context)".to_string())
             } else {
-                ToolResult::ok(wc.content)
+                ToolResult::ok(cap_chars(&wc.content, WORLD_CONTEXT_MAX_CHARS))
             }
         }
         Err(e) => ToolResult::err(format!("Error loading world context: {}", e)),
     }
+}
+
+/// Truncate at a character boundary with a note telling the model how to get
+/// the rest, so one tool call can never flood the context window.
+fn cap_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut cut: String = text.chars().take(max_chars).collect();
+    if let Some(pos) = cut.rfind('\n') {
+        cut.truncate(pos);
+    }
+    format!(
+        "{}\n\n[truncated at {} characters; use list_entities / get_entity for details beyond this point]",
+        cut, max_chars
+    )
 }
 
 fn exec_get_stats(db: &Database) -> ToolResult {
@@ -579,12 +648,22 @@ fn exec_delete_entity(input: &Value, db: &mut Database) -> ToolResult {
 /// Uses char-level indexing to avoid panics on multi-byte UTF-8.
 fn extract_snippet(content: &str, query: &str, max_chars: usize) -> String {
     let content_lower = content.to_lowercase();
-    let first_word = query.split_whitespace().next().unwrap_or(query).to_lowercase();
 
-    let match_char_offset = if let Some(byte_pos) = content_lower.find(&first_word) {
-        content_lower[..byte_pos].chars().count()
-    } else {
-        return content.chars().take(max_chars).collect::<String>();
+    // Anchor on the first occurrence of any query term, preferring longer
+    // (more specific) terms; FTS operators and punctuation are not terms.
+    let mut terms: Vec<String> = query
+        .split(|c: char| c.is_whitespace() || matches!(c, '"' | '(' | ')' | '*' | '+' | '-' | ':' | '^'))
+        .map(|t| t.trim().to_lowercase())
+        .filter(|t| t.len() > 1 && !matches!(t.as_str(), "and" | "or" | "not" | "near"))
+        .collect();
+    terms.sort_by_key(|t| std::cmp::Reverse(t.len()));
+
+    let match_char_offset = match terms
+        .iter()
+        .find_map(|term| content_lower.find(term.as_str()))
+    {
+        Some(byte_pos) => content_lower[..byte_pos].chars().count(),
+        None => return content.chars().take(max_chars).collect::<String>(),
     };
 
     let total_chars = content.chars().count();
@@ -617,5 +696,60 @@ fn extract_snippet(content: &str, query: &str, max_chars: usize) -> String {
         format!("...{}...", snippet)
     } else {
         format!("{}...", snippet)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transcript_pages_are_bounded_and_chain() {
+        let text = (1..=10).map(|i| format!("w{i}")).collect::<Vec<_>>().join(" ");
+        let first = page_words(&text, 0, 4);
+        assert_eq!(first.content, "w1 w2 w3 w4");
+        assert_eq!((first.total_words, first.returned_words), (10, 4));
+        assert!(first.has_more);
+        assert_eq!(first.next_offset_words, Some(4));
+
+        let last = page_words(&text, first.next_offset_words.unwrap() + 4, 4);
+        assert_eq!(last.content, "w9 w10");
+        assert!(!last.has_more);
+        assert_eq!(last.next_offset_words, None);
+
+        let past_end = page_words(&text, 50, 4);
+        assert_eq!(past_end.content, "");
+        assert_eq!(past_end.offset_words, 10);
+        assert!(!past_end.has_more);
+    }
+
+    #[test]
+    fn transcript_page_size_is_capped() {
+        let text = "x ".repeat(TRANSCRIPT_MAX_PAGE_WORDS + 500);
+        let page = page_words(&text, 0, usize::MAX);
+        assert_eq!(page.returned_words, TRANSCRIPT_MAX_PAGE_WORDS);
+        assert!(page.has_more);
+        let zero = page_words("a b c", 0, 0);
+        assert_eq!(zero.returned_words, 1, "max_words is clamped to at least one word");
+    }
+
+    #[test]
+    fn world_context_is_capped_with_a_note() {
+        let short = "owner: me";
+        assert_eq!(cap_chars(short, 100), short);
+        let long = "line\n".repeat(50);
+        let capped = cap_chars(&long, 23);
+        assert!(capped.starts_with("line\nline\nline\nline"));
+        assert!(capped.contains("[truncated at 23 characters"));
+        assert!(capped.chars().count() < long.chars().count());
+    }
+
+    #[test]
+    fn snippet_anchors_on_any_query_term() {
+        let content = "Alpha beta gamma. Later we discussed the budget migration plan in depth.";
+        let snippet = extract_snippet(content, "\"migration plan\" OR budget", 30);
+        assert!(snippet.contains("migration"), "got {snippet}");
+        let fallback = extract_snippet(content, "zzz", 10);
+        assert_eq!(fallback, "Alpha beta");
     }
 }
