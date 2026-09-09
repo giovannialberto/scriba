@@ -11,7 +11,7 @@
 
 pub mod chat_prompts;
 mod extractor;
-mod ollama;
+pub mod ollama;
 mod prompts;
 pub mod provider;
 pub mod search;

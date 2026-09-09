@@ -27,7 +27,12 @@ pub enum ChatStreamEvent {
     ToolCall { name: String, input_summary: String },
     ToolResult { name: String, output_summary: String },
     Usage { input_tokens: u32, output_tokens: u32 },
-    Compacted { summary: String, removed_count: usize },
+    /// Earlier history was summarized; the model continues from `summary` only.
+    Compacted { summary: String },
+    /// Messages to append to the model-facing transcript for the next turn.
+    Transcript(Vec<genai::chat::ChatMessage>),
+    /// Context window of the active model, in tokens.
+    ContextWindow(u32),
     Done,
     Error(String),
 }
@@ -110,6 +115,12 @@ pub enum ChatFocus {
 pub struct ChatState {
     pub context: ChatContext,
     pub messages: Vec<ChatMessage>,
+    /// Model-facing transcript (user turns, assistant turns with tool calls,
+    /// tool results). What the display shows is derived separately.
+    pub agent_history: Vec<genai::chat::ChatMessage>,
+    /// Summary of history that was compacted away; prepended to the system
+    /// prompt on every following turn.
+    pub compaction_summary: Option<String>,
     pub input_buffer: String,
     pub scroll_offset: usize,
 
@@ -182,8 +193,10 @@ pub struct ChatState {
     pub content_top_pad: usize,       // blank lines above content (home screen centering)
     pub content_border_overhead: u16, // border lines subtracted from height (0 if borderless)
 
-    // Context window tracking (Anthropic only)
+    // Context window tracking
     pub context_window_max: u32,
+    /// `SCRIBA_CTX_LIMIT` was set: keep it over provider-reported windows.
+    context_window_pinned: bool,
     pub context_input_tokens: u32,
     pub context_output_tokens: u32,
     usage_baseline_set: bool, // true after first Usage event per generation
@@ -201,6 +214,8 @@ impl ChatState {
         Self {
             context: ChatContext::Global,
             messages: Vec::new(),
+            agent_history: Vec::new(),
+            compaction_summary: None,
             input_buffer: String::new(),
             scroll_offset: 0,
             stream_rx: None,
@@ -238,6 +253,10 @@ impl ChatState {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(200_000),
+            context_window_pinned: std::env::var("SCRIBA_CTX_LIMIT")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .is_some(),
             context_input_tokens: 0,
             context_output_tokens: 0,
             usage_baseline_set: false,
@@ -252,6 +271,29 @@ impl ChatState {
     /// Invalidate the render cache (e.g. after clearing messages).
     pub fn invalidate_cache(&mut self) {
         self.cached_msg_count = 0;
+    }
+
+    /// Forget the conversation: display messages and the model transcript.
+    pub fn clear_conversation(&mut self) {
+        self.messages.clear();
+        self.agent_history.clear();
+        self.compaction_summary = None;
+        self.context_input_tokens = 0;
+        self.context_output_tokens = 0;
+        self.usage_baseline_set = false;
+        self.invalidate_cache();
+    }
+
+    /// System prompt for the next turn: the base prompt plus the summary of
+    /// anything compacted away.
+    pub fn effective_system_prompt(&self) -> String {
+        match &self.compaction_summary {
+            Some(summary) => format!(
+                "{}\n\n## Previous Conversation Summary\n{}",
+                self.system_prompt, summary
+            ),
+            None => self.system_prompt.clone(),
+        }
     }
 
     pub fn context_usage_fraction(&self) -> f64 {
@@ -326,34 +368,40 @@ impl ChatState {
                         // Always update output_tokens (current response contribution)
                         self.context_output_tokens = output_tokens;
                     }
-                    ChatStreamEvent::Compacted { summary, removed_count } => {
+                    ChatStreamEvent::Compacted { summary } => {
+                        // The model now continues from the summary alone; keep a
+                        // short tail on screen so the user keeps their bearings.
+                        const KEEP_ON_SCREEN: usize = 4;
                         let total_msgs = self.messages.len();
-                        if removed_count <= total_msgs {
-                            let remaining: Vec<ChatMessage> = self.messages.drain(removed_count..).collect();
-                            self.messages.clear();
-                            self.messages.push(ChatMessage::text(
-                                ChatRole::System,
-                                format!("Context compacted: {} messages summarized, {} kept",
-                                    removed_count, remaining.len()),
-                            ));
-                            self.messages.push(ChatMessage {
-                                role: ChatRole::System,
-                                blocks: vec![ChatBlock::CompactionMarker],
-                            });
-                            self.messages.push(ChatMessage::text(ChatRole::System, summary));
-                            self.messages.extend(remaining);
-                        } else {
-                            // Mismatch — just insert the summary without restructuring
-                            self.messages.push(ChatMessage {
-                                role: ChatRole::System,
-                                blocks: vec![ChatBlock::CompactionMarker],
-                            });
-                            self.messages.push(ChatMessage::text(ChatRole::System, summary));
-                        }
+                        let keep = KEEP_ON_SCREEN.min(total_msgs);
+                        let remaining: Vec<ChatMessage> = self.messages.drain(total_msgs - keep..).collect();
+                        let removed_count = self.messages.len();
+                        self.messages.clear();
+                        self.messages.push(ChatMessage::text(
+                            ChatRole::System,
+                            format!("Context compacted: {} messages summarized, {} kept",
+                                removed_count, remaining.len()),
+                        ));
+                        self.messages.push(ChatMessage {
+                            role: ChatRole::System,
+                            blocks: vec![ChatBlock::CompactionMarker],
+                        });
+                        self.messages.push(ChatMessage::text(ChatRole::System, summary.clone()));
+                        self.messages.extend(remaining);
+                        self.agent_history.clear();
+                        self.compaction_summary = Some(summary);
                         self.cached_msg_count = 0;
                         self.context_input_tokens = 0;
                         self.context_output_tokens = 0;
                         self.usage_baseline_set = false;
+                    }
+                    ChatStreamEvent::Transcript(new_messages) => {
+                        self.agent_history.extend(new_messages);
+                    }
+                    ChatStreamEvent::ContextWindow(tokens) => {
+                        if !self.context_window_pinned && tokens > 0 {
+                            self.context_window_max = tokens;
+                        }
                     }
                     ChatStreamEvent::Done => {
                         let blocks = std::mem::take(&mut self.pending_blocks);
@@ -1531,54 +1579,59 @@ fn parse_inline_markdown(text: &str, spans: &mut Vec<Span<'static>>) {
 pub async fn chat_agent_pipeline(
     config: crate::core::config::EnrichmentConfig,
     system_prompt: String,
-    messages: Vec<(String, String)>,
+    history: Vec<genai::chat::ChatMessage>,
+    previous_summary: Option<String>,
     user_message: String,
     needs_compaction: bool,
     tx: mpsc::Sender<ChatStreamEvent>,
 ) {
-    use crate::agent::loop_runner::{AgentEvent, run_agent_loop};
+    use crate::agent::loop_runner::{AgentEvent, history_as_text_pairs, run_agent_loop};
     use crate::agent::create_agent_provider;
 
     let provider = create_agent_provider(&config);
 
-    let mut effective_system_prompt = system_prompt;
-    let mut effective_messages = messages;
+    // Size the context bar for the model actually in use.
+    let target = crate::llm::LlmTarget::from_config(&config);
+    if let Some(window) = crate::llm::context_window(&target).await {
+        let _ = tx.send(ChatStreamEvent::ContextWindow(window)).await;
+    }
 
-    // Auto-compact if context is above 80% and there are enough messages
-    if needs_compaction && effective_messages.len() >= 4 {
+    let mut effective_system_prompt = system_prompt;
+    let mut effective_history = history;
+
+    // Auto-compact when the context is above the threshold: summarize the whole
+    // transcript (plus any earlier summary) and continue from the summary only.
+    // Keeping a verbatim tail would risk splitting tool calls from their results.
+    if needs_compaction && !effective_history.is_empty() {
         let _ = tx.send(ChatStreamEvent::Status(
-            format!("Compacting context ({} messages)...", effective_messages.len()),
+            format!("Compacting context ({} messages)...", effective_history.len()),
         )).await;
 
-        let keep_count = 4; // keep last 4 messages
-        let compact_end = effective_messages.len() - keep_count;
-        let to_compact: Vec<(String, String)> = effective_messages[..compact_end].to_vec();
-        let remaining: Vec<(String, String)> = effective_messages[compact_end..].to_vec();
+        let mut pairs = Vec::new();
+        if let Some(summary) = &previous_summary {
+            pairs.push(("Summary of earlier conversation".to_string(), summary.clone()));
+        }
+        pairs.extend(history_as_text_pairs(&effective_history));
 
-        let prompt = chat_prompts::build_compaction_prompt(&to_compact);
+        let prompt = chat_prompts::build_compaction_prompt(&pairs);
         match provider.compact_history(&prompt).await {
             Ok(summary) => {
-                let removed_count = compact_end;
-                let _ = tx.send(ChatStreamEvent::Compacted {
-                    summary: summary.clone(),
-                    removed_count,
-                }).await;
+                let removed_count = effective_history.len();
+                let _ = tx.send(ChatStreamEvent::Compacted { summary: summary.clone() }).await;
                 let _ = tx.send(ChatStreamEvent::Status(
-                    format!("Compacted {} messages into summary, {} kept", removed_count, remaining.len()),
+                    format!("Compacted {} messages into a summary", removed_count),
                 )).await;
-
-                // Augment system prompt with the summary
                 effective_system_prompt = format!(
                     "{}\n\n## Previous Conversation Summary\n{}",
                     effective_system_prompt, summary
                 );
-                effective_messages = remaining;
+                effective_history = Vec::new();
             }
             Err(e) => {
-                let _ = tx.send(ChatStreamEvent::Error(
-                    format!("Compaction failed: {}", e),
+                // Answer anyway; the next turn will try to compact again.
+                let _ = tx.send(ChatStreamEvent::Warning(
+                    format!("Could not compact the conversation ({}); continuing with full history", e),
                 )).await;
-                return;
             }
         }
     }
@@ -1587,7 +1640,7 @@ pub async fn chat_agent_pipeline(
 
     // Spawn the agent loop
     let agent_handle = tokio::spawn(async move {
-        run_agent_loop(provider, effective_system_prompt, effective_messages, user_message, agent_tx).await;
+        run_agent_loop(provider, effective_system_prompt, effective_history, user_message, agent_tx).await;
     });
 
     // Bridge AgentEvent -> ChatStreamEvent
@@ -1605,6 +1658,7 @@ pub async fn chat_agent_pipeline(
             AgentEvent::Usage { input_tokens, output_tokens } => {
                 ChatStreamEvent::Usage { input_tokens, output_tokens }
             }
+            AgentEvent::Transcript(messages) => ChatStreamEvent::Transcript(messages),
             AgentEvent::Done => ChatStreamEvent::Done,
             AgentEvent::Error(msg) => ChatStreamEvent::Error(msg),
         };
