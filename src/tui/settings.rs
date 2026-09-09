@@ -45,6 +45,8 @@ pub(super) enum Row {
     SpeechModel,
     SpeechEndpoint,
     SpeechKey,
+    /// Local speaker labelling toggle.
+    Speakers,
     AssistantProvider,
     AssistantModel,
     AssistantServer,
@@ -65,6 +67,7 @@ impl Row {
             Row::SpeechEndpoint | Row::AssistantEndpoint => "Endpoint",
             Row::SpeechKey | Row::AssistantKey => "API key",
             Row::AssistantServer => "Server",
+            Row::Speakers => "Speakers",
             Row::AutoStop => "Auto-stop",
             Row::Timeout => "Timeout",
             Row::MeetingWatch => "Meeting watch",
@@ -76,9 +79,11 @@ impl Row {
     fn section(self) -> Option<&'static str> {
         match self {
             Row::Setup => None,
-            Row::SpeechProvider | Row::SpeechModel | Row::SpeechEndpoint | Row::SpeechKey => {
-                Some("SPEECH TO TEXT")
-            }
+            Row::SpeechProvider
+            | Row::SpeechModel
+            | Row::SpeechEndpoint
+            | Row::SpeechKey
+            | Row::Speakers => Some("SPEECH TO TEXT"),
             Row::AssistantProvider
             | Row::AssistantModel
             | Row::AssistantServer
@@ -101,7 +106,7 @@ pub(super) enum Card {
 fn settings_rows(config: &ScribaConfig) -> Vec<Row> {
     let mut rows = vec![Row::Setup, Row::SpeechProvider, Row::SpeechModel];
     match speech_provider(config) {
-        SpeechProvider::Local => {}
+        SpeechProvider::Local => rows.push(Row::Speakers),
         SpeechProvider::Custom => rows.extend([Row::SpeechEndpoint, Row::SpeechKey]),
         _ => rows.push(Row::SpeechKey),
     }
@@ -746,6 +751,10 @@ impl Dashboard {
                     (stored, None)
                 };
                 self.open_text(row, buffer, true, note);
+            }
+            Row::Speakers => {
+                self.config.diarization.enabled = !self.config.diarization.enabled;
+                self.save_settings("setting");
             }
             Row::AutoStop => {
                 self.config.silence_auto_stop.enabled = !self.config.silence_auto_stop.enabled;
@@ -1617,27 +1626,21 @@ impl Dashboard {
         is_sel: bool,
     ) -> (String, String, DetailTone, &'static str, bool) {
         // Inline text editing takes over the value column.
-        if let SettingsEdit::Text {
-            row: r,
-            buffer,
-            secret,
-            ..
-        } = &self.settings_edit
+        if let SettingsEdit::Text { row: r, buffer, secret, .. } = &self.settings_edit
+            && *r == row
         {
-            if *r == row {
-                let shown = if *secret {
-                    mask_secret(buffer)
-                } else {
-                    buffer.clone()
-                };
-                return (
-                    format!("{}_", shown),
-                    String::new(),
-                    DetailTone::Neutral,
-                    "",
-                    true,
-                );
-            }
+            let shown = if *secret {
+                mask_secret(buffer)
+            } else {
+                buffer.clone()
+            };
+            return (
+                format!("{}_", shown),
+                String::new(),
+                DetailTone::Neutral,
+                "",
+                true,
+            );
         }
         let _ = is_sel;
         let config = &self.config;
@@ -1786,6 +1789,24 @@ impl Dashboard {
                     config.enrichment.resolve_api_key().is_some(),
                     &env,
                     &self.assistant_key_status,
+                )
+            }
+            Row::Speakers => {
+                let detail = if config.diarization.enabled {
+                    if crate::core::diarization::models_downloaded() {
+                        "who said what \u{00B7} models installed \u{2713}"
+                    } else {
+                        "who said what \u{00B7} 40 MB download on first use"
+                    }
+                } else {
+                    "transcripts without speaker labels"
+                };
+                (
+                    if config.diarization.enabled { "Enabled" } else { "Disabled" }.to_string(),
+                    detail.to_string(),
+                    DetailTone::Neutral,
+                    "\u{2190} Enter to toggle",
+                    false,
                 )
             }
             Row::AutoStop => (
@@ -1940,6 +1961,7 @@ async fn probe_bearer_endpoint(url: &str, key: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    #[allow(clippy::field_reassign_with_default)]
     fn config_with(transcription: TranscriptionMode, mode: EnrichmentMode) -> ScribaConfig {
         let mut config = ScribaConfig::default();
         config.transcription = transcription;
@@ -2044,6 +2066,7 @@ mod tests {
             Row::SpeechModel,
             Row::SpeechEndpoint,
             Row::SpeechKey,
+            Row::Speakers,
             Row::AssistantProvider,
             Row::AssistantModel,
             Row::AssistantServer,

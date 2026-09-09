@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 use super::config::{LocalModel, ScribaConfig, TranscriptionMode};
+use super::diarization::{self, Diarized, TranscriptSegment};
 use super::files::FileManager;
 use crate::database::Database;
 use crate::utils::BASE_PATH;
@@ -112,6 +113,7 @@ fn save_transcript_to_files_and_db(
     audio_path: &Path,
     transcript_text: &str,
     model_used: &str,
+    diarized: Option<&Diarized>,
 ) -> Result<()> {
     let audio_dir = audio_path
         .parent()
@@ -138,6 +140,14 @@ fn save_transcript_to_files_and_db(
                 true,
                 model_used,
             );
+            if let Some(d) = diarized {
+                if let Ok(segments) = serde_json::to_string(&d.segments) {
+                    let _ = db.update_transcript_segments(recording_id, &segments);
+                }
+                if let Ok(speakers) = serde_json::to_string(&d.speakers) {
+                    let _ = db.update_recording_speakers(recording_id, &speakers);
+                }
+            }
         }
     }
 
@@ -177,10 +187,19 @@ pub(crate) fn find_ffmpeg() -> Result<String> {
 }
 
 fn ensure_mono_16k_wav(input: &Path) -> Result<PathBuf> {
+    ensure_16k_wav(input, 1, "_tmp_stt_16k.wav")
+}
+
+/// Two-track (stereo) 16 kHz WAV, for telling the owner from the others.
+fn ensure_stereo_16k_wav(input: &Path) -> Result<PathBuf> {
+    ensure_16k_wav(input, 2, "_tmp_stt_16k_stereo.wav")
+}
+
+fn ensure_16k_wav(input: &Path, channels: u16, file_name: &str) -> Result<PathBuf> {
     let out = input
         .parent()
         .unwrap_or_else(|| Path::new("."))
-        .join("_tmp_stt_16k.wav");
+        .join(file_name);
 
     let ffmpeg_path = find_ffmpeg().context("FFmpeg is required for audio processing")?;
 
@@ -192,7 +211,7 @@ fn ensure_mono_16k_wav(input: &Path) -> Result<PathBuf> {
             "-ar",
             "16000",
             "-ac",
-            "1",
+            &channels.to_string(),
             "-f",
             "wav",
             out.to_string_lossy().as_ref(),
@@ -206,6 +225,30 @@ fn ensure_mono_16k_wav(input: &Path) -> Result<PathBuf> {
     }
 
     Ok(out)
+}
+
+/// Number of audio channels in a file, via ffprobe.
+pub(crate) fn get_audio_channels(audio_path: &Path) -> Result<u16> {
+    let ffmpeg_path = find_ffmpeg()?;
+    let ffprobe_path = ffmpeg_path.replace("ffmpeg", "ffprobe");
+    let output = Command::new(&ffprobe_path)
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=channels",
+            "-of",
+            "csv=p=0",
+            audio_path.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .context("Failed to run ffprobe")?;
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u16>()
+        .context("Could not read channel count from ffprobe")
 }
 
 /// Get the duration of an audio file in seconds using ffprobe.
@@ -542,7 +585,7 @@ struct ModelArchiveInfo {
 
 /// Extract a `.tar.bz2` archive to a destination directory using pure Rust.
 /// Cross-platform: does not shell out to `tar`.
-fn extract_tar_bz2(archive_path: &Path, dest_dir: &Path) -> Result<()> {
+pub(crate) fn extract_tar_bz2(archive_path: &Path, dest_dir: &Path) -> Result<()> {
     let file = std::fs::File::open(archive_path)
         .with_context(|| format!("Failed to open archive: {}", archive_path.display()))?;
     let decoder = bzip2::read::BzDecoder::new(BufReader::new(file));
@@ -688,7 +731,7 @@ pub(crate) async fn download_model_with_progress(
     Ok(())
 }
 
-async fn download_file_streaming(url: &str, dest: &Path, quiet: bool) -> Result<()> {
+pub(crate) async fn download_file_streaming(url: &str, dest: &Path, quiet: bool) -> Result<()> {
     let client = Client::new();
     let resp = client.get(url).send().await?.error_for_status()?;
     let total = resp.content_length();
@@ -856,7 +899,8 @@ fn suppress_stderr() -> Option<gag::Hold> {
 
 
 /// Run transcription using sherpa-onnx with VAD segmentation for long audio.
-fn run_sherpa_transcription(model: LocalModel, model_dir: &Path, wav_path: &Path, vad_model_path: &Path) -> Result<String> {
+/// Returns one timestamped segment per stretch of detected speech.
+fn run_sherpa_transcription(model: LocalModel, model_dir: &Path, wav_path: &Path, vad_model_path: &Path) -> Result<Vec<TranscriptSegment>> {
     let config = build_recognizer_config(model, model_dir);
 
     let recognizer = OfflineRecognizer::create(&config)
@@ -870,12 +914,12 @@ fn run_sherpa_transcription(model: LocalModel, model_dir: &Path, wav_path: &Path
 
     let vad = create_vad(vad_model_path)?;
     let window_size = 512; // Silero VAD window size
-    let mut all_text = String::new();
+    let mut segments: Vec<TranscriptSegment> = Vec::new();
 
     let drain_text = |vad: &sherpa_onnx::VoiceActivityDetector,
                           recognizer: &OfflineRecognizer,
                           sample_rate: i32,
-                          all_text: &mut String| {
+                          segments: &mut Vec<TranscriptSegment>| {
         while !vad.is_empty() {
             if let Some(segment) = vad.front() {
                 let stream = recognizer.create_stream();
@@ -884,10 +928,13 @@ fn run_sherpa_transcription(model: LocalModel, model_dir: &Path, wav_path: &Path
                 if let Some(result) = stream.get_result() {
                     let text = result.text.trim();
                     if !text.is_empty() {
-                        if !all_text.is_empty() {
-                            all_text.push(' ');
-                        }
-                        all_text.push_str(text);
+                        let start = segment.start() as f32 / sample_rate as f32;
+                        let end = start + segment.samples().len() as f32 / sample_rate as f32;
+                        segments.push(TranscriptSegment {
+                            start,
+                            end,
+                            text: text.to_string(),
+                        });
                     }
                 }
             }
@@ -897,13 +944,71 @@ fn run_sherpa_transcription(model: LocalModel, model_dir: &Path, wav_path: &Path
 
     for chunk in samples.chunks(window_size) {
         vad.accept_waveform(chunk);
-        drain_text(&vad, &recognizer, sample_rate, &mut all_text);
+        drain_text(&vad, &recognizer, sample_rate, &mut segments);
     }
 
     vad.flush();
-    drain_text(&vad, &recognizer, sample_rate, &mut all_text);
+    drain_text(&vad, &recognizer, sample_rate, &mut segments);
 
-    Ok(all_text)
+    Ok(segments)
+}
+
+/// Plain transcript text: segments joined by spaces.
+fn join_segments(segments: &[TranscriptSegment]) -> String {
+    segments
+        .iter()
+        .map(|s| s.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Owner's name for speaker labels, from the world; "You" until known.
+fn owner_label() -> String {
+    crate::enrichment::WorldContext::load()
+        .ok()
+        .and_then(|w| w.parsed())
+        .map(|d| d.owner.name)
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or_else(|| "You".to_string())
+}
+
+/// Label speakers on a freshly transcribed local recording. Non-fatal: any
+/// failure leaves the plain transcript in place.
+async fn diarize_local_transcript(
+    audio_file_path: &Path,
+    wav_path: &Path,
+    segments: &[TranscriptSegment],
+    config: &ScribaConfig,
+    verbose: bool,
+) -> Result<Diarized> {
+    let models = ensure_diarization_models_with_timeout().await?;
+    let channels = get_audio_channels(audio_file_path).unwrap_or(1);
+    let stereo = if channels >= 2 { Some(ensure_stereo_16k_wav(audio_file_path)?) } else { None };
+    let owner = owner_label();
+    let options = diarization::DiarizationOptions {
+        similarity_threshold: diarization::DEFAULT_SIMILARITY_THRESHOLD,
+        max_speakers: config.diarization.max_speakers.max(1) as usize,
+    };
+    let started = Instant::now();
+    let result = diarization::diarize_transcript(segments, wav_path, stereo.as_deref(), &models, options, &owner);
+    if let Some(p) = stereo {
+        let _ = std::fs::remove_file(p);
+    }
+    let diarized = result?;
+    if verbose {
+        println!(
+            "👥 {} speaker(s) identified in {:.0}s",
+            diarized.speakers.len(),
+            started.elapsed().as_secs_f64()
+        );
+    }
+    Ok(diarized)
+}
+
+async fn ensure_diarization_models_with_timeout() -> Result<diarization::DiarizationModels> {
+    tokio::time::timeout(Duration::from_secs(600), diarization::ensure_diarization_models(true))
+        .await
+        .context("Diarization model download timed out after 10 minutes")?
 }
 
 async fn transcribe_with_api(audio_path: &PathBuf, target: ApiTranscriptionTarget) -> Result<String> {
@@ -1007,6 +1112,7 @@ pub async fn transcribe_audio(
         println!("\n{}\n", mode_description);
     }
 
+    let mut diarized: Option<Diarized> = None;
     let (transcription_text, model_used) = match transcription_mode {
         TranscriptionMode::Local { model } => {
             // Suppress sherpa-onnx C library stderr warnings that would corrupt the TUI
@@ -1044,8 +1150,30 @@ pub async fn transcribe_audio(
             let vad_model_path = ensure_vad_model().await
                 .context("Failed to download VAD model")?;
 
-            let text = run_sherpa_transcription(model, &model_paths.dir, &wav_path, &vad_model_path)
+            let segments = run_sherpa_transcription(model, &model_paths.dir, &wav_path, &vad_model_path)
                 .context("Local transcription failed")?;
+            let mut text = join_segments(&segments);
+
+            if config.diarization.enabled && !segments.is_empty() {
+                if let Some(task) = progress_task.as_ref() {
+                    task.abort();
+                }
+                if verbose {
+                    print!("\r{}\r", " ".repeat(80));
+                    println!("👥 Identifying speakers...");
+                }
+                match diarize_local_transcript(&audio_file_path, &wav_path, &segments, &config, verbose).await {
+                    Ok(d) => {
+                        text = d.text.clone();
+                        diarized = Some(d);
+                    }
+                    Err(e) => {
+                        if verbose {
+                            println!("⚠️ Speaker identification skipped: {}", e);
+                        }
+                    }
+                }
+            }
 
             if wav_path.file_name() == Some(std::ffi::OsStr::new("_tmp_stt_16k.wav")) {
                 let _ = std::fs::remove_file(&wav_path);
@@ -1099,6 +1227,7 @@ pub async fn transcribe_audio(
         &audio_file_path,
         &transcription_text,
         &model_used,
+        diarized.as_ref(),
     )?;
 
     if verbose {
