@@ -1,6 +1,6 @@
 use anyhow::Result;
 use scriba::core::{
-    resolve_transcription_mode, AudioFormat, AutopilotOptions, CloudProvider, CompressionSettings, EndpointPreset, DEFAULT_OLLAMA_ENDPOINT, DEFAULT_OLLAMA_MODEL,
+    resolve_transcription_mode, AudioFormat, AutopilotOptions, CloudProvider, CompressionSettings, EndpointPreset, TranscriptionPreset, DEFAULT_OLLAMA_ENDPOINT, DEFAULT_OLLAMA_MODEL,
     EnrichmentMode, LocalModel, RecordingStatus, ScribaConfig, TranscriptionMode, WorkflowManager,
     initialize_world_from_seed, run_autopilot, watcher_excludes_self,
 };
@@ -235,9 +235,16 @@ enum ConfigCommand {
         #[structopt(help = "Model (tiny|base|small|medium|large|turbo|sensevoice|parakeet)")]
         model: LocalModel,
     },
+    /// Use a cloud speech API for transcription (OpenAI by default; Groq, DeepInfra or any OpenAI-compatible host)
     SetApi {
-        #[structopt(help = "OpenAI API key")]
+        #[structopt(help = "API key for the transcription host")]
         api_key: String,
+        #[structopt(long = "preset", help = "Known host: openai|groq|deepinfra (sets endpoint and model)")]
+        preset: Option<String>,
+        #[structopt(long = "base-url", help = "OpenAI-compatible API root, e.g. https://api.groq.com/openai/v1")]
+        base_url: Option<String>,
+        #[structopt(long = "model", help = "Transcription model, e.g. whisper-1, gpt-4o-transcribe, whisper-large-v3-turbo")]
+        model: Option<String>,
     },
     /// Set the enrichment provider (anthropic, openai, google, ollama, or an OpenAI-compatible host)
     SetProvider {
@@ -484,9 +491,17 @@ async fn main() -> Result<()> {
                                     println!("Transcription Mode: Local");
                                     println!("Model: {}", model.display_name());
                                 }
-                                TranscriptionMode::Api { api_key: _ } => {
-                                    println!("Transcription Mode: OpenAI API");
-                                    println!("API Key: ***configured***");
+                                TranscriptionMode::Api { .. } => {
+                                    println!("Transcription Mode: Cloud API");
+                                    println!("Host: {}", config.transcription_host_display());
+                                    println!("Endpoint: {}", config.transcription_base_url());
+                                    println!("Model: {}", config.transcription_model());
+                                    let key_status = if config.resolve_transcription_api_key().is_some() {
+                                        "***configured***"
+                                    } else {
+                                        "(not set)"
+                                    };
+                                    println!("API Key: {}", key_status);
                                 }
                             }
                             println!("\nEnrichment:");
@@ -538,10 +553,42 @@ async fn main() -> Result<()> {
                         );
                         Ok(())
                     }
-                    ConfigCommand::SetApi { api_key } => {
+                    ConfigCommand::SetApi { api_key, preset, base_url, model } => {
                         let mut config = ScribaConfig::load()?;
-                        config.set_transcription_mode(TranscriptionMode::Api { api_key })?;
-                        println!("✅ Updated transcription mode to OpenAI API");
+                        let (mut new_base_url, mut new_model) = match &config.transcription {
+                            TranscriptionMode::Api { base_url, model, .. } => (base_url.clone(), model.clone()),
+                            TranscriptionMode::Local { .. } => (
+                                config.last_transcription_base_url.clone(),
+                                config.last_transcription_model.clone(),
+                            ),
+                        };
+                        if let Some(name) = preset {
+                            let p = TranscriptionPreset::by_name(&name).ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "Unknown transcription preset '{}'. Use one of: {}",
+                                    name,
+                                    TranscriptionPreset::names().join(", ")
+                                )
+                            })?;
+                            new_base_url = Some(p.base_url.to_string());
+                            new_model = Some(p.model.to_string());
+                        }
+                        if let Some(url) = base_url {
+                            new_base_url = Some(url.trim().trim_end_matches('/').to_string()).filter(|u| !u.is_empty());
+                        }
+                        if let Some(m) = model {
+                            new_model = Some(m.trim().to_string()).filter(|m| !m.is_empty());
+                        }
+                        config.set_transcription_mode(TranscriptionMode::Api {
+                            api_key,
+                            base_url: new_base_url,
+                            model: new_model,
+                        })?;
+                        println!(
+                            "✅ Cloud transcription: {} ({})",
+                            config.transcription_host_display(),
+                            config.transcription_model()
+                        );
                         Ok(())
                     }
                     ConfigCommand::SetProvider { provider, base_url } => {

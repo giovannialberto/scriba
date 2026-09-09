@@ -15,7 +15,95 @@ pub enum TranscriptionMode {
         #[serde(alias = "model_size")]
         model: LocalModel,
     },
-    Api { api_key: String },
+    /// Any OpenAI-compatible `/audio/transcriptions` endpoint: OpenAI itself,
+    /// Groq, DeepInfra, or a self-hosted server.
+    Api {
+        api_key: String,
+        /// API root, e.g. `https://api.groq.com/openai/v1`. None = OpenAI.
+        #[serde(default)]
+        base_url: Option<String>,
+        /// Transcription model id. None = `DEFAULT_TRANSCRIPTION_MODEL`.
+        #[serde(default)]
+        model: Option<String>,
+    },
+}
+
+impl TranscriptionMode {
+    /// OpenAI transcription with the default model.
+    pub fn api(api_key: impl Into<String>) -> Self {
+        TranscriptionMode::Api {
+            api_key: api_key.into(),
+            base_url: None,
+            model: None,
+        }
+    }
+}
+
+/// Default API root for cloud transcription.
+pub const DEFAULT_TRANSCRIPTION_BASE_URL: &str = "https://api.openai.com/v1";
+/// Default cloud transcription model.
+pub const DEFAULT_TRANSCRIPTION_MODEL: &str = "whisper-1";
+
+/// OpenAI transcription models offered in the UI (id, label).
+pub const OPENAI_TRANSCRIPTION_MODELS: &[(&str, &str)] = &[
+    ("whisper-1", "Whisper (whisper-1)"),
+    ("gpt-4o-mini-transcribe", "GPT-4o mini transcribe"),
+    ("gpt-4o-transcribe", "GPT-4o transcribe"),
+    ("gpt-transcribe", "GPT transcribe"),
+    ("gpt-4o-transcribe-diarize", "GPT-4o transcribe with speaker labels"),
+];
+
+/// A known host for OpenAI-compatible speech-to-text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TranscriptionPreset {
+    pub name: &'static str,
+    pub display: &'static str,
+    pub base_url: &'static str,
+    pub model: &'static str,
+    pub env_var: &'static str,
+}
+
+/// Hosts with a drop-in `/audio/transcriptions` endpoint.
+pub const TRANSCRIPTION_PRESETS: &[TranscriptionPreset] = &[
+    TranscriptionPreset {
+        name: "openai",
+        display: "OpenAI",
+        base_url: DEFAULT_TRANSCRIPTION_BASE_URL,
+        model: DEFAULT_TRANSCRIPTION_MODEL,
+        env_var: "OPENAI_API_KEY",
+    },
+    TranscriptionPreset {
+        name: "groq",
+        display: "Groq",
+        base_url: "https://api.groq.com/openai/v1",
+        model: "whisper-large-v3-turbo",
+        env_var: "GROQ_API_KEY",
+    },
+    TranscriptionPreset {
+        name: "deepinfra",
+        display: "DeepInfra",
+        base_url: "https://api.deepinfra.com/v1/openai",
+        model: "openai/whisper-large-v3-turbo",
+        env_var: "DEEPINFRA_API_KEY",
+    },
+];
+
+impl TranscriptionPreset {
+    pub fn by_name(name: &str) -> Option<&'static TranscriptionPreset> {
+        let lower = name.to_lowercase();
+        TRANSCRIPTION_PRESETS.iter().find(|p| p.name == lower)
+    }
+
+    pub fn for_url(url: &str) -> Option<&'static TranscriptionPreset> {
+        let normalized = url.trim().trim_end_matches('/').to_lowercase();
+        TRANSCRIPTION_PRESETS
+            .iter()
+            .find(|p| normalized.starts_with(&p.base_url.to_lowercase()))
+    }
+
+    pub fn names() -> Vec<&'static str> {
+        TRANSCRIPTION_PRESETS.iter().map(|p| p.name).collect()
+    }
 }
 
 /// Available local transcription models.
@@ -141,6 +229,12 @@ pub struct ScribaConfig {
     /// Preserved cloud provider when switching from Cloud to Private mode.
     #[serde(default)]
     pub last_cloud_provider: Option<CloudProvider>,
+    /// Preserved cloud transcription endpoint when switching to Private mode.
+    #[serde(default)]
+    pub last_transcription_base_url: Option<String>,
+    /// Preserved cloud transcription model when switching to Private mode.
+    #[serde(default)]
+    pub last_transcription_model: Option<String>,
     /// Check for updates on launch (default: true).
     #[serde(default = "default_true")]
     pub check_for_updates: bool,
@@ -873,6 +967,8 @@ impl Default for ScribaConfig {
             voice: VoiceConfig::default(),
             last_local_model: None,
             last_cloud_provider: None,
+            last_transcription_base_url: None,
+            last_transcription_model: None,
             check_for_updates: true,
         }
     }
@@ -920,11 +1016,13 @@ impl ScribaConfig {
 
     /// Set the transcription mode and save.
     pub fn set_transcription_mode(&mut self, mode: TranscriptionMode) -> Result<()> {
-        // Save current API key if switching away from API mode
-        if let TranscriptionMode::Api { api_key } = &self.transcription {
+        // Save current API settings if switching away from API mode
+        if let TranscriptionMode::Api { api_key, base_url, model } = &self.transcription {
             if !api_key.is_empty() {
                 self.last_api_key = Some(api_key.clone());
             }
+            self.last_transcription_base_url = base_url.clone();
+            self.last_transcription_model = model.clone();
         }
         // Save current local model if switching away from Local mode
         if let TranscriptionMode::Local { model } = &self.transcription {
@@ -943,8 +1041,86 @@ impl ScribaConfig {
     /// Get the API key if in API mode.
     pub fn get_api_key(&self) -> Option<&str> {
         match &self.transcription {
-            TranscriptionMode::Api { api_key } => Some(api_key),
+            TranscriptionMode::Api { api_key, .. } => Some(api_key),
             _ => None,
+        }
+    }
+
+    /// Effective cloud transcription API root.
+    pub fn transcription_base_url(&self) -> String {
+        match &self.transcription {
+            TranscriptionMode::Api { base_url: Some(u), .. } if !u.trim().is_empty() => {
+                u.trim().trim_end_matches('/').to_string()
+            }
+            _ => DEFAULT_TRANSCRIPTION_BASE_URL.to_string(),
+        }
+    }
+
+    /// Effective cloud transcription model.
+    pub fn transcription_model(&self) -> String {
+        match &self.transcription {
+            TranscriptionMode::Api { model: Some(m), .. } if !m.trim().is_empty() => m.trim().to_string(),
+            _ => DEFAULT_TRANSCRIPTION_MODEL.to_string(),
+        }
+    }
+
+    /// Environment variable consulted for the transcription key.
+    pub fn transcription_api_key_env(&self) -> String {
+        TranscriptionPreset::for_url(&self.transcription_base_url())
+            .map(|p| p.env_var)
+            .unwrap_or("SCRIBA_STT_API_KEY")
+            .to_string()
+    }
+
+    /// Transcription key: config value, else the host's environment variable.
+    pub fn resolve_transcription_api_key(&self) -> Option<String> {
+        match &self.transcription {
+            TranscriptionMode::Api { api_key, .. } if !api_key.trim().is_empty() => Some(api_key.clone()),
+            TranscriptionMode::Api { .. } => std::env::var(self.transcription_api_key_env())
+                .ok()
+                .filter(|k| !k.trim().is_empty()),
+            TranscriptionMode::Local { .. } => None,
+        }
+    }
+
+    /// Human-readable transcription host ("OpenAI", "Groq", or the domain).
+    pub fn transcription_host_display(&self) -> String {
+        let url = self.transcription_base_url();
+        if let Some(preset) = TranscriptionPreset::for_url(&url) {
+            return preset.display.to_string();
+        }
+        url.split("//")
+            .nth(1)
+            .and_then(|rest| rest.split('/').next())
+            .unwrap_or(&url)
+            .to_string()
+    }
+
+    /// API mode with `key`, keeping the configured (or last used) endpoint and model.
+    pub fn api_mode_with_key(&self, key: String) -> TranscriptionMode {
+        let (base_url, model) = match &self.transcription {
+            TranscriptionMode::Api { base_url, model, .. } => (base_url.clone(), model.clone()),
+            TranscriptionMode::Local { .. } => (
+                self.last_transcription_base_url.clone(),
+                self.last_transcription_model.clone(),
+            ),
+        };
+        TranscriptionMode::Api { api_key: key, base_url, model }
+    }
+
+    /// Set the cloud transcription endpoint (only effective in API mode; empty clears).
+    pub fn set_transcription_base_url(&mut self, url: Option<String>) {
+        if let TranscriptionMode::Api { base_url, .. } = &mut self.transcription {
+            *base_url = url
+                .map(|u| u.trim().trim_end_matches('/').to_string())
+                .filter(|u| !u.is_empty());
+        }
+    }
+
+    /// Set the cloud transcription model (only effective in API mode; empty clears).
+    pub fn set_transcription_model(&mut self, model: Option<String>) {
+        if let TranscriptionMode::Api { model: m, .. } = &mut self.transcription {
+            *m = model.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
         }
     }
 
@@ -978,7 +1154,7 @@ pub fn resolve_transcription_mode(
     }
 
     if let Some(key) = api_key {
-        return Ok(TranscriptionMode::Api { api_key: key });
+        return Ok(config.api_mode_with_key(key));
     }
 
     if let Some(model) = model {
@@ -1003,6 +1179,66 @@ mod tests {
             base_url: base_url.map(str::to_string),
         };
         config
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn transcription_defaults_and_overrides() {
+        let mut config = ScribaConfig::default();
+        config.transcription = TranscriptionMode::api("sk-openai");
+        assert_eq!(config.transcription_base_url(), DEFAULT_TRANSCRIPTION_BASE_URL);
+        assert_eq!(config.transcription_model(), DEFAULT_TRANSCRIPTION_MODEL);
+        assert_eq!(config.transcription_host_display(), "OpenAI");
+        assert_eq!(config.transcription_api_key_env(), "OPENAI_API_KEY");
+        assert_eq!(config.resolve_transcription_api_key().as_deref(), Some("sk-openai"));
+
+        config.set_transcription_base_url(Some("https://api.groq.com/openai/v1/".into()));
+        config.set_transcription_model(Some(" whisper-large-v3-turbo ".into()));
+        assert_eq!(config.transcription_base_url(), "https://api.groq.com/openai/v1");
+        assert_eq!(config.transcription_model(), "whisper-large-v3-turbo");
+        assert_eq!(config.transcription_host_display(), "Groq");
+        assert_eq!(config.transcription_api_key_env(), "GROQ_API_KEY");
+
+        config.set_transcription_base_url(Some("http://stt.local:8000/v1".into()));
+        assert_eq!(config.transcription_host_display(), "stt.local:8000");
+        assert_eq!(config.transcription_api_key_env(), "SCRIBA_STT_API_KEY");
+        config.set_transcription_model(Some("  ".into()));
+        assert_eq!(config.transcription_model(), DEFAULT_TRANSCRIPTION_MODEL);
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn api_mode_with_key_keeps_endpoint_across_mode_switches() {
+        let mut config = ScribaConfig::default();
+        config.transcription = TranscriptionMode::Api {
+            api_key: "k".into(),
+            base_url: Some("https://api.groq.com/openai/v1".into()),
+            model: Some("whisper-large-v3-turbo".into()),
+        };
+        // Switching to Local must remember the endpoint/model (without saving to disk).
+        if let TranscriptionMode::Api { base_url, model, .. } = &config.transcription {
+            config.last_transcription_base_url = base_url.clone();
+            config.last_transcription_model = model.clone();
+        }
+        config.transcription = TranscriptionMode::Local { model: LocalModel::ParakeetTdt };
+        let restored = config.api_mode_with_key("k2".into());
+        match restored {
+            TranscriptionMode::Api { api_key, base_url, model } => {
+                assert_eq!(api_key, "k2");
+                assert_eq!(base_url.as_deref(), Some("https://api.groq.com/openai/v1"));
+                assert_eq!(model.as_deref(), Some("whisper-large-v3-turbo"));
+            }
+            _ => panic!("expected Api mode"),
+        }
+    }
+
+    #[test]
+    fn legacy_api_transcription_config_deserializes() {
+        let json = r#"{"Api":{"api_key":"sk"}}"#;
+        let mode: TranscriptionMode = serde_json::from_str(json).unwrap();
+        assert!(matches!(mode, TranscriptionMode::Api { base_url: None, model: None, .. }));
+        assert_eq!(TranscriptionPreset::by_name("Groq").unwrap().model, "whisper-large-v3-turbo");
+        assert!(TranscriptionPreset::for_url("https://api.deepinfra.com/v1/openai/").is_some());
     }
 
     #[test]

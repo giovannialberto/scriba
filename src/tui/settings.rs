@@ -1,5 +1,6 @@
 use crate::core::{
-    CloudProvider, EnrichmentMode, LocalModel, TranscriptionMode, DEFAULT_OLLAMA_ENDPOINT, DEFAULT_OLLAMA_MODEL,
+    CloudProvider, EnrichmentMode, LocalModel, ScribaConfig, TranscriptionMode, DEFAULT_OLLAMA_ENDPOINT,
+    DEFAULT_OLLAMA_MODEL, OPENAI_TRANSCRIPTION_MODELS,
 };
 use crate::enrichment::OllamaClient;
 use anyhow::Result;
@@ -19,35 +20,69 @@ use super::chat::ACCENT;
 // ─── Settings index layout ───────────────────────────────────────────────────
 //
 // Index 0 is always the mode toggle. Mode-specific items follow (3 for Private,
-// 4 or 5 for Cloud), then the shared items (Recording, General).
+// the `cloud_rows` for Cloud), then the shared items (Recording, General).
 
 const IDX_MODE: usize = 0;
 /// Number of mode-specific items in Private mode (STT Model, Ollama Model, Ollama Server).
 const PRIVATE_MODE_ITEMS: usize = 3;
-/// Number of mode-specific items in Cloud mode (Whisper API Key, LLM Provider, Model, Provider API Key).
-const CLOUD_MODE_ITEMS: usize = 4;
-/// Cloud-mode index of the Endpoint row, shown only for OpenAI-compatible providers.
-const IDX_CLOUD_ENDPOINT: usize = 5;
 /// Number of shared items (Auto-Stop, Timeout, Meeting Watch, Check for Updates).
 const SHARED_ITEMS: usize = 4;
 
-/// Number of mode-specific items for the given mode.
-fn mode_items(is_private: bool, has_endpoint_row: bool) -> usize {
-    if is_private {
-        PRIVATE_MODE_ITEMS
-    } else {
-        CLOUD_MODE_ITEMS + usize::from(has_endpoint_row)
+/// Rows of the Cloud section, in display order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloudRow {
+    /// API key for the transcription host.
+    TranscriptionKey,
+    /// Transcription model id.
+    TranscriptionModel,
+    /// Transcription API root.
+    TranscriptionEndpoint,
+    /// LLM provider (cycles).
+    Provider,
+    /// LLM model (picker).
+    Model,
+    /// LLM API key.
+    EnrichmentKey,
+    /// LLM endpoint, only for OpenAI-compatible providers.
+    Endpoint,
+}
+
+/// Cloud rows for the current configuration.
+fn cloud_rows(config: &ScribaConfig) -> Vec<CloudRow> {
+    let mut rows = vec![
+        CloudRow::TranscriptionKey,
+        CloudRow::TranscriptionModel,
+        CloudRow::TranscriptionEndpoint,
+        CloudRow::Provider,
+        CloudRow::Model,
+        CloudRow::EnrichmentKey,
+    ];
+    if config.enrichment.has_custom_endpoint() {
+        rows.push(CloudRow::Endpoint);
     }
+    rows
+}
+
+/// Cloud transcription text fields edited inline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SttField {
+    Model,
+    Endpoint,
+}
+
+/// Number of mode-specific items for the given mode.
+fn mode_items(is_private: bool, cloud_row_count: usize) -> usize {
+    if is_private { PRIVATE_MODE_ITEMS } else { cloud_row_count }
 }
 
 /// First shared-section index for a given mode.
-fn shared_offset(is_private: bool, has_endpoint_row: bool) -> usize {
-    1 + mode_items(is_private, has_endpoint_row)
+fn shared_offset(is_private: bool, cloud_row_count: usize) -> usize {
+    1 + mode_items(is_private, cloud_row_count)
 }
 
 /// Maximum selectable index for a given mode.
-fn max_index(is_private: bool, has_endpoint_row: bool) -> usize {
-    shared_offset(is_private, has_endpoint_row) + SHARED_ITEMS - 1
+fn max_index(is_private: bool, cloud_row_count: usize) -> usize {
+    shared_offset(is_private, cloud_row_count) + SHARED_ITEMS - 1
 }
 
 // ─── Settings types ──────────────────────────────────────────────────────────
@@ -70,7 +105,7 @@ pub(super) struct ModelPickerItem {
 
 impl Dashboard {
     pub(super) fn is_editing_settings_field(&self) -> bool {
-        self.editing_api_key || self.model_picker_state != ModelPickerState::Closed || self.editing_enrichment_endpoint || self.editing_enrichment_api_key
+        self.editing_api_key || self.model_picker_state != ModelPickerState::Closed || self.editing_enrichment_endpoint || self.editing_enrichment_api_key || self.editing_stt_field.is_some()
     }
 
     pub(super) fn save_enrichment_config(&mut self) -> Result<()> {
@@ -161,9 +196,9 @@ impl Dashboard {
     pub(super) async fn handle_settings_keys(&mut self, key_code: KeyCode) -> Result<DashboardAction> {
         // Dual-mode settings layout:
         let is_private = self.config.is_private_mode();
-        let has_endpoint_row = self.config.enrichment.has_custom_endpoint();
-        let max_idx = max_index(is_private, has_endpoint_row);
-        let shared_off = shared_offset(is_private, has_endpoint_row);
+        let rows = cloud_rows(&self.config);
+        let max_idx = max_index(is_private, rows.len());
+        let shared_off = shared_offset(is_private, rows.len());
 
         match key_code {
             KeyCode::Esc => {
@@ -173,6 +208,7 @@ impl Dashboard {
                     self.editing_api_key = false;
                     self.editing_enrichment_endpoint = false;
                     self.editing_enrichment_api_key = false;
+                    self.editing_stt_field = None;
                 } else {
                     self.current_view = DashboardView::Main;
                 }
@@ -202,10 +238,8 @@ impl Dashboard {
             KeyCode::Enter => {
                 // Handle active editing states first (these are mode-independent)
                 if self.editing_api_key {
-                    // Save OpenAI transcription API key
-                    let new_mode = TranscriptionMode::Api {
-                        api_key: self.api_key_input.clone(),
-                    };
+                    // Save the transcription API key, keeping endpoint and model
+                    let new_mode = self.config.api_mode_with_key(self.api_key_input.clone());
                     if let Err(e) = self.config.set_transcription_mode(new_mode) {
                         self.message = format!("Failed to save API key: {}", e);
                         self.show_message = true;
@@ -213,6 +247,18 @@ impl Dashboard {
                     }
                     self.editing_api_key = false;
                     self.api_key_input.clear();
+                } else if let Some(field) = self.editing_stt_field.take() {
+                    let value = Some(self.stt_field_input.trim().to_string()).filter(|v| !v.is_empty());
+                    match field {
+                        SttField::Model => self.config.set_transcription_model(value),
+                        SttField::Endpoint => self.config.set_transcription_base_url(value),
+                    }
+                    if let Err(e) = self.config.save() {
+                        self.message = format!("Failed to save transcription setting: {}", e);
+                        self.show_message = true;
+                        self.return_to_view = Some(DashboardView::Settings);
+                    }
+                    self.stt_field_input.clear();
                 } else if self.model_picker_state == ModelPickerState::Open {
                     if let Some(item) = self.model_picker_items.get(self.model_picker_selection) {
                         if item.display_name == "Loading..." {
@@ -321,7 +367,8 @@ impl Dashboard {
                                 base_url: enrichment_base_url,
                             };
                             // set_transcription_mode preserves last_local_model_size & last_api_key, then saves
-                            new_cfg.set_transcription_mode(TranscriptionMode::Api { api_key: transcription_key })?;
+                            let api_mode = new_cfg.api_mode_with_key(transcription_key);
+                            new_cfg.set_transcription_mode(api_mode)?;
                         } else {
                             // Cloud → Private
                             if let Some(p) = new_cfg.enrichment.cloud_provider().cloned() {
@@ -377,56 +424,60 @@ impl Dashboard {
                                 self.editing_enrichment_endpoint = true;
                                 self.enrichment_endpoint_input = self.config.enrichment.ollama_endpoint();
                             }
-                            (1, false) => {
-                                // Edit OpenAI transcription API key
-                                self.editing_api_key = true;
-                                self.api_key_input = match &self.config.transcription {
-                                    TranscriptionMode::Api { api_key } => api_key.clone(),
-                                    _ => String::new(),
-                                };
-                            }
-                            (2, false) => {
-                                // Cycle cloud enrichment provider (see CloudProvider::ALL for the order)
-                                self.close_model_picker();
-                                let (cur_provider, cur_key, cur_model, cur_base_url) = match &self.config.enrichment.mode {
-                                    EnrichmentMode::Cloud { provider, api_key, model, base_url } => {
-                                        (provider.clone(), api_key.clone(), model.clone(), base_url.clone())
-                                    }
-                                    _ => (CloudProvider::Anthropic, String::new(), None, None),
-                                };
-                                self.config.enrichment.save_key_for_provider(&cur_provider, &cur_key);
-                                self.config.enrichment.save_model_for_provider(&cur_provider, &cur_model);
-                                self.config.enrichment.save_base_url_for_provider(&cur_provider, &cur_base_url);
-                                let next_provider = cur_provider.next();
-                                let next_key = self.config.enrichment.load_key_for_provider(&next_provider);
-                                let next_model = self.config.enrichment.load_model_for_provider(&next_provider);
-                                let next_base_url = self.config.enrichment.load_base_url_for_provider(&next_provider);
-                                self.config.enrichment.mode = EnrichmentMode::Cloud {
-                                    provider: next_provider,
-                                    api_key: next_key,
-                                    model: next_model,
-                                    base_url: next_base_url,
-                                };
-                                if let Err(e) = self.save_enrichment_config() {
-                                    self.message = format!("Failed to save provider: {}", e);
-                                    self.show_message = true;
-                                    self.return_to_view = Some(DashboardView::Settings);
+                            (idx, false) => match rows.get(idx.saturating_sub(1)) {
+                                Some(CloudRow::TranscriptionKey) => {
+                                    self.editing_api_key = true;
+                                    self.api_key_input = self.config.get_api_key().unwrap_or("").to_string();
                                 }
-                            }
-                            (3, false) => {
-                                // Open cloud model picker
-                                self.open_model_picker();
-                            }
-                            (4, false) => {
-                                // Edit enrichment API key
-                                self.editing_enrichment_api_key = true;
-                                self.enrichment_api_key_input = self.config.enrichment.api_key().unwrap_or("").to_string();
-                            }
-                            (IDX_CLOUD_ENDPOINT, false) if has_endpoint_row => {
-                                // Edit OpenAI-compatible base URL
-                                self.editing_enrichment_endpoint = true;
-                                self.enrichment_endpoint_input = self.config.enrichment.effective_base_url().unwrap_or_default();
-                            }
+                                Some(CloudRow::TranscriptionModel) => {
+                                    self.editing_stt_field = Some(SttField::Model);
+                                    self.stt_field_input = self.config.transcription_model();
+                                }
+                                Some(CloudRow::TranscriptionEndpoint) => {
+                                    self.editing_stt_field = Some(SttField::Endpoint);
+                                    self.stt_field_input = self.config.transcription_base_url();
+                                }
+                                Some(CloudRow::Provider) => {
+                                    // Cycle cloud enrichment provider (see CloudProvider::ALL for the order)
+                                    self.close_model_picker();
+                                    let (cur_provider, cur_key, cur_model, cur_base_url) = match &self.config.enrichment.mode {
+                                        EnrichmentMode::Cloud { provider, api_key, model, base_url } => {
+                                            (provider.clone(), api_key.clone(), model.clone(), base_url.clone())
+                                        }
+                                        _ => (CloudProvider::Anthropic, String::new(), None, None),
+                                    };
+                                    self.config.enrichment.save_key_for_provider(&cur_provider, &cur_key);
+                                    self.config.enrichment.save_model_for_provider(&cur_provider, &cur_model);
+                                    self.config.enrichment.save_base_url_for_provider(&cur_provider, &cur_base_url);
+                                    let next_provider = cur_provider.next();
+                                    let next_key = self.config.enrichment.load_key_for_provider(&next_provider);
+                                    let next_model = self.config.enrichment.load_model_for_provider(&next_provider);
+                                    let next_base_url = self.config.enrichment.load_base_url_for_provider(&next_provider);
+                                    self.config.enrichment.mode = EnrichmentMode::Cloud {
+                                        provider: next_provider,
+                                        api_key: next_key,
+                                        model: next_model,
+                                        base_url: next_base_url,
+                                    };
+                                    if let Err(e) = self.save_enrichment_config() {
+                                        self.message = format!("Failed to save provider: {}", e);
+                                        self.show_message = true;
+                                        self.return_to_view = Some(DashboardView::Settings);
+                                    }
+                                }
+                                Some(CloudRow::Model) => {
+                                    self.open_model_picker();
+                                }
+                                Some(CloudRow::EnrichmentKey) => {
+                                    self.editing_enrichment_api_key = true;
+                                    self.enrichment_api_key_input = self.config.enrichment.api_key().unwrap_or("").to_string();
+                                }
+                                Some(CloudRow::Endpoint) => {
+                                    self.editing_enrichment_endpoint = true;
+                                    self.enrichment_endpoint_input = self.config.enrichment.effective_base_url().unwrap_or_default();
+                                }
+                                None => {}
+                            },
                             _ => {}
                         }
 
@@ -492,6 +543,8 @@ impl Dashboard {
                     self.enrichment_endpoint_input.push(c);
                 } else if self.editing_enrichment_api_key {
                     self.enrichment_api_key_input.push(c);
+                } else if self.editing_stt_field.is_some() {
+                    self.stt_field_input.push(c);
                 }
                 Ok(DashboardAction::Continue)
             }
@@ -504,6 +557,8 @@ impl Dashboard {
                     self.enrichment_endpoint_input.pop();
                 } else if self.editing_enrichment_api_key {
                     self.enrichment_api_key_input.pop();
+                } else if self.editing_stt_field.is_some() {
+                    self.stt_field_input.pop();
                 }
                 Ok(DashboardAction::Continue)
             }
@@ -589,12 +644,12 @@ impl Dashboard {
         let pad = 28; // label column width (must fit "Anthropic (Claude) API Key")
 
         let is_private = self.config.is_private_mode();
-        let has_endpoint_row = self.config.enrichment.has_custom_endpoint();
+        let rows = cloud_rows(&self.config);
         let sel = self.settings_selection;
         let mut lines: Vec<Line> = Vec::new();
 
         // Shared section indices depend on mode
-        let shared_off = shared_offset(is_private, has_endpoint_row);
+        let shared_off = shared_offset(is_private, rows.len());
 
         // Helper macro for building a setting line with ▸ selection marker
         macro_rules! setting_line {
@@ -683,74 +738,106 @@ impl Dashboard {
             lines.push(Line::from(""));
             lines.push(Line::from(vec![Span::raw("  "), Span::styled("CLOUD", section_style)]));
 
-            // Index 1: Whisper API Key (transcription)
-            if let TranscriptionMode::Api { api_key } = &self.config.transcription {
-                let api_key_display = if self.editing_api_key {
-                    format!("{}_", self.api_key_input)
-                } else if api_key.is_empty() {
+            let mask = |key: &str| -> String {
+                if key.is_empty() {
                     "[Not Set]".to_string()
+                } else if key.chars().count() >= 4 {
+                    format!("{}******", key.chars().take(4).collect::<String>())
                 } else {
-                    let prefix: String = api_key.chars().take(4).collect();
-                    format!("{}******", prefix)
-                };
-                let style_override = if sel == 1 && self.editing_api_key { Some(val_editing) } else { None };
-                setting_line!("Whisper API Key", api_key_display, 1, "\u{2190} Enter to edit", style_override);
-            }
-
-            // Index 2: LLM Provider (cycle)
-            setting_line!("LLM Provider", self.config.enrichment.provider_display_name(), 2, "\u{2190} Enter to cycle", None::<Style>);
-
-            // Index 3: Model (picker)
-            let model_idx: usize = 3;
-            if self.model_picker_state == ModelPickerState::Closed {
-                setting_line!("Model", self.config.enrichment.model_name(), model_idx, "\u{2190} Enter to choose", None::<Style>);
-            } else {
-                let picker_marker = if sel == model_idx { "\u{25B8} " } else { "  " };
-                lines.push(Line::from(vec![
-                    Span::styled(picker_marker, if sel == model_idx { marker_style } else { Style::default() }),
-                    Span::styled(format!("{:<width$}", "Model", width = pad), label_style),
-                    Span::styled("(select below)", hint_style),
-                ]));
-                self.render_model_picker_items(&mut lines, val_selected, val_editing, val_normal);
-            }
-
-            // Index 4: Enrichment API Key
-            let key_label = match self.config.enrichment.cloud_provider() {
-                Some(_) => format!("{} API Key", self.config.enrichment.provider_display_name()),
-                None => "API Key".to_string(),
-            };
-            let env_hint = match self.config.enrichment.api_key_env_var() {
-                Some(env) => format!(" (or set {})", env),
-                None => String::new(),
-            };
-            let key_display = if self.editing_enrichment_api_key {
-                format!("{}_", self.enrichment_api_key_input)
-            } else {
-                match self.config.enrichment.api_key() {
-                    Some(key) if key.len() >= 4 => {
-                        let prefix: String = key.chars().take(4).collect();
-                        format!("{}******", prefix)
-                    }
-                    Some(_) => "******".to_string(),
-                    None => format!("[Not Set]{}", env_hint),
+                    "******".to_string()
                 }
             };
-            let style_override = if sel == 4 && self.editing_enrichment_api_key { Some(val_editing) } else { None };
-            setting_line!(key_label, key_display, 4, "\u{2190} Enter to edit", style_override);
 
-            // Index 5: Endpoint (OpenAI-compatible providers only)
-            if has_endpoint_row {
-                let endpoint_display = if self.editing_enrichment_endpoint {
-                    format!("{}_", self.enrichment_endpoint_input)
-                } else {
-                    self.config.enrichment.effective_base_url().unwrap_or_default()
-                };
-                let style_override = if sel == IDX_CLOUD_ENDPOINT && self.editing_enrichment_endpoint { Some(val_editing) } else { None };
-                setting_line!("Endpoint", endpoint_display, IDX_CLOUD_ENDPOINT, "\u{2190} Enter to edit (DeepInfra, OpenRouter, Groq, vLLM...)", style_override);
+            for (offset, row) in rows.iter().enumerate() {
+                let idx = offset + 1;
+                match row {
+                    CloudRow::TranscriptionKey => {
+                        let host = self.config.transcription_host_display();
+                        let display = if self.editing_api_key {
+                            format!("{}_", self.api_key_input)
+                        } else {
+                            let stored = self.config.get_api_key().unwrap_or("");
+                            if stored.is_empty() {
+                                format!("[Not Set] (or set {})", self.config.transcription_api_key_env())
+                            } else {
+                                mask(stored)
+                            }
+                        };
+                        let style_override = if sel == idx && self.editing_api_key { Some(val_editing) } else { None };
+                        setting_line!(format!("{} STT Key", host), display, idx, "\u{2190} Enter to edit", style_override);
+                    }
+                    CloudRow::TranscriptionModel => {
+                        let editing = self.editing_stt_field == Some(SttField::Model);
+                        let display = if editing {
+                            format!("{}_", self.stt_field_input)
+                        } else {
+                            self.config.transcription_model()
+                        };
+                        let hint = if self.config.transcription_host_display() == "OpenAI" {
+                            let ids: Vec<&str> = OPENAI_TRANSCRIPTION_MODELS.iter().map(|(id, _)| *id).collect();
+                            format!("\u{2190} Enter to edit ({})", ids.join(", "))
+                        } else {
+                            "\u{2190} Enter to edit (model id as listed by the host)".to_string()
+                        };
+                        let style_override = if sel == idx && editing { Some(val_editing) } else { None };
+                        setting_line!("STT Model", display, idx, hint, style_override);
+                    }
+                    CloudRow::TranscriptionEndpoint => {
+                        let editing = self.editing_stt_field == Some(SttField::Endpoint);
+                        let display = if editing {
+                            format!("{}_", self.stt_field_input)
+                        } else {
+                            self.config.transcription_base_url()
+                        };
+                        let style_override = if sel == idx && editing { Some(val_editing) } else { None };
+                        setting_line!("STT Endpoint", display, idx, "\u{2190} Enter to edit (OpenAI, Groq, DeepInfra, self-hosted)", style_override);
+                    }
+                    CloudRow::Provider => {
+                        setting_line!("LLM Provider", self.config.enrichment.provider_display_name(), idx, "\u{2190} Enter to cycle", None::<Style>);
+                    }
+                    CloudRow::Model => {
+                        if self.model_picker_state == ModelPickerState::Closed {
+                            setting_line!("LLM Model", self.config.enrichment.model_name(), idx, "\u{2190} Enter to choose", None::<Style>);
+                        } else {
+                            let picker_marker = if sel == idx { "\u{25B8} " } else { "  " };
+                            lines.push(Line::from(vec![
+                                Span::styled(picker_marker, if sel == idx { marker_style } else { Style::default() }),
+                                Span::styled(format!("{:<width$}", "LLM Model", width = pad), label_style),
+                                Span::styled("(select below)", hint_style),
+                            ]));
+                            self.render_model_picker_items(&mut lines, val_selected, val_editing, val_normal);
+                        }
+                    }
+                    CloudRow::EnrichmentKey => {
+                        let env_hint = match self.config.enrichment.api_key_env_var() {
+                            Some(env) => format!(" (or set {})", env),
+                            None => String::new(),
+                        };
+                        let display = if self.editing_enrichment_api_key {
+                            format!("{}_", self.enrichment_api_key_input)
+                        } else {
+                            match self.config.enrichment.api_key() {
+                                Some(key) => mask(key),
+                                None => format!("[Not Set]{}", env_hint),
+                            }
+                        };
+                        let style_override = if sel == idx && self.editing_enrichment_api_key { Some(val_editing) } else { None };
+                        setting_line!(format!("{} Key", self.config.enrichment.provider_display_name()), display, idx, "\u{2190} Enter to edit", style_override);
+                    }
+                    CloudRow::Endpoint => {
+                        let display = if self.editing_enrichment_endpoint {
+                            format!("{}_", self.enrichment_endpoint_input)
+                        } else {
+                            self.config.enrichment.effective_base_url().unwrap_or_default()
+                        };
+                        let style_override = if sel == idx && self.editing_enrichment_endpoint { Some(val_editing) } else { None };
+                        setting_line!("LLM Endpoint", display, idx, "\u{2190} Enter to edit (DeepInfra, OpenRouter, Groq, vLLM...)", style_override);
+                    }
+                }
             }
         }
 
-        // ── RECORDING ───────────────────────────────────────────────
+        // ── RECORDING ───        // ── RECORDING ───────────────────────────────────────────────
         lines.push(Line::from(""));
         lines.push(Line::from(vec![Span::raw("  "), Span::styled("RECORDING", section_style)]));
 
