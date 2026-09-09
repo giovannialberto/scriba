@@ -1,0 +1,616 @@
+//! Unified LLM transport built on [`genai`].
+//!
+//! Every model call in Scriba — enrichment extraction, agent chat, context
+//! compaction, health checks — goes through [`GenaiProvider`]. Provider
+//! selection is a pure function of [`EnrichmentConfig`], resolved into an
+//! [`LlmTarget`] that pins the wire protocol, endpoint, credential and model.
+//! Nothing here guesses a provider from a model name.
+
+use std::time::Duration;
+
+use async_trait::async_trait;
+use futures_util::StreamExt;
+use genai::adapter::AdapterKind;
+use genai::chat::{
+    CacheControl, ChatMessage, ChatOptions, ChatRequest, ChatResponseFormat, ChatStreamEvent,
+    MessageContent, StopReason, Tool,
+};
+use genai::resolver::{AuthData, Endpoint};
+use genai::{Client, ModelIden, ServiceTarget, WebConfig};
+use tokio::sync::mpsc;
+
+use crate::agent::loop_runner::AgentEvent;
+use crate::agent::provider::{AgentProvider, AgentTurnResult};
+use crate::core::config::{CloudProvider, EnrichmentConfig, EnrichmentMode};
+use crate::enrichment::{LlmProvider, OllamaClient, ProviderError};
+
+/// Overall HTTP timeout for a single model call.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+/// Timeout for the lightweight connectivity probe in `health_check`.
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(15);
+/// Output budget for JSON extraction calls.
+const JSON_MAX_TOKENS: u32 = 8192;
+/// Output budget for free-text calls (world evolution, entity context).
+const TEXT_MAX_TOKENS: u32 = 2048;
+/// Output budget for one agent turn.
+const AGENT_MAX_TOKENS: u32 = 8192;
+/// Output budget for history compaction summaries.
+const COMPACTION_MAX_TOKENS: u32 = 1024;
+/// Sampling temperature for providers that accept one.
+const EXTRACTION_TEMPERATURE: f64 = 0.3;
+/// Longest error body we echo back to the user.
+const MAX_ERROR_BODY_CHARS: usize = 500;
+
+/// Wire protocol spoken to the endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    /// Anthropic Messages API.
+    Anthropic,
+    /// OpenAI Chat Completions (also spoken by most open-weight hosts).
+    OpenAI,
+    /// Google Gemini generateContent.
+    Gemini,
+    /// Ollama native `/api/chat`.
+    Ollama,
+}
+
+impl Protocol {
+    fn adapter_kind(self) -> AdapterKind {
+        match self {
+            Protocol::Anthropic => AdapterKind::Anthropic,
+            Protocol::OpenAI => AdapterKind::OpenAI,
+            Protocol::Gemini => AdapterKind::Gemini,
+            Protocol::Ollama => AdapterKind::Ollama,
+        }
+    }
+
+    fn default_endpoint(self) -> &'static str {
+        match self {
+            Protocol::Anthropic => "https://api.anthropic.com/v1/",
+            Protocol::OpenAI => "https://api.openai.com/v1/",
+            Protocol::Gemini => "https://generativelanguage.googleapis.com/v1beta/",
+            Protocol::Ollama => "http://localhost:11434/",
+        }
+    }
+
+    /// Whether the endpoint needs an API key.
+    fn requires_api_key(self) -> bool {
+        !matches!(self, Protocol::Ollama)
+    }
+
+    /// Whether pinning a sampling temperature is safe. Current Anthropic and
+    /// OpenAI reasoning models reject the parameter outright.
+    fn accepts_temperature(self) -> bool {
+        matches!(self, Protocol::Gemini | Protocol::Ollama)
+    }
+
+    /// Whether the adapter has a dedicated JSON-mode flag.
+    fn supports_json_mode(self) -> bool {
+        matches!(self, Protocol::OpenAI | Protocol::Ollama)
+    }
+}
+
+/// Fully resolved destination for model calls.
+#[derive(Debug, Clone)]
+pub struct LlmTarget {
+    pub protocol: Protocol,
+    /// Base URL, always with a trailing slash.
+    pub endpoint: String,
+    /// Credential, if the protocol needs one and one was found.
+    pub api_key: Option<String>,
+    /// Environment variable consulted for the credential (for error hints).
+    pub api_key_env: Option<String>,
+    pub model: String,
+    pub display_name: String,
+}
+
+impl LlmTarget {
+    /// Resolve the target from the enrichment configuration.
+    pub fn from_config(config: &EnrichmentConfig) -> Self {
+        match &config.mode {
+            EnrichmentMode::Cloud {
+                provider, model, ..
+            } => {
+                let protocol = match provider {
+                    CloudProvider::Anthropic => Protocol::Anthropic,
+                    CloudProvider::OpenAI => Protocol::OpenAI,
+                    CloudProvider::Google => Protocol::Gemini,
+                };
+                Self {
+                    protocol,
+                    endpoint: normalize_base_url(protocol.default_endpoint()),
+                    api_key: config.resolve_api_key().filter(|k| !k.trim().is_empty()),
+                    api_key_env: Some(provider.env_var_name().to_string()),
+                    model: model
+                        .clone()
+                        .unwrap_or_else(|| provider.default_model().to_string()),
+                    display_name: provider.display_name().to_string(),
+                }
+            }
+            EnrichmentMode::Local {
+                ollama_endpoint,
+                ollama_model,
+            } => Self {
+                protocol: Protocol::Ollama,
+                endpoint: normalize_base_url(ollama_endpoint),
+                api_key: None,
+                api_key_env: None,
+                model: ollama_model.clone(),
+                display_name: "Ollama (Local)".to_string(),
+            },
+        }
+    }
+
+    fn service_target(&self) -> ServiceTarget {
+        let auth = match &self.api_key {
+            Some(key) => AuthData::from_single(key.clone()),
+            // Ollama ignores the credential but genai requires one.
+            None => AuthData::from_single("ollama"),
+        };
+        ServiceTarget {
+            endpoint: Endpoint::from_owned(self.endpoint.clone()),
+            auth,
+            model: ModelIden::new(self.protocol.adapter_kind(), self.model.as_str()),
+        }
+    }
+}
+
+/// Ensure a base URL ends with exactly one slash so adapters can append paths.
+fn normalize_base_url(url: &str) -> String {
+    let trimmed = url.trim().trim_end_matches('/');
+    format!("{trimmed}/")
+}
+
+/// Map a `genai` error onto Scriba's provider error taxonomy.
+pub fn map_error(err: genai::Error) -> ProviderError {
+    use genai::webc::Error as WebError;
+
+    fn from_web(web: &WebError) -> Option<ProviderError> {
+        match web {
+            WebError::ResponseFailedStatus { status, body, .. } => {
+                Some(status_error(status.as_u16(), body))
+            }
+            WebError::Reqwest(e) if e.is_timeout() => Some(ProviderError::Timeout {
+                seconds: REQUEST_TIMEOUT.as_secs(),
+            }),
+            WebError::Reqwest(e) if e.is_connect() => Some(ProviderError::Network {
+                message: e.to_string(),
+            }),
+            _ => None,
+        }
+    }
+
+    match &err {
+        genai::Error::WebAdapterCall { webc_error, .. }
+        | genai::Error::WebModelCall { webc_error, .. } => {
+            from_web(webc_error).unwrap_or_else(|| ProviderError::Other {
+                message: err.to_string(),
+            })
+        }
+        genai::Error::HttpError { status, body, .. } => status_error(status.as_u16(), body),
+        // Streaming requests surface HTTP failures as a stringified cause.
+        genai::Error::WebStream { cause, .. } => match parse_stream_http_status(cause) {
+            Some((status, body)) => status_error(status, body),
+            None => ProviderError::Network {
+                message: trim_body(cause),
+            },
+        },
+        genai::Error::StreamParse { serde_error, .. } => ProviderError::ParseError {
+            message: serde_error.to_string(),
+        },
+        genai::Error::ChatResponse { body, .. } => ProviderError::Other {
+            message: format!("Stream error: {body}"),
+        },
+        genai::Error::RequiresApiKey { .. }
+        | genai::Error::NoAuthData { .. }
+        | genai::Error::NoAuthResolver { .. } => ProviderError::AuthFailure {
+            message: err.to_string(),
+        },
+        _ => ProviderError::Other {
+            message: err.to_string(),
+        },
+    }
+}
+
+/// Classify an HTTP status into the provider error taxonomy.
+fn status_error(status: u16, body: &str) -> ProviderError {
+    let message = trim_body(body);
+    match status {
+        401 | 403 => ProviderError::AuthFailure { message },
+        // Gemini reports a bad key as 400 INVALID_ARGUMENT rather than 401.
+        400 if body.contains("API_KEY_INVALID") || body.contains("API key not valid") => {
+            ProviderError::AuthFailure { message }
+        }
+        429 => ProviderError::RateLimited { message },
+        _ => ProviderError::HttpStatus { status, message },
+    }
+}
+
+/// Recover `(status, body)` from genai's stringified stream HTTP error,
+/// which looks like `"HTTP error.\nStatus: 400 Bad Request\nBody: {...}"`.
+fn parse_stream_http_status(cause: &str) -> Option<(u16, &str)> {
+    let rest = cause.split("Status:").nth(1)?;
+    let status: u16 = rest.split_whitespace().next()?.parse().ok()?;
+    let body = rest
+        .split_once("Body:")
+        .map(|(_, b)| b.trim())
+        .unwrap_or("");
+    Some((status, body))
+}
+
+fn trim_body(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.chars().count() <= MAX_ERROR_BODY_CHARS {
+        return trimmed.to_string();
+    }
+    let mut s: String = trimmed.chars().take(MAX_ERROR_BODY_CHARS).collect();
+    s.push('…');
+    s
+}
+
+/// The one model transport used by enrichment and the agent.
+pub struct GenaiProvider {
+    target: LlmTarget,
+    service_target: ServiceTarget,
+    client: Client,
+}
+
+impl GenaiProvider {
+    /// Build a provider for a resolved target.
+    pub fn new(target: LlmTarget) -> Self {
+        let service_target = target.service_target();
+        let client = Client::builder()
+            .with_web_config(WebConfig::default().with_timeout(REQUEST_TIMEOUT))
+            .build();
+        Self {
+            target,
+            service_target,
+            client,
+        }
+    }
+
+    /// Build a provider from the enrichment configuration.
+    pub fn from_config(config: &EnrichmentConfig) -> Self {
+        Self::new(LlmTarget::from_config(config))
+    }
+
+    /// The resolved target this provider talks to.
+    pub fn target(&self) -> &LlmTarget {
+        &self.target
+    }
+
+    /// Fail fast with a helpful message instead of a bare 401 when no key is set.
+    fn ensure_credentials(&self) -> Result<(), ProviderError> {
+        if self.target.protocol.requires_api_key() && self.target.api_key.is_none() {
+            let hint = match &self.target.api_key_env {
+                Some(env) => format!(" Add one in Settings or set {env}."),
+                None => String::new(),
+            };
+            return Err(ProviderError::AuthFailure {
+                message: format!(
+                    "No API key configured for {}.{hint}",
+                    self.target.display_name
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn base_options(&self) -> ChatOptions {
+        let mut options = ChatOptions::default();
+        if self.target.protocol.accepts_temperature() {
+            options = options.with_temperature(EXTRACTION_TEMPERATURE);
+        }
+        options
+    }
+
+    /// Non-streaming call returning the concatenated text parts.
+    async fn complete_text(
+        &self,
+        request: ChatRequest,
+        options: ChatOptions,
+    ) -> Result<String, ProviderError> {
+        self.ensure_credentials()?;
+        let response = self
+            .client
+            .exec_chat(self.service_target.clone(), request, Some(&options))
+            .await
+            .map_err(map_error)?;
+        let text = response.content.into_texts().join("");
+        if text.trim().is_empty() {
+            return Err(ProviderError::ParseError {
+                message: format!("Empty response from {}", self.target.display_name),
+            });
+        }
+        Ok(text)
+    }
+}
+
+#[async_trait]
+impl LlmProvider for GenaiProvider {
+    async fn generate(&self, prompt: &str) -> Result<String, ProviderError> {
+        let prompt = format!(
+            "{prompt}\n\nRespond with valid JSON only. No markdown fences, no explanation."
+        );
+        let mut options = self.base_options().with_max_tokens(JSON_MAX_TOKENS);
+        if self.target.protocol.supports_json_mode() {
+            options = options.with_response_format(ChatResponseFormat::JsonMode);
+        }
+        self.complete_text(ChatRequest::from_user(prompt), options)
+            .await
+    }
+
+    async fn generate_text(&self, prompt: &str) -> Result<String, ProviderError> {
+        let options = self.base_options().with_max_tokens(TEXT_MAX_TOKENS);
+        self.complete_text(ChatRequest::from_user(prompt), options)
+            .await
+    }
+
+    async fn health_check(&self) -> Result<(), ProviderError> {
+        if self.target.protocol == Protocol::Ollama {
+            return OllamaClient::new(&self.target.endpoint, &self.target.model)
+                .health_check()
+                .await
+                .map_err(Into::into);
+        }
+        self.ensure_credentials()?;
+        let options = ChatOptions::default().with_max_tokens(64);
+        let call = self.client.exec_chat(
+            self.service_target.clone(),
+            ChatRequest::from_user("Say OK"),
+            Some(&options),
+        );
+        match tokio::time::timeout(HEALTH_TIMEOUT, call).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(map_error(e)),
+            Err(_) => Err(ProviderError::Timeout {
+                seconds: HEALTH_TIMEOUT.as_secs(),
+            }),
+        }
+    }
+
+    fn display_name(&self) -> &str {
+        &self.target.display_name
+    }
+
+    fn model(&self) -> &str {
+        &self.target.model
+    }
+}
+
+#[async_trait]
+impl AgentProvider for GenaiProvider {
+    async fn send_turn(
+        &self,
+        system_prompt: &str,
+        messages: &[ChatMessage],
+        tools: &[Tool],
+        tx: &mpsc::Sender<AgentEvent>,
+    ) -> Result<AgentTurnResult, ProviderError> {
+        self.ensure_credentials()?;
+
+        // The system prompt and tool schemas are the stable prefix of every
+        // turn; marking the system block cacheable lets Anthropic serve both
+        // from cache. Other adapters ignore the hint.
+        let system = ChatMessage::system(system_prompt).with_options(CacheControl::Ephemeral);
+        let mut all = Vec::with_capacity(messages.len() + 1);
+        all.push(system);
+        all.extend(messages.iter().cloned());
+        let request = ChatRequest::new(all).with_tools(tools.to_vec());
+
+        let options = self
+            .base_options()
+            .with_max_tokens(AGENT_MAX_TOKENS)
+            .with_capture_usage(true)
+            .with_capture_content(true)
+            .with_capture_tool_calls(true);
+
+        let mut response = self
+            .client
+            .exec_chat_stream(self.service_target.clone(), request, Some(&options))
+            .await
+            .map_err(map_error)?;
+
+        let mut streamed_text = String::new();
+        let mut end = None;
+        while let Some(event) = response.stream.next().await {
+            match event.map_err(map_error)? {
+                ChatStreamEvent::Chunk(chunk) => {
+                    if !chunk.content.is_empty() {
+                        streamed_text.push_str(&chunk.content);
+                        let _ = tx.send(AgentEvent::Chunk(chunk.content)).await;
+                    }
+                }
+                ChatStreamEvent::End(e) => end = Some(e),
+                ChatStreamEvent::Start
+                | ChatStreamEvent::ToolCallChunk(_)
+                | ChatStreamEvent::ReasoningChunk(_)
+                | ChatStreamEvent::ThoughtSignatureChunk(_) => {}
+            }
+        }
+        let end = end.unwrap_or_default();
+
+        let content = end
+            .captured_content
+            .filter(|c| !c.is_empty())
+            .unwrap_or_else(|| MessageContent::from_text(streamed_text));
+        let has_tool_calls = !content.tool_calls().is_empty();
+
+        let truncated = matches!(end.captured_stop_reason, Some(StopReason::MaxTokens(_)));
+        if truncated {
+            let _ = tx
+                .send(AgentEvent::Status(
+                    "Response hit the output limit".to_string(),
+                ))
+                .await;
+        }
+
+        let (input_tokens, output_tokens) = end
+            .captured_usage
+            .as_ref()
+            .map(|u| {
+                (
+                    u.prompt_tokens.unwrap_or(0).max(0) as u32,
+                    u.completion_tokens.unwrap_or(0).max(0) as u32,
+                )
+            })
+            .unwrap_or((0, 0));
+
+        Ok(AgentTurnResult {
+            content,
+            should_stop: !has_tool_calls || truncated,
+            input_tokens,
+            output_tokens,
+        })
+    }
+
+    async fn compact_history(&self, prompt: &str) -> Result<String, ProviderError> {
+        let options = self.base_options().with_max_tokens(COMPACTION_MAX_TOKENS);
+        self.complete_text(ChatRequest::from_user(prompt), options)
+            .await
+    }
+
+    fn display_name(&self) -> &str {
+        &self.target.display_name
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cloud_config(provider: CloudProvider, model: Option<&str>) -> EnrichmentConfig {
+        let mut config = EnrichmentConfig::default();
+        config.mode = EnrichmentMode::Cloud {
+            provider,
+            api_key: "sk-test".to_string(),
+            model: model.map(str::to_string),
+        };
+        config
+    }
+
+    #[test]
+    fn cloud_target_uses_provider_defaults() {
+        let target = LlmTarget::from_config(&cloud_config(CloudProvider::Anthropic, None));
+        assert_eq!(target.protocol, Protocol::Anthropic);
+        assert_eq!(target.endpoint, "https://api.anthropic.com/v1/");
+        assert_eq!(target.model, CloudProvider::Anthropic.default_model());
+        assert_eq!(target.api_key.as_deref(), Some("sk-test"));
+        assert_eq!(target.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
+    }
+
+    #[test]
+    fn cloud_target_respects_explicit_model() {
+        let target = LlmTarget::from_config(&cloud_config(CloudProvider::Google, Some("gemini-x")));
+        assert_eq!(target.protocol, Protocol::Gemini);
+        assert_eq!(target.model, "gemini-x");
+    }
+
+    #[test]
+    fn local_target_normalizes_endpoint() {
+        let mut config = EnrichmentConfig::default();
+        config.mode = EnrichmentMode::Local {
+            ollama_endpoint: "http://box:11434//".to_string(),
+            ollama_model: "gemma4:12b".to_string(),
+        };
+        let target = LlmTarget::from_config(&config);
+        assert_eq!(target.protocol, Protocol::Ollama);
+        assert_eq!(target.endpoint, "http://box:11434/");
+        assert_eq!(target.model, "gemma4:12b");
+        assert!(target.api_key.is_none());
+    }
+
+    #[test]
+    fn missing_cloud_key_fails_fast() {
+        let target = LlmTarget {
+            protocol: Protocol::OpenAI,
+            endpoint: normalize_base_url(Protocol::OpenAI.default_endpoint()),
+            api_key: None,
+            api_key_env: Some("OPENAI_API_KEY".to_string()),
+            model: "gpt-test".to_string(),
+            display_name: "OpenAI (GPT)".to_string(),
+        };
+        let provider = GenaiProvider::new(target);
+        let err = provider.ensure_credentials().unwrap_err();
+        assert!(matches!(err, ProviderError::AuthFailure { .. }));
+        assert!(err.to_string().contains("OPENAI_API_KEY"));
+    }
+
+    #[test]
+    fn ollama_needs_no_key() {
+        let target = LlmTarget {
+            protocol: Protocol::Ollama,
+            endpoint: "http://localhost:11434/".to_string(),
+            api_key: None,
+            api_key_env: None,
+            model: "m".to_string(),
+            display_name: "Ollama (Local)".to_string(),
+        };
+        assert!(GenaiProvider::new(target).ensure_credentials().is_ok());
+    }
+
+    #[test]
+    fn status_codes_map_to_error_kinds() {
+        assert!(matches!(
+            status_error(401, ""),
+            ProviderError::AuthFailure { .. }
+        ));
+        assert!(matches!(
+            status_error(403, ""),
+            ProviderError::AuthFailure { .. }
+        ));
+        assert!(matches!(
+            status_error(429, ""),
+            ProviderError::RateLimited { .. }
+        ));
+        assert!(matches!(
+            status_error(503, "busy"),
+            ProviderError::HttpStatus { status: 503, .. }
+        ));
+        assert!(status_error(503, "busy").is_retryable());
+        assert!(!status_error(400, "bad").is_retryable());
+    }
+
+    #[test]
+    fn gemini_invalid_key_is_an_auth_failure() {
+        let body = r#"{"error": {"code": 400, "status": "INVALID_ARGUMENT", "details": [{"reason": "API_KEY_INVALID"}]}}"#;
+        assert!(matches!(
+            status_error(400, body),
+            ProviderError::AuthFailure { .. }
+        ));
+        assert!(matches!(
+            status_error(400, "malformed request"),
+            ProviderError::HttpStatus { status: 400, .. }
+        ));
+    }
+
+    #[test]
+    fn stream_http_errors_are_parsed() {
+        let cause = "HTTP error.\nStatus: 429 Too Many Requests\nBody: {\"slow\": true}";
+        let (status, body) = parse_stream_http_status(cause).unwrap();
+        assert_eq!(status, 429);
+        assert_eq!(body, "{\"slow\": true}");
+        assert!(matches!(
+            status_error(status, body),
+            ProviderError::RateLimited { .. }
+        ));
+        assert!(parse_stream_http_status("connection reset").is_none());
+    }
+
+    #[test]
+    fn error_bodies_are_truncated() {
+        let long = "x".repeat(MAX_ERROR_BODY_CHARS + 50);
+        let msg = trim_body(&long);
+        assert_eq!(msg.chars().count(), MAX_ERROR_BODY_CHARS + 1);
+        assert!(msg.ends_with('…'));
+        assert_eq!(trim_body("  short  "), "short");
+    }
+
+    #[test]
+    fn temperature_only_where_safe() {
+        assert!(!Protocol::Anthropic.accepts_temperature());
+        assert!(!Protocol::OpenAI.accepts_temperature());
+        assert!(Protocol::Gemini.accepts_temperature());
+        assert!(Protocol::Ollama.accepts_temperature());
+    }
+}

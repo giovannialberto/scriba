@@ -1,29 +1,35 @@
 //! Agent-side tool wrappers.
 //!
-//! Delegates to `crate::tools` for definitions and execution,
-//! and provides Anthropic-format wrapping + TUI display helpers.
+//! Delegates to `crate::tools` for definitions and execution, converts the
+//! schemas into `genai` tool definitions, and provides TUI display helpers.
 
 use crate::database::Database;
 use crate::tools;
-use serde_json::{json, Value};
+use genai::chat::Tool;
+use serde_json::Value;
 
-/// Return all tool definitions in Anthropic Messages API format.
-pub fn all_tool_definitions() -> Vec<Value> {
+/// Return all tool definitions as provider-agnostic `genai` tools.
+pub fn all_tool_definitions() -> Vec<Tool> {
     tools::all_tool_schemas()
         .into_iter()
         .map(|s| {
-            json!({
-                "name": s.name,
-                "description": s.description,
-                "input_schema": s.input_schema,
-            })
+            Tool::new(s.name)
+                .with_description(s.description)
+                .with_schema(s.input_schema)
         })
         .collect()
 }
 
 /// Execute a tool and return the output string.
+///
+/// Failures are prefixed so the model can tell an error apart from data.
 pub fn execute_tool(name: &str, input: &Value, db: &mut Database) -> String {
-    tools::execute_tool(name, input, db).output
+    let result = tools::execute_tool(name, input, db);
+    if result.is_error {
+        format!("Error: {}", result.output)
+    } else {
+        result.output
+    }
 }
 
 /// Summarize a tool result for display in the UI (short one-liner).
@@ -183,5 +189,21 @@ pub fn summarize_input(name: &str, input: &Value) -> String {
             format!("{} -> {}", src, tgt)
         }
         _ => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_definitions_cover_every_schema() {
+        let schemas = tools::all_tool_schemas();
+        let defs = all_tool_definitions();
+        assert_eq!(defs.len(), schemas.len());
+        for (def, schema) in defs.iter().zip(schemas.iter()) {
+            assert_eq!(def.description.as_deref(), Some(schema.description));
+            assert_eq!(def.schema.as_ref(), Some(&schema.input_schema));
+        }
     }
 }

@@ -30,13 +30,15 @@ src/
     notify_panel.swift Notification-style panel, compiled at runtime by notify.rs (macOS)
     config.rs          ScribaConfig, TranscriptionMode, EnrichmentMode, MeetingDetectionConfig
   database/            SQLite persistence (schema.sql at repo root, included at compile time)
-  enrichment/          LLM integration (Ollama, Anthropic, OpenAI, Google)
+  llm/                 Unified model transport on genai: LlmTarget resolution, GenaiProvider, error mapping
+  enrichment/          Extraction, world evolution, prompts (model calls go through llm/)
+    ollama.rs          Ollama management only: health, diagnose, list/pull models
     world.rs           Knowledge graph (WorldData), single source of truth
     extractor.rs       Entity/topic extraction from transcripts
     prompts.rs         All LLM prompts for extraction and evolution
     chat_prompts.rs    Chat system prompts (agent + fallback)
-  agent/               Agent loop with tool use (Anthropic provider)
-    providers/         Per-provider implementations
+  agent/               Agent loop with tool use (any provider via llm/)
+    provider.rs        AgentProvider trait + factory
   entities/            Entity registry and linking (LLM-driven, no fuzzy matching)
   tui/                 Terminal UI (ratatui)
     app.rs             Main dashboard, navigation, key handling
