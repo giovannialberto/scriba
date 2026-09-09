@@ -73,19 +73,20 @@ impl VoiceEnrollment {
             .unwrap_or(0);
         Self {
             phase: VoicePhase::Prompt,
-            name: if name.trim().is_empty() {
-                "there".to_string()
-            } else {
-                name.trim().to_string()
-            },
+            name: name.trim().to_string(),
             dir: std::env::temp_dir().join(format!("scriba-voice-{stamp}")),
         }
     }
 
     /// The sentences to read: short, natural, and covering varied sounds.
     pub(super) fn script(&self) -> Vec<String> {
+        let hello = if self.name.is_empty() {
+            "\u{201C}Hey Scriba, it's me.".to_string()
+        } else {
+            format!("\u{201C}Hey Scriba, this is {}.", self.name)
+        };
         vec![
-            format!("\u{201C}Hey Scriba, this is {}.", self.name),
+            hello,
             "I'm going to use you to remember my meetings,".to_string(),
             "my ideas, and the people I work with.".to_string(),
             "Let's see how well you learn my voice.\u{201D}".to_string(),
@@ -416,7 +417,7 @@ mod tests {
         assert!(lines.len() > 5);
         assert_eq!(v.footer_hint(), "[Enter] Record  [S] Skip");
         let anon = VoiceEnrollment::new("   ");
-        assert!(anon.script()[0].contains("there"));
+        assert!(anon.script()[0].contains("it's me"));
     }
 
     #[test]

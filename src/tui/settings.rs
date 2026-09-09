@@ -1850,9 +1850,7 @@ impl Dashboard {
             }
             Row::Speakers => {
                 let detail = if config.diarization.enabled {
-                    if speech_provider(config) != SpeechProvider::Local {
-                        "who said what \u{00B7} local transcription only, for now"
-                    } else if crate::core::diarization::models_downloaded() {
+                    if crate::core::diarization::models_downloaded() {
                         "who said what \u{00B7} models installed \u{2713}"
                     } else {
                         "who said what \u{00B7} 40 MB download on first use"
