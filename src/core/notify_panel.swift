@@ -170,6 +170,10 @@ class HoverButton: NSButton {
     var hoverFill: NSColor = .clear
     private var trackingArea: NSTrackingArea?
 
+    // The panel is non-activating and never key, so without this the first
+    // click only makes the panel key and the button needs a second click.
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         if let area = trackingArea {
