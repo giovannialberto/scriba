@@ -26,7 +26,7 @@ src/
     loopback.rs        System audio capture (macOS: ScreenCaptureKit, Linux: PulseAudio/PipeWire)
     meeting.rs         Meeting detection: polls "mic in use by another process" (Core Audio process objects / pactl)
     autopilot.rs       Meeting autopilot: detect -> confirm -> record -> instant stop; shared RecordingStatus
-    notify.rs          Desktop notifications + Record/Ignore prompt (native panel helper, AppleScript fallback)
+    notify.rs          Desktop notifications + Record/Ignore prompt (native panel helper; plain notifications fall back to AppleScript, the prompt reports itself unavailable)
     notify_panel.swift Notification-style panel, compiled at runtime by notify.rs (macOS)
     config.rs          ScribaConfig, TranscriptionMode, EnrichmentMode (Cloud has provider + optional base_url; CloudProvider::OpenAICompatible + EndpointPreset for DeepInfra/OpenRouter/Groq/Together), MeetingDetectionConfig
   database/            SQLite persistence (schema.sql at repo root, included at compile time)

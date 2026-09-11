@@ -331,11 +331,17 @@ pub async fn run_autopilot(
     match tokio::task::spawn_blocking(notify::prepare_notification_helper).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
-            if !quiet {
-                eprintln!(
-                    "⚠️  Native notification panel unavailable ({e}); meeting prompts fall back to plain notifications."
+            // Consequential: with confirm_before_record the prompt is the only
+            // way to start a recording, so say so in both hosting modes.
+            let mut msg = format!("Notification panel unavailable ({e}).");
+            if confirm {
+                msg.push_str(
+                    " Meetings will not be recorded until it works: install the Xcode \
+                     Command Line Tools (xcode-select --install) or disable \
+                     meeting_detection.confirm_before_record.",
                 );
             }
+            report_issue(quiet, &msg);
         }
         Err(e) => report_issue(quiet, &format!("Notification panel setup task failed: {e}")),
     }
@@ -363,8 +369,7 @@ pub async fn run_autopilot(
 
     // Set when an auto-recording ended on its own (silence fallback or error)
     // before the meeting app released the mic: the next MeetingEnded should
-    // still notify. Not set after a manual stop from the TUI (see
-    // [`EndNotice`]).
+    // still notify. Never set after a manual stop from the TUI (#109).
     let mut pending_end_notify = false;
     // After a recording finishes, suppress new detections until this instant
     // (breaks feedback loops with other recording tools reacting to us).
@@ -462,9 +467,20 @@ pub async fn run_autopilot(
                 tokio::select! {
                     biased;
                     _ = wait_shutdown(&mut shutdown) => break 'outer,
-                    answer = &mut dialog => {
-                        break if answer { MeetingDecision::Record } else { MeetingDecision::Skip };
-                    }
+                    answer = &mut dialog => match answer {
+                        Ok(true) => break MeetingDecision::Record,
+                        Ok(false) => break MeetingDecision::Skip,
+                        // Nothing was shown: tell the user why this meeting
+                        // is being skipped instead of silently ignoring it.
+                        Err(e) => {
+                            let app = trigger.as_deref().map(|t| format!(" ({t})")).unwrap_or_default();
+                            report_issue(
+                                quiet,
+                                &format!("Meeting detected{app} but the Record/Ignore prompt is unavailable: {e}. Not recording."),
+                            );
+                            break MeetingDecision::Skip;
+                        }
+                    },
                     evt = watcher.events.recv() => match evt {
                         // Meeting over before the user answered: the dropped
                         // dialog future kills the dialog process.
@@ -617,28 +633,25 @@ pub async fn run_autopilot(
                 }
                 res = &mut rec_task => break res,
                 _ = recording_guard.stop_requested(), if !user_stopped && !meeting_ended => {
-                    // Stopped from the TUI (Ctrl+R); the meeting itself may
-                    // go on, so the end notification waits for the mic release.
+                    // Stopped from the TUI (Ctrl+R). The meeting may go on,
+                    // but its end is never announced after a manual stop
+                    // (#109): the MeetingEnded arm below is disabled from
+                    // here on and the leftover event is drained in phase 1.
                     user_stopped = true;
                     recording_guard.set_phase(RecordingPhase::Processing);
                     let _ = stop_tx.try_send(());
                 }
-                evt = watcher.events.recv(), if watcher_alive && !meeting_ended => match evt {
+                evt = watcher.events.recv(), if watcher_alive && !meeting_ended && !user_stopped => match evt {
                     Some(MeetingEvent::MeetingEnded) => {
                         meeting_ended = true;
-                        // The user already stopped this recording from the
-                        // TUI (it may still be transcribing): they know it
-                        // ended, so the meeting's end is not announced.
-                        if !user_stopped {
-                            recording_guard.set_phase(RecordingPhase::Processing);
-                            // Notify right away — finalization (encode, DB,
-                            // transcription) can take a while.
-                            notify_event(MeetingEvent::MeetingEnded, true, None);
-                            if verbose {
-                                say!("📴 Meeting app released the mic — stopping recording.");
-                            }
-                            let _ = stop_tx.try_send(());
+                        recording_guard.set_phase(RecordingPhase::Processing);
+                        // Notify right away — finalization (encode, DB,
+                        // transcription) can take a while.
+                        notify_event(MeetingEvent::MeetingEnded, true, None);
+                        if verbose {
+                            say!("📴 Meeting app released the mic — stopping recording.");
                         }
+                        let _ = stop_tx.try_send(());
                     }
                     Some(_) => {}
                     None => watcher_alive = false,
@@ -663,45 +676,44 @@ pub async fn run_autopilot(
 
         cooldown_until = Some(tokio::time::Instant::now() + cooldown);
 
-        let notice = end_notice(meeting_ended, user_stopped);
-
+        // Who ended the recording decides the end notification: a mic release
+        // already fired it; a manual stop from the TUI is never announced
+        // (#109); a silence-fallback stop (or error) while the meeting app
+        // still holds the mic is announced once it lets go.
         if exclude_self {
-            match notice {
-                // Fired the moment the mic was released.
-                EndNotice::AlreadyFired => {
-                    if opts.once {
-                        break;
-                    }
-                }
-                // The meeting app still holds the mic; notify once it lets go.
-                // The watcher is still tracking this meeting, so the next
-                // MeetingStarted can only be a new one.
-                EndNotice::OnMicRelease => pending_end_notify = true,
-                EndNotice::Skip => {
-                    if opts.once {
-                        break;
-                    }
-                }
-            }
-        } else {
-            // The watcher was paused, so poll for the mic release ourselves,
-            // giving our own just-closed stream a moment to disappear. This
-            // also keeps the respawned watcher from re-detecting the same
-            // meeting.
-            tokio::time::sleep(Duration::from_millis(1500)).await;
-            loop {
-                if !meeting_signal(&watcher_cfg).unwrap_or(false) {
+            if meeting_ended || user_stopped {
+                if opts.once {
                     break;
                 }
-                tokio::select! {
-                    biased;
-                    _ = wait_shutdown(&mut shutdown) => break 'outer,
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-                }
+            } else {
+                // The watcher is still tracking this meeting and only emits
+                // MeetingStarted again if the app drops and re-grabs the mic.
+                pending_end_notify = true;
             }
-            if notice != EndNotice::Skip {
+        } else {
+            // The watcher was paused. Give our own just-closed stream a
+            // moment to disappear before probing the mic again.
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            if !user_stopped {
+                // The silence fallback (or an error) ended the recording while
+                // the meeting app still held the mic: poll for the release
+                // ourselves and announce it.
+                loop {
+                    if !meeting_signal(&watcher_cfg).unwrap_or(false) {
+                        break;
+                    }
+                    tokio::select! {
+                        biased;
+                        _ = wait_shutdown(&mut shutdown) => break 'outer,
+                        _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    }
+                }
                 notify_event(MeetingEvent::MeetingEnded, true, None);
             }
+            // After a manual stop there is nothing to announce (#109) and no
+            // reason to sit here for the rest of the meeting: the respawned
+            // watcher seeds its state from a probe, so it will not re-detect
+            // a meeting that is still in progress.
             if opts.once {
                 break;
             }
@@ -711,32 +723,6 @@ pub async fn run_autopilot(
 
     watcher.stop.store(true, Ordering::Relaxed);
     Ok(())
-}
-
-/// Whether the "meeting ended / recording stopped" notification is still owed
-/// once an auto-recording has finished.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EndNotice {
-    /// The meeting app released the mic while recording: the notification
-    /// fired right then.
-    AlreadyFired,
-    /// The recording ended on its own (silence fallback or error) while the
-    /// meeting goes on: notify when the meeting app releases the mic.
-    OnMicRelease,
-    /// The user stopped the recording from the TUI, whether or not the
-    /// meeting has ended since. They already know it ended, so the meeting's
-    /// end is not announced (issue #109).
-    Skip,
-}
-
-fn end_notice(meeting_ended: bool, user_stopped: bool) -> EndNotice {
-    if user_stopped {
-        EndNotice::Skip
-    } else if meeting_ended {
-        EndNotice::AlreadyFired
-    } else {
-        EndNotice::OnMicRelease
-    }
 }
 
 /// Wait for the current meeting to end (notifying, `recorded = false` wording)
@@ -764,30 +750,5 @@ async fn wait_for_meeting_end(
                 }
             },
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn end_notice_after_mic_release_is_already_fired() {
-        assert_eq!(end_notice(true, false), EndNotice::AlreadyFired);
-    }
-
-    #[test]
-    fn end_notice_after_silence_fallback_waits_for_mic_release() {
-        assert_eq!(end_notice(false, false), EndNotice::OnMicRelease);
-    }
-
-    #[test]
-    fn end_notice_after_manual_stop_is_skipped() {
-        // Issue #109: stopping from the TUI must not announce "Recording
-        // stopped" again when the meeting eventually ends...
-        assert_eq!(end_notice(false, true), EndNotice::Skip);
-        // ...including when it ends while the stopped recording is still
-        // being transcribed (the loop saw MeetingEnded but did not notify).
-        assert_eq!(end_notice(true, true), EndNotice::Skip);
     }
 }
