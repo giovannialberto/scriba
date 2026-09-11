@@ -333,7 +333,7 @@ pub async fn run_autopilot(
         Ok(Err(e)) => {
             if !quiet {
                 eprintln!(
-                    "⚠️  Native notification panel unavailable ({e}); using AppleScript dialogs instead."
+                    "⚠️  Native notification panel unavailable ({e}); meeting prompts fall back to plain notifications."
                 );
             }
         }

@@ -54,18 +54,10 @@ mod panel {
         }
         let dir = path.parent().expect("helper path has a parent");
         std::fs::create_dir_all(dir)?;
-        // Drop helpers left behind by previous Scriba versions.
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                if entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with("notify-panel-")
-                {
-                    let _ = std::fs::remove_file(entry.path());
-                }
-            }
-        }
+        // Helpers built by other Scriba versions are left alone: another
+        // instance (an older install, a dev build in a second terminal) may
+        // still be running and would lose its panel, falling back to
+        // AppleScript. They are ~130 KB each.
         let source_path = path.with_extension("swift");
         std::fs::write(&source_path, SOURCE)?;
         let output = std::process::Command::new("swiftc")
@@ -183,8 +175,9 @@ fn try_notify(title: &str, body: &str) -> Result<()> {
 /// back to `default_answer` — a plain notification is fired instead on
 /// failure so the event is not silently swallowed.
 ///
-/// - macOS: native notification-style panel (top-right, pill buttons);
-///   `osascript` `display dialog` when the panel helper is unavailable.
+/// - macOS: native notification-style panel (top-right, pill buttons). There
+///   is deliberately no `display dialog` fallback (a centered modal): without
+///   the panel, a plain notification is fired and `default_answer` is used.
 /// - Linux: `notify-send -A` action buttons (libnotify 0.7.9+).
 pub async fn confirm(
     title: &str,
@@ -208,8 +201,9 @@ pub async fn confirm(
     let hard_timeout = Duration::from_secs(timeout_secs as u64 + 600);
     match tokio::time::timeout(hard_timeout, attempt).await {
         Ok(Ok(answer)) => answer,
-        Ok(Err(e)) => {
-            eprintln!("⚠️  Confirmation dialog failed ({e}); assuming default");
+        // No stderr here: the caller may be hosted by the TUI. The plain
+        // notification is the visible fallback.
+        Ok(Err(_)) => {
             notify(title, message);
             default_answer
         }
@@ -257,30 +251,10 @@ async fn try_confirm(
         });
     }
 
-    // Fallback: centered AppleScript dialog.
-    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
-    let script = format!(
-        "display dialog \"{}\" with title \"{}\" buttons {{\"{}\", \"{}\"}} default button \"{}\" giving up after {}",
-        esc(message),
-        esc(title),
-        esc(no_label),
-        esc(yes_label),
-        esc(yes_label),
-        timeout_secs
-    );
-    let output = tokio::process::Command::new("osascript")
-        .args(["-e", &script])
-        .kill_on_drop(true)
-        .output()
-        .await?;
-    if !output.status.success() {
-        anyhow::bail!("osascript exited with status {}", output.status);
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if stdout.contains("gave up:true") {
-        return Ok(default_answer);
-    }
-    Ok(stdout.contains(&format!("button returned:{yes_label}")))
+    // No centered `display dialog` fallback: it is an unstyled modal in the
+    // middle of the screen. Without the panel the caller fires a plain
+    // notification and uses the default answer.
+    anyhow::bail!("native notification panel is not built")
 }
 
 #[cfg(target_os = "linux")]
