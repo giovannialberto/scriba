@@ -170,6 +170,10 @@ class HoverButton: NSButton {
     var hoverFill: NSColor = .clear
     private var trackingArea: NSTrackingArea?
 
+    // The panel is non-activating and never key, so without this the first
+    // click only makes the panel key and the button needs a second click.
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         if let area = trackingArea {
@@ -205,6 +209,17 @@ class HoverButton: NSButton {
         fade.duration = 0.15
         layer.add(fade, forKey: "fill")
         layer.backgroundColor = color.cgColor
+    }
+}
+
+/// Card background. Accepts first mouse (the panel is never key) and claims
+/// clicks on its non-interactive children, so the click-to-dismiss gesture of
+/// plain notifications fires on the first click; the pill buttons keep theirs.
+final class CardView: NSView {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard let hit = super.hitTest(point) else { return nil }
+        return hit is HoverButton ? hit : self
     }
 }
 
@@ -302,7 +317,7 @@ let root = HoverRoot(
     frame: NSRect(x: 0, y: 0, width: rootWidth, height: rootHeight))
 panel.contentView = root
 
-let card = NSView(
+let card = CardView(
     frame: NSRect(x: overhang, y: 0, width: cardWidth, height: cardHeight))
 card.wantsLayer = true
 card.layer?.backgroundColor = cardColor.cgColor
