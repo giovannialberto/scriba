@@ -18,7 +18,9 @@ use std::time::Duration;
 /// draws its own notification-style panel (top-right, vibrancy, buttons) via
 /// a small AppKit helper. The Swift source is embedded and compiled once with
 /// `swiftc` (ships with the Xcode Command Line Tools, which Homebrew
-/// requires); everything falls back to AppleScript when it is unavailable.
+/// requires). Without it, plain notifications fall back to AppleScript's
+/// `display notification`; the Record/Ignore prompt has no fallback and
+/// reports itself unavailable instead (see [`confirm`]).
 #[cfg(target_os = "macos")]
 mod panel {
     use anyhow::Result;
@@ -55,23 +57,30 @@ mod panel {
         let dir = path.parent().expect("helper path has a parent");
         std::fs::create_dir_all(dir)?;
         // Helpers built by other Scriba versions are left alone: another
-        // instance (an older install, a dev build in a second terminal) may
-        // still be running and would lose its panel, falling back to
-        // AppleScript. They are ~130 KB each.
-        let source_path = path.with_extension("swift");
+        // running instance may still be using them.
+        //
+        // Build under per-process names and publish with a rename, so two
+        // instances of the same version compiling at once can't trip over
+        // each other's source or half-written binary.
+        let pid = std::process::id();
+        let source_path = path.with_extension(format!("{pid}.swift"));
+        let build_path = path.with_extension(format!("{pid}.tmp"));
         std::fs::write(&source_path, SOURCE)?;
         let output = std::process::Command::new("swiftc")
             .args(["-O", "-o"])
-            .arg(&path)
+            .arg(&build_path)
             .arg(&source_path)
-            .output()?;
+            .output();
         let _ = std::fs::remove_file(&source_path);
+        let output = output?;
         if !output.status.success() {
+            let _ = std::fs::remove_file(&build_path);
             return Err(anyhow::anyhow!(
                 "swiftc failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             ));
         }
+        std::fs::rename(&build_path, &path)?;
         Ok(path)
     }
 }
@@ -91,8 +100,9 @@ pub fn notification_helper_ready() -> bool {
 
 /// Build the native notification panel helper ahead of time so the first
 /// meeting notification doesn't wait on a compile. Blocking (runs swiftc on
-/// first call, ~10s); no-op off macOS. On failure callers keep working — the
-/// AppleScript fallbacks are used instead.
+/// first call, ~10s); no-op off macOS. On failure callers keep working: plain
+/// notifications fall back to AppleScript, and [`confirm`] returns an error
+/// so the caller can report that the Record/Ignore prompt is unavailable.
 pub fn prepare_notification_helper() -> Result<()> {
     #[cfg(target_os = "macos")]
     panel::ensure()?;
@@ -171,13 +181,13 @@ fn try_notify(title: &str, body: &str) -> Result<()> {
 ///
 /// Blocks (async) until the user chooses, the dialog times out, or the future
 /// is dropped (the dialog process is killed on drop, so callers can cancel it
-/// via `select!`). On timeout or any failure (e.g. no dialog tooling), falls
-/// back to `default_answer` — a plain notification is fired instead on
-/// failure so the event is not silently swallowed.
+/// via `select!`). A timeout yields `default_answer`. `Err` means the prompt
+/// could not be shown at all (no panel helper, helper crashed): nothing was
+/// displayed, so the caller should tell the user and pick a default itself.
 ///
 /// - macOS: native notification-style panel (top-right, pill buttons). There
-///   is deliberately no `display dialog` fallback (a centered modal): without
-///   the panel, a plain notification is fired and `default_answer` is used.
+///   is deliberately no `display dialog` fallback: it is an unstyled modal in
+///   the middle of the screen.
 /// - Linux: `notify-send -A` action buttons (libnotify 0.7.9+).
 pub async fn confirm(
     title: &str,
@@ -186,7 +196,7 @@ pub async fn confirm(
     no_label: &str,
     timeout_secs: u32,
     default_answer: bool,
-) -> bool {
+) -> Result<bool> {
     let attempt = try_confirm(
         title,
         message,
@@ -200,14 +210,8 @@ pub async fn confirm(
     // user decides.
     let hard_timeout = Duration::from_secs(timeout_secs as u64 + 600);
     match tokio::time::timeout(hard_timeout, attempt).await {
-        Ok(Ok(answer)) => answer,
-        // No stderr here: the caller may be hosted by the TUI. The plain
-        // notification is the visible fallback.
-        Ok(Err(_)) => {
-            notify(title, message);
-            default_answer
-        }
-        Err(_) => default_answer,
+        Ok(result) => result,
+        Err(_) => Ok(default_answer),
     }
 }
 
@@ -220,41 +224,39 @@ async fn try_confirm(
     timeout_secs: u32,
     default_answer: bool,
 ) -> Result<bool> {
-    // Native notification-style panel, top-right with action buttons.
-    if let Some(helper) = panel::existing() {
-        let output = tokio::process::Command::new(helper)
-            .args([
-                "confirm",
-                "--title",
-                title,
-                "--subtitle",
-                message,
-                "--yes",
-                yes_label,
-                "--no",
-                no_label,
-                "--timeout",
-                &timeout_secs.to_string(),
-                "--sound",
-                "Glass",
-            ])
-            .kill_on_drop(true)
-            .output()
-            .await?;
-        if !output.status.success() {
-            anyhow::bail!("notify panel exited with status {}", output.status);
-        }
-        return Ok(match String::from_utf8_lossy(&output.stdout).trim() {
-            "yes" => true,
-            "no" => false,
-            _ => default_answer,
-        });
+    // Native notification-style panel, top-right with action buttons. There is
+    // deliberately no `display dialog` fallback (an unstyled centered modal):
+    // without the panel the prompt is unavailable and the caller reports it.
+    let Some(helper) = panel::existing() else {
+        anyhow::bail!("notification panel helper is not built (is swiftc installed?)");
+    };
+    let output = tokio::process::Command::new(helper)
+        .args([
+            "confirm",
+            "--title",
+            title,
+            "--subtitle",
+            message,
+            "--yes",
+            yes_label,
+            "--no",
+            no_label,
+            "--timeout",
+            &timeout_secs.to_string(),
+            "--sound",
+            "Glass",
+        ])
+        .kill_on_drop(true)
+        .output()
+        .await?;
+    if !output.status.success() {
+        anyhow::bail!("notify panel exited with status {}", output.status);
     }
-
-    // No centered `display dialog` fallback: it is an unstyled modal in the
-    // middle of the screen. Without the panel the caller fires a plain
-    // notification and uses the default answer.
-    anyhow::bail!("native notification panel is not built")
+    Ok(match String::from_utf8_lossy(&output.stdout).trim() {
+        "yes" => true,
+        "no" => false,
+        _ => default_answer,
+    })
 }
 
 #[cfg(target_os = "linux")]
