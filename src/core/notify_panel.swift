@@ -212,6 +212,17 @@ class HoverButton: NSButton {
     }
 }
 
+/// Card background. Accepts first mouse (the panel is never key) and claims
+/// clicks on its non-interactive children, so the click-to-dismiss gesture of
+/// plain notifications fires on the first click; the pill buttons keep theirs.
+final class CardView: NSView {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard let hit = super.hitTest(point) else { return nil }
+        return hit is HoverButton ? hit : self
+    }
+}
+
 /// Root view: tracks hover over the whole card area to pause the countdown
 /// and reveal the ✕ button.
 final class HoverRoot: NSView {
@@ -306,7 +317,7 @@ let root = HoverRoot(
     frame: NSRect(x: 0, y: 0, width: rootWidth, height: rootHeight))
 panel.contentView = root
 
-let card = NSView(
+let card = CardView(
     frame: NSRect(x: overhang, y: 0, width: cardWidth, height: cardHeight))
 card.wantsLayer = true
 card.layer?.backgroundColor = cardColor.cgColor
