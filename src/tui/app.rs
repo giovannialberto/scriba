@@ -324,7 +324,7 @@ impl Dashboard {
                 let _ = self.config.save();
                 let learned = self
                     .db
-                    .speaker_sample_stats("owner")
+                    .speaker_sample_stats("owner", crate::core::diarization::EMBEDDING_MODEL_ID)
                     .map(|(count, _)| count > 0)
                     .unwrap_or(false);
                 if !learned {

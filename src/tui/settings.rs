@@ -1829,7 +1829,7 @@ impl Dashboard {
                 )
             }
             Row::Voice => {
-                let (count, secs) = self.db.speaker_sample_stats("owner").unwrap_or((0, 0.0));
+                let (count, secs) = self.db.speaker_sample_stats("owner", crate::core::diarization::EMBEDDING_MODEL_ID).unwrap_or((0, 0.0));
                 if count == 0 {
                     (
                         "not learned yet".to_string(),
@@ -1853,7 +1853,7 @@ impl Dashboard {
                     if crate::core::diarization::models_downloaded() {
                         "who said what \u{00B7} models installed \u{2713}"
                     } else {
-                        "who said what \u{00B7} 40 MB download on first use"
+                        "who said what \u{00B7} 100 MB download on first use"
                     }
                 } else {
                     "transcripts without speaker labels"

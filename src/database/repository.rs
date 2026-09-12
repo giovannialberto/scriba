@@ -176,7 +176,7 @@ impl Database {
                 let schema = include_str!("../../schema.sql");
                 tx.execute_batch(schema)
                     .context("Failed to initialize database schema")?;
-                tx.execute("PRAGMA user_version = 5", [])
+                tx.execute("PRAGMA user_version = 6", [])
                     .context("Failed to set user_version")?;
                 tx.commit()
                     .context("Failed to commit schema initialization")?;
@@ -322,6 +322,30 @@ impl Database {
                     .context("Failed to set user_version")?;
                 tx.commit()
                     .context("Failed to commit v5 migration")?;
+            }
+        }
+
+        // Migration v5 → v6: voice samples remember which embedding model made them
+        {
+            let user_version: i64 = self
+                .conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap_or(0);
+
+            if user_version == 5 {
+                let tx = self
+                    .conn
+                    .transaction()
+                    .context("Failed to start v6 migration transaction")?;
+                tx.execute(
+                    "ALTER TABLE speaker_samples ADD COLUMN model TEXT NOT NULL DEFAULT 'eres2net-base-zh'",
+                    [],
+                )
+                .context("Failed to add speaker_samples.model")?;
+                tx.execute("PRAGMA user_version = 6", [])
+                    .context("Failed to set user_version")?;
+                tx.commit()
+                    .context("Failed to commit v6 migration")?;
             }
         }
 
@@ -799,23 +823,24 @@ impl Database {
         embedding: &[f32],
         duration_secs: f32,
         source: &str,
+        model: &str,
         recording_id: Option<i64>,
     ) -> Result<i64> {
         let json = serde_json::to_string(embedding)?;
         self.conn.execute(
-            "INSERT INTO speaker_samples (speaker, is_owner, embedding, duration_secs, source, recording_id, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![speaker, is_owner, json, duration_secs as f64, source, recording_id, Utc::now()],
+            "INSERT INTO speaker_samples (speaker, is_owner, embedding, duration_secs, source, model, recording_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![speaker, is_owner, json, duration_secs as f64, source, model, recording_id, Utc::now()],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
 
-    /// Every speaker with stored voice samples, with a normalized centroid.
-    pub fn speaker_profiles(&self) -> Result<Vec<SpeakerProfile>> {
+    /// Every speaker with voice samples from embedding `model`, with a normalized centroid.
+    pub fn speaker_profiles(&self, model: &str) -> Result<Vec<SpeakerProfile>> {
         let mut stmt = self.conn.prepare(
-            "SELECT speaker, is_owner, embedding, duration_secs FROM speaker_samples ORDER BY speaker, id",
+            "SELECT speaker, is_owner, embedding, duration_secs FROM speaker_samples WHERE model = ?1 ORDER BY speaker, id",
         )?;
-        let rows = stmt.query_map([], |row| {
+        let rows = stmt.query_map([model], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, bool>(1)?,
@@ -842,21 +867,22 @@ impl Database {
     }
 
     /// Number of samples and seconds of voice stored for a speaker.
-    pub fn speaker_sample_stats(&self, speaker: &str) -> Result<(usize, f32)> {
+    pub fn speaker_sample_stats(&self, speaker: &str, model: &str) -> Result<(usize, f32)> {
         let (count, secs): (i64, f64) = self.conn.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(duration_secs), 0) FROM speaker_samples WHERE speaker = ?1",
-            params![speaker],
+            "SELECT COUNT(*), COALESCE(SUM(duration_secs), 0) FROM speaker_samples WHERE speaker = ?1 AND model = ?2",
+            params![speaker, model],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         Ok((count as usize, secs as f32))
     }
 
-    /// Keep only the newest `keep` samples of a speaker.
-    pub fn prune_speaker_samples(&mut self, speaker: &str, keep: usize) -> Result<usize> {
+    /// Keep only the newest `keep` samples of a speaker made by `model`;
+    /// samples from other models are dropped.
+    pub fn prune_speaker_samples(&mut self, speaker: &str, keep: usize, model: &str) -> Result<usize> {
         let deleted = self.conn.execute(
-            "DELETE FROM speaker_samples WHERE speaker = ?1 AND id NOT IN (
-                SELECT id FROM speaker_samples WHERE speaker = ?1 ORDER BY id DESC LIMIT ?2)",
-            params![speaker, keep as i64],
+            "DELETE FROM speaker_samples WHERE speaker = ?1 AND (model != ?3 OR id NOT IN (
+                SELECT id FROM speaker_samples WHERE speaker = ?1 AND model = ?3 ORDER BY id DESC LIMIT ?2))",
+            params![speaker, keep as i64, model],
         )?;
         Ok(deleted)
     }
@@ -1488,11 +1514,12 @@ mod fts_tests {
     #[test]
     fn speaker_samples_round_trip_and_prune() {
         let mut db = Database::open_in_memory().unwrap();
-        db.add_speaker_sample("owner", true, &[1.0, 0.0], 3.0, "enrollment", None).unwrap();
-        db.add_speaker_sample("owner", true, &[0.8, 0.6], 4.0, "mic-track", None).unwrap();
-        db.add_speaker_sample("Marco", false, &[0.0, 1.0], 2.0, "confirmed", None).unwrap();
+        db.add_speaker_sample("owner", true, &[1.0, 0.0], 3.0, "enrollment", "m1", None).unwrap();
+        db.add_speaker_sample("owner", true, &[0.8, 0.6], 4.0, "mic-track", "m1", None).unwrap();
+        db.add_speaker_sample("Marco", false, &[0.0, 1.0], 2.0, "confirmed", "m1", None).unwrap();
 
-        let profiles = db.speaker_profiles().unwrap();
+        let profiles = db.speaker_profiles("m1").unwrap();
+        assert!(db.speaker_profiles("other-model").unwrap().is_empty());
         assert_eq!(profiles.len(), 2);
         let owner = profiles.iter().find(|p| p.is_owner).unwrap();
         assert_eq!(owner.speaker, "owner");
@@ -1500,12 +1527,12 @@ mod fts_tests {
         let norm: f32 = owner.centroid.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-4);
         assert!(owner.similarity(&[1.0, 0.0]) > owner.similarity(&[0.0, 1.0]));
-        assert_eq!(db.speaker_sample_stats("owner").unwrap(), (2, 7.0));
+        assert_eq!(db.speaker_sample_stats("owner", "m1").unwrap(), (2, 7.0));
 
-        assert_eq!(db.prune_speaker_samples("owner", 1).unwrap(), 1);
-        assert_eq!(db.speaker_sample_stats("owner").unwrap().0, 1);
+        assert_eq!(db.prune_speaker_samples("owner", 1, "m1").unwrap(), 1);
+        assert_eq!(db.speaker_sample_stats("owner", "m1").unwrap().0, 1);
         assert_eq!(db.delete_speaker_samples("Marco").unwrap(), 1);
-        assert_eq!(db.speaker_profiles().unwrap().len(), 1);
+        assert_eq!(db.speaker_profiles("m1").unwrap().len(), 1);
     }
 
     #[test]

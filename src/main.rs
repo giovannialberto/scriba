@@ -725,7 +725,7 @@ async fn main() -> Result<()> {
                     match cmd {
                         VoiceCommand::Enroll { file } => {
                             let samples = scriba::core::voice::enroll_owner_from_file(&file, &mut db).await?;
-                            let (count, secs) = db.speaker_sample_stats("owner")?;
+                            let (count, secs) = db.speaker_sample_stats("owner", scriba::core::diarization::EMBEDDING_MODEL_ID)?;
                             println!(
                                 "✅ Learned {} voice sample(s) from {}. Total: {} sample(s), {:.0}s of your voice.",
                                 samples,
@@ -735,13 +735,13 @@ async fn main() -> Result<()> {
                             );
                         }
                         VoiceCommand::Status => {
-                            let (count, secs) = db.speaker_sample_stats("owner")?;
+                            let (count, secs) = db.speaker_sample_stats("owner", scriba::core::diarization::EMBEDDING_MODEL_ID)?;
                             if count == 0 {
                                 println!("Scriba has not learned your voice yet. Run: scriba voice enroll <file>");
                             } else {
                                 println!("Owner voice: {} sample(s), {:.0}s of speech.", count, secs);
                             }
-                            for p in db.speaker_profiles()?.into_iter().filter(|p| !p.is_owner) {
+                            for p in db.speaker_profiles(scriba::core::diarization::EMBEDDING_MODEL_ID)?.into_iter().filter(|p| !p.is_owner) {
                                 println!("{}: {} sample(s), {:.0}s", p.speaker, p.samples, p.total_secs);
                             }
                         }

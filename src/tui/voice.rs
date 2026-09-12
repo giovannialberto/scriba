@@ -216,7 +216,7 @@ impl VoiceEnrollment {
                                     &samples,
                                     "enrollment",
                                 )?;
-                                let (count, secs) = db.speaker_sample_stats("owner")?;
+                                let (count, secs) = db.speaker_sample_stats("owner", crate::core::diarization::EMBEDDING_MODEL_ID)?;
                                 Ok::<_, anyhow::Error>((samples.len(), count, secs))
                             }
                             .await;

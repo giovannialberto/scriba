@@ -55,8 +55,8 @@ pub async fn enroll_owner_from_file(input: &Path, db: &mut Database) -> Result<u
 /// Persist owner samples and keep the table bounded.
 pub fn store_owner_samples(db: &mut Database, samples: &[VoiceSample], source: &str) -> Result<()> {
     for s in samples {
-        db.add_speaker_sample("owner", true, &s.embedding, s.duration_secs, source, None)?;
+        db.add_speaker_sample("owner", true, &s.embedding, s.duration_secs, source, diarization::EMBEDDING_MODEL_ID, None)?;
     }
-    db.prune_speaker_samples("owner", diarization::OWNER_SAMPLES_KEPT)?;
+    db.prune_speaker_samples("owner", diarization::OWNER_SAMPLES_KEPT, diarization::EMBEDDING_MODEL_ID)?;
     Ok(())
 }

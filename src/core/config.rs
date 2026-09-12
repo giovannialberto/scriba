@@ -76,14 +76,14 @@ pub const TRANSCRIPTION_PRESETS: &[TranscriptionPreset] = &[
         name: "groq",
         display: "Groq",
         base_url: "https://api.groq.com/openai/v1",
-        model: "whisper-large-v3-turbo",
+        model: "whisper-large-v3",
         env_var: "GROQ_API_KEY",
     },
     TranscriptionPreset {
         name: "deepinfra",
         display: "DeepInfra",
         base_url: "https://api.deepinfra.com/v1/openai",
-        model: "openai/whisper-large-v3-turbo",
+        model: "openai/whisper-large-v3",
         env_var: "DEEPINFRA_API_KEY",
     },
 ];
@@ -1392,7 +1392,7 @@ mod tests {
         let json = r#"{"Api":{"api_key":"sk"}}"#;
         let mode: TranscriptionMode = serde_json::from_str(json).unwrap();
         assert!(matches!(mode, TranscriptionMode::Api { base_url: None, model: None, .. }));
-        assert_eq!(TranscriptionPreset::by_name("Groq").unwrap().model, "whisper-large-v3-turbo");
+        assert_eq!(TranscriptionPreset::by_name("Groq").unwrap().model, "whisper-large-v3");
         assert!(TranscriptionPreset::for_url("https://api.deepinfra.com/v1/openai/").is_some());
     }
 

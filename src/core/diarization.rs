@@ -21,14 +21,29 @@ use sherpa_onnx::{SpeakerEmbeddingExtractor, SpeakerEmbeddingExtractorConfig};
 use super::transcription::download_file_streaming;
 use crate::utils::BASE_PATH;
 
-const EMBEDDING_FILE: &str = "3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx";
-const EMBEDDING_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx";
+/// Speaker embedding model: NVIDIA TitaNet-Large (VoxCeleb), 192-dim.
+/// Chosen over 3D-Speaker ERes2Net (zh-cn) for real voices: on the same
+/// recordings it separates speakers with about twice the margin, at the
+/// same speed (33 s per hour of speech on an M-series laptop).
+const EMBEDDING_FILE: &str = "nemo_en_titanet_large.onnx";
+const EMBEDDING_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/nemo_en_titanet_large.onnx";
+/// Identifies the embedding space stored voice samples belong to. Samples
+/// from another model are ignored (a voice must be learned again).
+pub const EMBEDDING_MODEL_ID: &str = "titanet-large";
+/// Approximate download size, for UI hints.
+pub const EMBEDDING_DOWNLOAD_MB: u32 = 100;
 
-/// Cosine similarity above which two speaker clusters are merged.
-pub const DEFAULT_SIMILARITY_THRESHOLD: f32 = 0.7;
-/// Segments shorter than this have unreliable embeddings; they inherit the
-/// speaker of the closest neighbouring segment instead.
+/// Cosine similarity above which two speaker clusters are merged, for
+/// clusters with at least `REFERENCE_SECS` of speech. Shorter stretches give
+/// weaker embeddings, so the bar is lowered by `duration_factor`.
+pub const DEFAULT_SIMILARITY_THRESHOLD: f32 = 0.65;
+/// Speech time at which embeddings are considered fully reliable.
+pub const REFERENCE_SECS: f32 = 3.0;
+/// Embeddings need at least this much audio; shorter units are tiled up to it.
 pub const MIN_EMBED_SECS: f32 = 0.8;
+/// Units shorter than this are not embedded at all; they inherit the speaker
+/// of the closest neighbouring unit instead.
+pub const MIN_UNIT_SECS: f32 = 0.4;
 /// The mic must carry this much more RMS energy than the system track for a
 /// segment to count as the owner speaking (covers speaker bleed into the mic).
 pub const OWNER_ENERGY_RATIO: f32 = 2.0;
@@ -36,8 +51,16 @@ pub const OWNER_ENERGY_RATIO: f32 = 2.0;
 const SILENCE_RMS: f32 = 1e-4;
 /// Left/right correlation above which a "stereo" file is really a mono mix.
 const IDENTICAL_TRACKS_CORRELATION: f32 = 0.98;
-/// Cosine similarity above which a cluster is recognized as a known voice.
-pub const PROFILE_MATCH_THRESHOLD: f32 = 0.62;
+/// Cosine similarity above which a cluster is recognized as a known voice
+/// (scaled by `duration_factor` of the cluster's speech time).
+pub const PROFILE_MATCH_THRESHOLD: f32 = 0.65;
+
+/// How much of a similarity threshold applies to `secs` of speech: 1.0 from
+/// `REFERENCE_SECS` up, falling as the square root of the duration below it
+/// (a 1 s turn of the same speaker scores roughly half of a 3 s one).
+pub fn duration_factor(secs: f32) -> f32 {
+    (secs / REFERENCE_SECS).clamp(0.15, 1.0).sqrt()
+}
 /// Owner voice samples harvested per meeting from the mic track.
 pub const OWNER_SAMPLES_PER_RECORDING: usize = 8;
 /// Newest owner samples kept in the database.
@@ -54,6 +77,9 @@ const ENROLLMENT_MIN_RMS: f32 = 0.01;
 /// it is far more likely a bad embedding than a real participant.
 const MIN_CLUSTER_SECS: f32 = 6.0;
 const MIN_CLUSTER_SHARE: f32 = 0.05;
+/// A cluster with less speech than this is never kept as its own speaker,
+/// however short the recording: nothing reliable can be said about it.
+const MIN_CLUSTER_ABS_SECS: f32 = 1.0;
 
 /// Where the speaker embedding model lives once downloaded.
 #[derive(Debug, Clone)]
@@ -89,6 +115,149 @@ pub struct TranscriptSegment {
     pub start: f32,
     pub end: f32,
     pub text: String,
+}
+
+/// A word with host-provided timing (`verbose_json` word granularity).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimedWord {
+    pub start: f32,
+    pub end: f32,
+    pub text: String,
+}
+
+/// Pause between two words that ends a turn when cutting by word timing.
+/// Used for speech the voice activity detector did not cover, typically one
+/// quiet participant, so a generous gap keeps their short replies together.
+pub const WORD_TURN_GAP_SECS: f32 = 1.0;
+
+/// Speech units from host word timestamps: consecutive words stay together
+/// while the pause between them is short. Covers everything the host heard,
+/// including quiet speakers a local voice activity detector may miss.
+pub fn turns_from_words(words: &[TimedWord], max_gap: f32) -> Vec<TranscriptSegment> {
+    let mut turns: Vec<TranscriptSegment> = Vec::new();
+    for w in words {
+        match turns.last_mut() {
+            Some(last) if w.start - last.end <= max_gap => {
+                last.end = last.end.max(w.end);
+                last.text.push(' ');
+                last.text.push_str(&w.text);
+            }
+            _ => turns.push(TranscriptSegment {
+                start: w.start,
+                end: w.end.max(w.start + 0.05),
+                text: w.text.clone(),
+            }),
+        }
+    }
+    turns
+}
+
+/// Tolerance when deciding whether a word lies inside a speech segment.
+const WORD_IN_SPEECH_TOLERANCE_SECS: f32 = 0.25;
+
+/// Speech units from the voice activity detector plus the host's words:
+/// detected speech segments are the primary units (pauses in the audio are
+/// the most reliable turn boundaries), and words the detector did not cover
+/// (a quiet participant further from the microphone) form extra units cut by
+/// word gaps. Sorted by start time.
+pub fn units_from_speech_and_words(
+    speech: &[TranscriptSegment],
+    words: &[TimedWord],
+) -> Vec<TranscriptSegment> {
+    let covered = |at: f32| {
+        speech.iter().any(|s| {
+            at >= s.start - WORD_IN_SPEECH_TOLERANCE_SECS && at <= s.end + WORD_IN_SPEECH_TOLERANCE_SECS
+        })
+    };
+    let orphans: Vec<TimedWord> = words
+        .iter()
+        .filter(|w| !covered((w.start + w.end) / 2.0))
+        .cloned()
+        .collect();
+    let mut units: Vec<TranscriptSegment> = speech.to_vec();
+    units.extend(turns_from_words(&orphans, WORD_TURN_GAP_SECS));
+    units.sort_by(|a, b| a.start.total_cmp(&b.start));
+    units
+}
+
+/// Re-cut a transcript along locally detected speech segments.
+///
+/// Cloud hosts return long segments that often span a whole exchange, so
+/// one label per segment cannot follow a conversation. `speech` is what the
+/// voice activity detector found (pauses split turns); the transcript's
+/// words are placed on the speech segment containing them and each speech
+/// segment becomes a unit with its own text. Punctuation and casing come
+/// from the transcript text: when the host's `words` line up with a
+/// segment's tokens their timing is used, otherwise tokens are spread evenly
+/// over the segment. Speech segments that received no words are dropped.
+pub fn realign_to_speech(
+    speech: &[TranscriptSegment],
+    transcript: &[TranscriptSegment],
+    words: &[TimedWord],
+) -> Vec<TranscriptSegment> {
+    if speech.is_empty() {
+        return transcript.to_vec();
+    }
+    // Timed tokens, keeping the transcript's own spelling.
+    let mut timed: Vec<(f32, String)> = Vec::new();
+    let mut word_cursor = 0;
+    for seg in transcript {
+        let tokens: Vec<&str> = seg.text.split_whitespace().collect();
+        if tokens.is_empty() {
+            continue;
+        }
+        // Words belonging to this segment: consecutive, midpoint inside it.
+        let first = word_cursor;
+        while word_cursor < words.len() {
+            let w = &words[word_cursor];
+            let mid = (w.start + w.end) / 2.0;
+            if mid < seg.end || (word_cursor == first && mid < seg.end + 0.5) {
+                word_cursor += 1;
+            } else {
+                break;
+            }
+        }
+        let seg_words = &words[first..word_cursor];
+        let duration = (seg.end - seg.start).max(0.01);
+        for (i, tok) in tokens.iter().enumerate() {
+            let at = if seg_words.len() == tokens.len() {
+                (seg_words[i].start + seg_words[i].end) / 2.0
+            } else {
+                seg.start + duration * (i as f32 + 0.5) / tokens.len() as f32
+            };
+            timed.push((at, (*tok).to_string()));
+        }
+    }
+
+    let mut texts: Vec<Vec<String>> = vec![Vec::new(); speech.len()];
+    for (at, tok) in timed {
+        let idx = match speech.iter().position(|s| at >= s.start && at <= s.end) {
+            Some(i) => i,
+            None => {
+                let mut best = 0;
+                let mut best_dist = f32::MAX;
+                for (i, s) in speech.iter().enumerate() {
+                    let dist = if at < s.start { s.start - at } else { at - s.end };
+                    if dist < best_dist {
+                        best_dist = dist;
+                        best = i;
+                    }
+                }
+                best
+            }
+        };
+        texts[idx].push(tok);
+    }
+    speech
+        .iter()
+        .zip(texts)
+        .filter(|(_, t)| !t.is_empty())
+        .map(|(s, t)| TranscriptSegment {
+            start: s.start,
+            end: s.end,
+            text: t.join(" "),
+        })
+        .collect()
 }
 
 /// A transcribed segment with a speaker label, as stored in the database.
@@ -173,10 +342,20 @@ impl SpeakerEmbedder {
     }
 
     /// L2-normalized embedding of one stretch of speech, or `None` when too short.
+    /// Stretches between `MIN_UNIT_SECS` and `MIN_EMBED_SECS` are tiled to the
+    /// minimum length: a repeated short turn still embeds as its speaker.
     pub fn embed(&self, samples: &[f32], rate: u32) -> Option<Vec<f32>> {
-        if (samples.len() as f32) < MIN_EMBED_SECS * rate as f32 {
+        if (samples.len() as f32) < MIN_UNIT_SECS * rate as f32 {
             return None;
         }
+        let need = (MIN_EMBED_SECS * rate as f32) as usize;
+        let tiled: Vec<f32>;
+        let samples = if samples.len() < need {
+            tiled = samples.iter().copied().cycle().take(need).collect();
+            &tiled
+        } else {
+            samples
+        };
         let stream = self.extractor.create_stream()?;
         stream.accept_waveform(rate as i32, samples);
         stream.input_finished();
@@ -285,7 +464,9 @@ pub fn cluster_speakers(
         }
     };
 
-    // Phase 1: merge the most similar pair while above threshold or over the cap.
+    // Phase 1: merge the pair with the largest margin over its threshold
+    // (the bar depends on how much speech the shorter cluster holds) while
+    // some pair clears it, or while over the speaker cap.
     while alive_count > 1 {
         let mut best: Option<(f32, usize, usize)> = None;
         for i in 0..k {
@@ -293,13 +474,18 @@ pub fn cluster_speakers(
                 continue;
             }
             for j in (i + 1)..k {
-                if alive[j] && best.is_none_or(|(b, _, _)| sim[i][j] > b) {
-                    best = Some((sim[i][j], i, j));
+                if !alive[j] {
+                    continue;
+                }
+                let bar = options.similarity_threshold * duration_factor(secs[i].min(secs[j]));
+                let margin = sim[i][j] - bar;
+                if best.is_none_or(|(b, _, _)| margin > b) {
+                    best = Some((margin, i, j));
                 }
             }
         }
-        let Some((best_sim, i, j)) = best else { break };
-        if best_sim < options.similarity_threshold && alive_count <= max_speakers {
+        let Some((best_margin, i, j)) = best else { break };
+        if best_margin < 0.0 && alive_count <= max_speakers {
             break;
         }
         merge(
@@ -317,7 +503,9 @@ pub fn cluster_speakers(
 
     // Phase 2: absorb clusters too small to be a real participant.
     let total_secs: f32 = secs.iter().sum();
-    let min_secs = MIN_CLUSTER_SECS.min(total_secs * MIN_CLUSTER_SHARE);
+    let min_secs = MIN_CLUSTER_SECS
+        .min(total_secs * MIN_CLUSTER_SHARE)
+        .max(MIN_CLUSTER_ABS_SECS);
     while alive_count > 1 {
         let small = (0..k)
             .filter(|&i| alive[i] && secs[i] < min_secs)
@@ -501,6 +689,7 @@ pub fn speaker_names(segments: &[LabelledSegment]) -> Vec<String> {
 pub fn match_clusters(
     assignment: &[Option<usize>],
     embeddings: &[Option<Vec<f32>>],
+    durations: &[f32],
     known: &[KnownSpeaker],
 ) -> std::collections::HashMap<usize, String> {
     let mut matched = std::collections::HashMap::new();
@@ -514,6 +703,7 @@ pub fn match_clusters(
     for id in ids {
         let mut sum = vec![0f32; dim];
         let mut n = 0;
+        let mut secs = 0.0f32;
         for (i, a) in assignment.iter().enumerate() {
             if *a == Some(id)
                 && let Some(e) = &embeddings[i]
@@ -522,6 +712,7 @@ pub fn match_clusters(
                     *acc += v;
                 }
                 n += 1;
+                secs += durations.get(i).copied().unwrap_or(0.0);
             }
         }
         if n == 0 {
@@ -533,7 +724,7 @@ pub fn match_clusters(
             .iter()
             .map(|k| (k, k.similarity(&sum)))
             .max_by(|a, b| a.1.total_cmp(&b.1))
-            && sim >= PROFILE_MATCH_THRESHOLD
+            && sim >= PROFILE_MATCH_THRESHOLD * duration_factor(secs)
         {
             matched.insert(id, best.name.clone());
         }
@@ -644,8 +835,9 @@ pub fn label_single_track(
     options: DiarizationOptions,
     known: &[KnownSpeaker],
 ) -> Vec<LabelledSegment> {
-    let mut assignment = cluster_speakers(embeddings, &durations(transcript), options);
-    let recognized = match_clusters(&assignment, embeddings, known);
+    let secs = durations(transcript);
+    let mut assignment = cluster_speakers(embeddings, &secs, options);
+    let recognized = match_clusters(&assignment, embeddings, &secs, known);
     fill_gaps_by_neighbour(&mut assignment);
     let labels = cluster_labels(&assignment, 1, &recognized);
     transcript
@@ -676,10 +868,11 @@ pub fn label_two_track(
         .zip(owner)
         .map(|(e, is_owner)| if *is_owner { None } else { e.clone() })
         .collect();
-    let mut assignment = cluster_speakers(&masked, &durations(transcript), options);
+    let secs = durations(transcript);
+    let mut assignment = cluster_speakers(&masked, &secs, options);
     // Other participants may be voices we already know (never the owner here).
     let others_known: Vec<KnownSpeaker> = known.iter().filter(|k| !k.is_owner).cloned().collect();
-    let recognized = match_clusters(&assignment, &masked, &others_known);
+    let recognized = match_clusters(&assignment, &masked, &secs, &others_known);
     let mut others_only: Vec<Option<usize>> = assignment
         .iter()
         .zip(owner)
@@ -894,6 +1087,68 @@ mod tests {
         let stranger = vec![KnownSpeaker { name: "Nobody".into(), is_owner: false, centroid: unit(&[1.0, 1.0, 1.0]).unwrap() }]; // 0.58 to every axis, below the threshold
         let labelled = label_single_track(&transcript, &embeddings, DiarizationOptions::default(), &stranger);
         assert!(labelled.iter().all(|l| l.speaker.starts_with("Speaker")));
+    }
+
+    fn w(start: f32, end: f32, text: &str) -> TimedWord {
+        TimedWord {
+            start,
+            end,
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn realign_splits_a_host_segment_at_a_pause_using_word_times() {
+        // One 10 s host segment holding a question and its answer.
+        let host = [t(0.0, 10.0, "Come ti chiami? Giulia. Quanti anni?")];
+        let words = [
+            w(0.2, 0.6, "Come"),
+            w(0.6, 0.9, "ti"),
+            w(0.9, 1.5, "chiami"),
+            w(4.0, 4.8, "Giulia"),
+            w(7.0, 7.5, "Quanti"),
+            w(7.5, 8.2, "anni"),
+        ];
+        let speech = [t(0.0, 2.0, ""), t(3.8, 5.0, ""), t(6.8, 9.0, "")];
+        let out = realign_to_speech(&speech, &host, &words);
+        let texts: Vec<&str> = out.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, ["Come ti chiami?", "Giulia.", "Quanti anni?"]);
+        assert_eq!(out[1].start, 3.8);
+    }
+
+    #[test]
+    fn words_missed_by_the_detector_become_their_own_units() {
+        let speech = [t(0.0, 2.0, ""), t(5.0, 6.0, "")];
+        let words = [
+            w(0.5, 0.9, "hi"),
+            w(3.0, 3.3, "yes"),   // quiet reply the detector missed
+            w(3.4, 3.8, "please"),
+            w(5.2, 5.6, "ok"),
+        ];
+        let units = units_from_speech_and_words(&speech, &words);
+        let spans: Vec<(f32, f32)> = units.iter().map(|u| (u.start, u.end)).collect();
+        assert_eq!(spans, [(0.0, 2.0), (3.0, 3.8), (5.0, 6.0)]);
+    }
+
+    #[test]
+    fn turns_follow_pauses_between_words() {
+        let words = [w(0.0, 0.3, "a"), w(0.4, 0.7, "b"), w(2.0, 2.4, "c"), w(2.5, 2.9, "d")];
+        let turns = turns_from_words(&words, 0.8);
+        assert_eq!(turns.len(), 2);
+        assert_eq!((turns[0].start, turns[0].end, turns[0].text.as_str()), (0.0, 0.7, "a b"));
+        assert_eq!(turns[1].text, "c d");
+    }
+
+    #[test]
+    fn realign_without_words_spreads_tokens_over_time() {
+        let host = [t(0.0, 8.0, "a b c d e f g h")];
+        let speech = [t(0.0, 4.0, ""), t(4.5, 8.0, ""), t(20.0, 22.0, "")];
+        let out = realign_to_speech(&speech, &host, &[]);
+        assert_eq!(out.len(), 2, "empty speech segments are dropped");
+        assert_eq!(out[0].text, "a b c d");
+        assert_eq!(out[1].text, "e f g h");
+        // No speech at all: transcript is returned unchanged.
+        assert_eq!(realign_to_speech(&[], &host, &[]).len(), 1);
     }
 
     #[test]

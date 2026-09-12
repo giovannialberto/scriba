@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 use super::config::{LocalModel, ScribaConfig, TranscriptionMode};
-use super::diarization::{self, Diarized, TranscriptSegment};
+use super::diarization::{self, Diarized, TimedWord, TranscriptSegment};
 use super::files::FileManager;
 use crate::database::Database;
 use crate::utils::BASE_PATH;
@@ -156,11 +156,12 @@ fn save_transcript_to_files_and_db(
                         &sample.embedding,
                         sample.duration_secs,
                         "mic-track",
+                        diarization::EMBEDDING_MODEL_ID,
                         Some(recording_id),
                     );
                 }
                 if !d.owner_samples.is_empty() {
-                    let _ = db.prune_speaker_samples("owner", diarization::OWNER_SAMPLES_KEPT);
+                    let _ = db.prune_speaker_samples("owner", diarization::OWNER_SAMPLES_KEPT, diarization::EMBEDDING_MODEL_ID);
                 }
             }
         }
@@ -479,6 +480,7 @@ fn render_diarized(response: &Value) -> Option<String> {
 struct ApiChunk {
     text: String,
     segments: Vec<TranscriptSegment>,
+    words: Vec<TimedWord>,
 }
 
 /// Parse a `json` or `verbose_json` transcription response.
@@ -501,19 +503,45 @@ fn parse_api_chunk(response: &Value) -> Option<ApiChunk> {
                 .collect()
         })
         .unwrap_or_default();
+    let words: Vec<TimedWord> = response
+        .get("words")
+        .and_then(|w| w.as_array())
+        .map(|ws| {
+            ws.iter()
+                .filter_map(|w| {
+                    let text = w.get("word").and_then(|t| t.as_str())?.trim();
+                    let start = w.get("start").and_then(|v| v.as_f64())? as f32;
+                    let end = w.get("end").and_then(|v| v.as_f64())? as f32;
+                    (!text.is_empty()).then(|| TimedWord {
+                        start,
+                        end,
+                        text: text.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let text = match response.get("text").and_then(|t| t.as_str()) {
         Some(t) => t.trim().to_string(),
         None if !segments.is_empty() => join_segments(&segments),
         None => return None,
     };
-    Some(ApiChunk { text, segments })
+    Some(ApiChunk {
+        text,
+        segments,
+        words,
+    })
 }
 
-/// Shift a chunk's segment times by the chunk's start within the recording.
+/// Shift a chunk's segment and word times by the chunk's start within the recording.
 fn offset_segments(chunk: &mut ApiChunk, offset_secs: f32) {
     for seg in &mut chunk.segments {
         seg.start += offset_secs;
         seg.end += offset_secs;
+    }
+    for w in &mut chunk.words {
+        w.start += offset_secs;
+        w.end += offset_secs;
     }
 }
 
@@ -578,7 +606,10 @@ async fn send_chunk(
             .text("response_format", "diarized_json")
             .text("chunking_strategy", "auto");
     } else if with_timestamps {
-        form = form.text("response_format", "verbose_json");
+        form = form
+            .text("response_format", "verbose_json")
+            .text("timestamp_granularities[]", "word")
+            .text("timestamp_granularities[]", "segment");
     } else {
         form = form.text("response_format", "json");
     }
@@ -618,7 +649,7 @@ async fn send_chunk(
         .map_err(transient)?;
 
     let chunk = if target.diarizes() {
-        render_diarized(&response_json).map(|text| ApiChunk { text, segments: Vec::new() })
+        render_diarized(&response_json).map(|text| ApiChunk { text, ..Default::default() })
     } else {
         parse_api_chunk(&response_json)
     };
@@ -960,9 +991,22 @@ async fn ensure_vad_model() -> Result<PathBuf> {
 
 /// Create a Silero VAD for segmenting long audio.
 fn create_vad(vad_model_path: &Path) -> Result<sherpa_onnx::VoiceActivityDetector> {
+    create_vad_with_threshold(vad_model_path, 0.5)
+}
+
+/// Silero speech probability above which audio counts as speech when
+/// cutting cloud transcripts into turns. Lower than the 0.5 used for local
+/// transcription so a quiet participant further from the microphone still
+/// gets units of their own; units without words are dropped anyway.
+const DIARIZATION_VAD_THRESHOLD: f32 = 0.35;
+
+fn create_vad_with_threshold(
+    vad_model_path: &Path,
+    threshold: f32,
+) -> Result<sherpa_onnx::VoiceActivityDetector> {
     let mut vad_config = sherpa_onnx::VadModelConfig::default();
     vad_config.silero_vad.model = Some(vad_model_path.to_string_lossy().into_owned());
-    vad_config.silero_vad.threshold = 0.5;
+    vad_config.silero_vad.threshold = threshold;
     vad_config.silero_vad.min_silence_duration = 0.5;
     vad_config.silero_vad.min_speech_duration = 0.25;
     vad_config.silero_vad.window_size = 512;
@@ -1040,6 +1084,38 @@ fn run_sherpa_transcription(model: LocalModel, model_dir: &Path, wav_path: &Path
     Ok(segments)
 }
 
+/// Speech segments found by Silero VAD, with empty text: the units speaker
+/// labelling works on when the transcript came from a cloud host.
+fn speech_segments(wav_path: &Path, vad_model_path: &Path) -> Result<Vec<TranscriptSegment>> {
+    let wave = Wave::read(wav_path.to_string_lossy().as_ref())
+        .ok_or_else(|| anyhow::anyhow!("Failed to read WAV file: {}", wav_path.display()))?;
+    let samples = wave.samples();
+    let sample_rate = wave.sample_rate();
+    let vad = create_vad_with_threshold(vad_model_path, DIARIZATION_VAD_THRESHOLD)?;
+    let mut segments: Vec<TranscriptSegment> = Vec::new();
+    let drain = |vad: &sherpa_onnx::VoiceActivityDetector, segments: &mut Vec<TranscriptSegment>| {
+        while !vad.is_empty() {
+            if let Some(segment) = vad.front() {
+                let start = segment.start() as f32 / sample_rate as f32;
+                let end = start + segment.samples().len() as f32 / sample_rate as f32;
+                segments.push(TranscriptSegment {
+                    start,
+                    end,
+                    text: String::new(),
+                });
+            }
+            vad.pop();
+        }
+    };
+    for chunk in samples.chunks(512) {
+        vad.accept_waveform(chunk);
+        drain(&vad, &mut segments);
+    }
+    vad.flush();
+    drain(&vad, &mut segments);
+    Ok(segments)
+}
+
 /// Plain transcript text: segments joined by spaces.
 fn join_segments(segments: &[TranscriptSegment]) -> String {
     segments
@@ -1096,7 +1172,7 @@ async fn diarize_local_transcript(
 /// Voices Scriba already knows, labelled with their current display names.
 fn known_speakers(owner_name: &str) -> Vec<diarization::KnownSpeaker> {
     Database::new()
-        .and_then(|db| db.speaker_profiles())
+        .and_then(|db| db.speaker_profiles(diarization::EMBEDDING_MODEL_ID))
         .map(|profiles| {
             profiles
                 .into_iter()
@@ -1199,9 +1275,13 @@ async fn transcribe_with_api(audio_path: &PathBuf, target: ApiTranscriptionTarge
     // consistently: keep the text, drop the partial timing.
     let chunks: Vec<ApiChunk> = transcripts.into_iter().map(|t| t.unwrap_or_default()).collect();
     let all_timed = chunks.iter().all(|c| !c.segments.is_empty());
+    let all_worded = chunks.iter().all(|c| !c.words.is_empty());
     let mut result = ApiChunk::default();
     result.text = chunks.iter().map(|c| c.text.as_str()).collect::<Vec<_>>().join(" ");
     if all_timed {
+        if all_worded {
+            result.words = chunks.iter().flat_map(|c| c.words.clone()).collect();
+        }
         result.segments = chunks.into_iter().flat_map(|c| c.segments).collect();
     }
     Ok(result)
@@ -1343,8 +1423,9 @@ pub async fn transcribe_audio(
             }
             let mut text = result.text;
 
-            // Speaker labelling is local either way: with segment timestamps
-            // from the host, the same embeddings pipeline applies.
+            // Speaker labelling is local either way: the host's timestamps
+            // place the words, the voice activity detector cuts the turns,
+            // and the same embeddings pipeline labels them.
             if config.diarization.enabled && !result.segments.is_empty() {
                 if verbose {
                     print!("\r{}\r", " ".repeat(80));
@@ -1353,10 +1434,38 @@ pub async fn transcribe_audio(
                 let _stderr_guard = suppress_stderr();
                 let labelled = match ensure_mono_16k_wav(&audio_file_path) {
                     Ok(wav_path) => {
+                        // Pauses in the audio cut the turns; the host's
+                        // words place the text and cover speech the
+                        // detector missed. Without a detector, words alone;
+                        // without words, the host's segments.
+                        let speech = match ensure_vad_model().await {
+                            Ok(vad) => speech_segments(&wav_path, &vad).ok(),
+                            Err(_) => None,
+                        };
+                        let units = match (speech, result.words.is_empty()) {
+                            (Some(speech), false) => {
+                                let units = diarization::units_from_speech_and_words(
+                                    &speech,
+                                    &result.words,
+                                );
+                                diarization::realign_to_speech(&units, &result.segments, &result.words)
+                            }
+                            (Some(speech), true) => {
+                                diarization::realign_to_speech(&speech, &result.segments, &[])
+                            }
+                            (None, false) => {
+                                let turns = diarization::turns_from_words(
+                                    &result.words,
+                                    diarization::WORD_TURN_GAP_SECS,
+                                );
+                                diarization::realign_to_speech(&turns, &result.segments, &result.words)
+                            }
+                            (None, true) => result.segments.clone(),
+                        };
                         let r = diarize_local_transcript(
                             &audio_file_path,
                             &wav_path,
-                            &result.segments,
+                            &units,
                             &config,
                             verbose,
                         )
@@ -1484,6 +1593,16 @@ mod api_chunking_tests {
         assert_eq!(chunk.segments[0].text, "Hello there.");
         offset_segments(&mut chunk, 600.0);
         assert_eq!(chunk.segments[1].start, 601.6);
+
+        let worded = serde_json::json!({
+            "text": "Hi there",
+            "segments": [{"start": 0.0, "end": 1.0, "text": "Hi there"}],
+            "words": [{"word": "Hi", "start": 0.0, "end": 0.4}, {"word": "there", "start": 0.4, "end": 1.0}]
+        });
+        let mut chunk = parse_api_chunk(&worded).unwrap();
+        assert_eq!(chunk.words.len(), 2);
+        offset_segments(&mut chunk, 10.0);
+        assert_eq!(chunk.words[1].start, 10.4);
 
         let plain = parse_api_chunk(&serde_json::json!({"text": "just text"})).unwrap();
         assert_eq!(plain.text, "just text");

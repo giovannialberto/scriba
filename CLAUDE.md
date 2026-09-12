@@ -22,7 +22,7 @@ src/
   core/                Business logic (no UI deps)
     recording.rs       Audio capture via cpal
     transcription.rs   STT: sherpa-onnx (local) + OpenAI-compatible speech APIs (verbose_json timestamps when the host supports them, so cloud transcripts get speaker labels too)
-    diarization.rs     Who spoke when: per-segment speaker embeddings (sherpa-onnx) clustered by similarity; owner from the mic track on two-track recordings; known voices matched from speaker_samples
+    diarization.rs     Who spoke when: per-turn speaker embeddings (TitaNet-Large via sherpa-onnx) clustered with duration-aware thresholds; turns from VAD pauses plus host word timing; owner from the mic track on two-track recordings; known voices matched from speaker_samples (per embedding model)
     voice.rs           Owner voice enrollment: clip -> embeddings -> speaker_samples
     workflow.rs        Orchestration: record -> transcribe -> enrich
     loopback.rs        System audio capture (macOS: ScreenCaptureKit, Linux: PulseAudio/PipeWire)

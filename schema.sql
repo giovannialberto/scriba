@@ -197,6 +197,7 @@ CREATE TABLE IF NOT EXISTS speaker_samples (
     embedding TEXT NOT NULL,              -- JSON array of floats, L2-normalized
     duration_secs REAL NOT NULL DEFAULT 0,
     source TEXT NOT NULL,                 -- 'enrollment' | 'mic-track' | 'confirmed'
+    model TEXT NOT NULL DEFAULT '',       -- embedding model id the vector belongs to
     recording_id INTEGER,
     created_at DATETIME NOT NULL,
     FOREIGN KEY (recording_id) REFERENCES recordings(id) ON DELETE SET NULL
