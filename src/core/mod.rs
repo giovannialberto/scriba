@@ -10,6 +10,7 @@
 pub mod audio;
 pub mod autopilot;
 pub mod config;
+pub mod diarization;
 pub mod files;
 pub mod loopback;
 pub mod meeting;

@@ -217,8 +217,8 @@ pub struct ScribaConfig {
     /// Automatic meeting detection settings (`scriba watch`).
     #[serde(default)]
     pub meeting_detection: MeetingDetectionConfig,
-    /// Speaker diarization settings (reserved for future use).
-    #[serde(default, skip_serializing)]
+    /// Speaker diarization settings.
+    #[serde(default)]
     pub diarization: DiarizationConfig,
     /// Voice-activated recording settings (reserved for future use).
     #[serde(default, skip_serializing)]
@@ -1000,17 +1000,23 @@ impl EnrichmentConfig {
 /// Configuration for speaker diarization.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiarizationConfig {
-    /// Whether speaker diarization is enabled during transcription.
+    /// Whether to label who said what after local transcription.
+    #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Maximum number of speakers to detect.
+    /// Reserved: upper bound on detected speakers (clustering is automatic today).
+    #[serde(default = "default_max_speakers")]
     pub max_speakers: u32,
+}
+
+fn default_max_speakers() -> u32 {
+    6
 }
 
 impl Default for DiarizationConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            max_speakers: 6,
+            enabled: true,
+            max_speakers: default_max_speakers(),
         }
     }
 }
