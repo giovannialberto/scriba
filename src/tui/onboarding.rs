@@ -15,7 +15,7 @@ use ratatui::{
 use tokio::sync::mpsc;
 
 use super::chat::ACCENT;
-use super::app::{Dashboard, DashboardAction};
+use super::app::{Dashboard, DashboardAction, DashboardView};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Onboarding
@@ -42,6 +42,10 @@ pub(super) enum OnboardingStep {
     // Shared
     AskName,
     AskRole,
+    /// Existing users only: one-time introduction to speaker labels.
+    WhatsNew,
+    /// Owner voice enrollment (optional).
+    VoiceEnrollment,
     Processing,
     Confirmation,
     Done,
@@ -155,6 +159,10 @@ pub(super) struct OnboardingState {
     pub(super) download_task: Option<tokio::task::JoinHandle<()>>,
     pub(super) download_rx: Option<mpsc::UnboundedReceiver<DownloadProgress>>,
     pub(super) download_items: Vec<(String, DownloadStatus)>,
+    pub(super) voice: Option<super::voice::VoiceEnrollment>,
+    /// True when this is the "what's new" voice introduction for an existing
+    /// user: no world setup, no step dots, Esc leaves instead of quitting.
+    pub(super) upgrade_intro: bool,
 }
 
 impl OnboardingState {
@@ -205,7 +213,29 @@ impl OnboardingState {
             download_task: None,
             download_rx: None,
             download_items: Vec::new(),
+            voice: None,
+            upgrade_intro: false,
         }
+    }
+
+    /// The short flow shown once to users who set up Scriba before voice
+    /// profiles existed: what changed, then the optional voice enrollment.
+    pub(super) fn voice_intro(owner_name: &str) -> Self {
+        let mut ob = Self::new();
+        ob.upgrade_intro = true;
+        ob.step = OnboardingStep::WhatsNew;
+        ob.voice = Some(super::voice::VoiceEnrollment::new(owner_name));
+        ob.set_step_text(
+            "Scriba now tells speakers apart.\n\n\
+             Meetings are recorded as two tracks, so what you say\n\
+             is kept separate from the other participants.\n\
+             Transcripts label who said what.\n\n\
+             If Scriba learns your voice, it can name you\n\
+             in single-mic recordings too, and it keeps learning\n\
+             from every meeting. Only a voiceprint is stored.",
+            true,
+        );
+        ob
     }
 
     pub(super) fn set_step_text(&mut self, text: &str, animated: bool) {
@@ -292,6 +322,9 @@ impl OnboardingState {
                     self.tick_typewriter_lines();
                 }
             }
+            OnboardingStep::WhatsNew => {
+                self.tick_typewriter_lines();
+            }
             OnboardingStep::AskName | OnboardingStep::AskRole => {
                 self.tick_typewriter_lines();
             }
@@ -299,6 +332,11 @@ impl OnboardingState {
             | OnboardingStep::ProviderSelection | OnboardingStep::EndpointEntry
             | OnboardingStep::ModelEntry | OnboardingStep::ApiKeyEntry => {
                 // Instant text -- no typewriter
+            }
+            OnboardingStep::VoiceEnrollment => {
+                if let Some(v) = &mut self.voice {
+                    v.tick();
+                }
             }
             OnboardingStep::ModelSetup => {
                 // Phase 3: drain download progress
@@ -626,11 +664,17 @@ impl Dashboard {
             None => return Ok(DashboardAction::Continue),
         };
 
-        // Esc at any step → quit the application
+        // Esc at any step → quit the application (or leave the what's-new intro)
         if matches!(key_code, KeyCode::Esc) {
+            if ob.upgrade_intro {
+                self.onboarding = None;
+                self.current_view = DashboardView::Main;
+                return Ok(DashboardAction::Continue);
+            }
             return Ok(DashboardAction::Quit);
         }
 
+        let mut leave_intro = false;
         match ob.step {
             OnboardingStep::Entrance => {
                 // No key handling during entrance animation
@@ -1236,10 +1280,10 @@ impl Dashboard {
                     match key_code {
                         KeyCode::Enter => {
                             if !ob.user_role.trim().is_empty() {
-                                ob.step = OnboardingStep::Processing;
+                                ob.step = OnboardingStep::VoiceEnrollment;
                                 ob.anim_frame = 0;
-                                ob.set_step_text("Setting up your world...", false);
-                                self.start_onboarding_processing();
+                                ob.voice = Some(super::voice::VoiceEnrollment::new(&ob.user_name));
+                                ob.set_step_text("", false);
                             }
                         }
                         KeyCode::Char(c) => {
@@ -1250,6 +1294,37 @@ impl Dashboard {
                         }
                         _ => {}
                     }
+                }
+            }
+            OnboardingStep::WhatsNew => {
+                if !ob.text_complete {
+                    ob.visible_chars = ob.full_text.chars().count();
+                    ob.text_complete = true;
+                } else {
+                    match key_code {
+                        KeyCode::Enter => {
+                            ob.step = OnboardingStep::VoiceEnrollment;
+                            ob.anim_frame = 0;
+                            ob.set_step_text("", false);
+                        }
+                        KeyCode::Char('s') | KeyCode::Char('S') => leave_intro = true,
+                        _ => {}
+                    }
+                }
+            }
+            OnboardingStep::VoiceEnrollment => {
+                let finished = match ob.voice.as_mut() {
+                    Some(v) => v.handle_key(key_code, &self.config) == super::voice::VoiceAction::Finished,
+                    None => true,
+                };
+                if finished && ob.upgrade_intro {
+                    leave_intro = true;
+                } else if finished {
+                    ob.voice = None;
+                    ob.step = OnboardingStep::Processing;
+                    ob.anim_frame = 0;
+                    ob.set_step_text("Setting up your world...", false);
+                    self.start_onboarding_processing();
                 }
             }
             OnboardingStep::Processing => {
@@ -1318,6 +1393,10 @@ impl Dashboard {
             }
         }
 
+        if leave_intro {
+            self.onboarding = None;
+            self.current_view = DashboardView::Main;
+        }
         Ok(DashboardAction::Continue)
     }
 
@@ -1467,6 +1546,9 @@ impl Dashboard {
             OnboardingStep::SystemCheck => "Setup \u{00B7} System Check",
             OnboardingStep::ModelSetup => "Setup \u{00B7} Models",
             OnboardingStep::AskName | OnboardingStep::AskRole => "Setup \u{00B7} About You",
+            OnboardingStep::WhatsNew => "What's new \u{00B7} Speaker labels",
+            OnboardingStep::VoiceEnrollment if ob.upgrade_intro => "What's new \u{00B7} Your voice",
+            OnboardingStep::VoiceEnrollment => "Setup \u{00B7} Your voice",
             OnboardingStep::Processing => "Setup \u{00B7} Processing",
             OnboardingStep::Confirmation => "Setup \u{00B7} Confirm",
             OnboardingStep::Done => "Ready",
@@ -1842,6 +1924,10 @@ impl Dashboard {
                     lines.push(Line::from(Span::styled(format!("  {}{}", label, pad), Style::default().fg(Color::DarkGray))));
                 }
             }
+        } else if ob.step == OnboardingStep::VoiceEnrollment {
+            if let Some(v) = &ob.voice {
+                lines.extend(v.render_lines(body.width as usize));
+            }
         } else if ob.step == OnboardingStep::Confirmation {
             // Structured label/value layout
             for text_line in visible.split('\n') {
@@ -1993,7 +2079,7 @@ impl Dashboard {
                 OnboardingStep::ProviderSelection | OnboardingStep::EndpointEntry | OnboardingStep::ModelEntry => 3,
                 OnboardingStep::ApiKeyEntry | OnboardingStep::ApiKeyValidation => 4,
                 OnboardingStep::AskName => 5,
-                OnboardingStep::AskRole => 6,
+                OnboardingStep::AskRole | OnboardingStep::VoiceEnrollment => 6,
                 OnboardingStep::Processing => 7,
                 OnboardingStep::Confirmation => 8,
                 OnboardingStep::Done => 9,
@@ -2006,7 +2092,7 @@ impl Dashboard {
                 OnboardingStep::SystemCheck => 2,
                 OnboardingStep::ModelSetup => 3,
                 OnboardingStep::AskName => 4,
-                OnboardingStep::AskRole => 5,
+                OnboardingStep::AskRole | OnboardingStep::VoiceEnrollment => 5,
                 OnboardingStep::Processing => 6,
                 OnboardingStep::Confirmation => 7,
                 OnboardingStep::Done => 8,
@@ -2025,8 +2111,10 @@ impl Dashboard {
             };
             dots.push(Span::styled(format!(" {} ", ch), Style::default().fg(color)));
         }
-        let dots_line = Paragraph::new(Line::from(dots)).alignment(Alignment::Center);
-        f.render_widget(dots_line, chunks[2]);
+        if !ob.upgrade_intro {
+            let dots_line = Paragraph::new(Line::from(dots)).alignment(Alignment::Center);
+            f.render_widget(dots_line, chunks[2]);
+        }
 
         // ── Footer ──────────────────────────────────────────────────
         let footer_area = chunks[3];
@@ -2081,6 +2169,10 @@ impl Dashboard {
                 }
             }
             OnboardingStep::AskName | OnboardingStep::AskRole => "[Enter] Continue",
+            OnboardingStep::WhatsNew => {
+                if ob.text_complete { "[Enter] Learn my voice  [S] Later" } else { "" }
+            }
+            OnboardingStep::VoiceEnrollment => ob.voice.as_ref().map(|v| v.footer_hint()).unwrap_or("[Enter] Continue"),
             OnboardingStep::Processing => {
                 if ob.processing_task.is_some() { "" }
                 else if !ob.ollama_available { "[Enter] Continue" }
@@ -2093,7 +2185,7 @@ impl Dashboard {
         };
 
         let mut right_spans: Vec<Span> = Vec::new();
-        if ob.step != OnboardingStep::Done {
+        if ob.step != OnboardingStep::Done && !ob.upgrade_intro {
             right_spans.extend([
                 Span::styled("[", Style::default().fg(Color::DarkGray)),
                 Span::styled("Esc", Style::default().fg(Color::White)),

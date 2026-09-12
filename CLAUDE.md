@@ -21,8 +21,9 @@ src/
   lib.rs               Public module exports
   core/                Business logic (no UI deps)
     recording.rs       Audio capture via cpal
-    transcription.rs   STT: sherpa-onnx (local) + OpenAI-compatible speech APIs
-    diarization.rs     Who spoke when: sherpa-onnx pyannote + speaker embeddings; owner from the mic track on two-track recordings
+    transcription.rs   STT: sherpa-onnx (local) + OpenAI-compatible speech APIs (verbose_json timestamps when the host supports them, so cloud transcripts get speaker labels too)
+    diarization.rs     Who spoke when: per-turn speaker embeddings (TitaNet-Large via sherpa-onnx) clustered with duration-aware thresholds; turns from VAD pauses plus host word timing; owner from the mic track on two-track recordings; known voices matched from speaker_samples (per embedding model)
+    voice.rs           Owner voice enrollment: clip -> embeddings -> speaker_samples
     workflow.rs        Orchestration: record -> transcribe -> enrich
     loopback.rs        System audio capture (macOS: ScreenCaptureKit, Linux: PulseAudio/PipeWire)
     meeting.rs         Meeting detection: polls "mic in use by another process" (Core Audio process objects / pactl)
@@ -48,6 +49,7 @@ src/
     entities.rs        Entity browser/editor
     onboarding.rs      First-run setup flow
     settings.rs        Settings UI
+    voice.rs           Voice enrollment component (record 12 s, embed, store) shared by onboarding and Settings
     transcript.rs      Transcript viewer
     recording.rs       Recording UI
   mcp/                 Model Context Protocol server for Claude Desktop

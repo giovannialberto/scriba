@@ -316,6 +316,23 @@ impl Dashboard {
             // Initialize chat context for global view
             self.load_entities().ok();
             self.init_global_chat();
+
+            // Users who set up Scriba before voice profiles existed get the
+            // "what's new" introduction once, with the optional enrollment.
+            if !self.config.voice_intro_seen {
+                self.config.voice_intro_seen = true;
+                let _ = self.config.save();
+                let learned = self
+                    .db
+                    .speaker_sample_stats("owner", crate::core::diarization::EMBEDDING_MODEL_ID)
+                    .map(|(count, _)| count > 0)
+                    .unwrap_or(false);
+                if !learned {
+                    let name = crate::core::transcription::owner_display_name();
+                    self.current_view = DashboardView::Onboarding;
+                    self.onboarding = Some(OnboardingState::voice_intro(&name));
+                }
+            }
         }
 
         // Background meeting watcher: on by default, toggled in Settings.
@@ -547,6 +564,11 @@ impl Dashboard {
             // Key probe results for the settings screen
             while let Ok((card, result)) = self.key_probe_rx.try_recv() {
                 self.on_key_probe(card, result);
+            }
+
+            // Voice enrollment running from Settings
+            if let SettingsEdit::Voice(v) = &mut self.settings_edit {
+                v.tick();
             }
 
             // Handle chat-triggered recording

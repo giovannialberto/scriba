@@ -202,6 +202,11 @@ enum Command {
         )]
         enrichment_base_url: Option<String>,
     },
+    /// Teach Scriba voices (owner enrollment, status)
+    Voice {
+        #[structopt(subcommand)]
+        cmd: VoiceCommand,
+    },
     /// Manage entities (people, organizations)
     Entity {
         #[structopt(subcommand)]
@@ -263,6 +268,19 @@ enum ConfigCommand {
         #[structopt(help = "Model name")]
         model: String,
     },
+}
+
+#[derive(Debug, StructOpt)]
+enum VoiceCommand {
+    /// Learn the owner's voice from an audio file of the owner speaking alone (10-30 s is plenty)
+    Enroll {
+        #[structopt(help = "Audio file (wav, mp3, m4a...) with only the owner speaking")]
+        file: PathBuf,
+    },
+    /// Show how much of the owner's voice Scriba has learned
+    Status,
+    /// Forget everything learned about the owner's voice
+    Forget,
 }
 
 #[derive(Debug, StructOpt)]
@@ -700,6 +718,38 @@ async fn main() -> Result<()> {
                     };
 
                     workflow.enrich_existing_recording(&directory_name, true).await?;
+                    Ok(())
+                }
+                Command::Voice { cmd } => {
+                    let mut db = Database::new()?;
+                    match cmd {
+                        VoiceCommand::Enroll { file } => {
+                            let samples = scriba::core::voice::enroll_owner_from_file(&file, &mut db).await?;
+                            let (count, secs) = db.speaker_sample_stats("owner", scriba::core::diarization::EMBEDDING_MODEL_ID)?;
+                            println!(
+                                "✅ Learned {} voice sample(s) from {}. Total: {} sample(s), {:.0}s of your voice.",
+                                samples,
+                                file.display(),
+                                count,
+                                secs
+                            );
+                        }
+                        VoiceCommand::Status => {
+                            let (count, secs) = db.speaker_sample_stats("owner", scriba::core::diarization::EMBEDDING_MODEL_ID)?;
+                            if count == 0 {
+                                println!("Scriba has not learned your voice yet. Run: scriba voice enroll <file>");
+                            } else {
+                                println!("Owner voice: {} sample(s), {:.0}s of speech.", count, secs);
+                            }
+                            for p in db.speaker_profiles(scriba::core::diarization::EMBEDDING_MODEL_ID)?.into_iter().filter(|p| !p.is_owner) {
+                                println!("{}: {} sample(s), {:.0}s", p.speaker, p.samples, p.total_secs);
+                            }
+                        }
+                        VoiceCommand::Forget => {
+                            let n = db.delete_speaker_samples("owner")?;
+                            println!("🗑  Forgot {} owner voice sample(s).", n);
+                        }
+                    }
                     Ok(())
                 }
                 Command::Entity { cmd } => {
