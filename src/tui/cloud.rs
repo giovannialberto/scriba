@@ -1,9 +1,9 @@
 //! Scriba Pro flows, shown inline under a Settings row.
 //!
-//! Two separate, linear flows: sign in (email, then the emailed code) and
-//! request access (email, then an optional note). Enter moves forward, Esc
-//! moves back, errors appear under the field, and the panel closes itself
-//! when the flow is done. Signed-in actions (refresh, sign out) are a normal
+//! Two linear flows: request access (one field, your email) and sign in
+//! (email, then the emailed code). Enter moves forward, Esc cancels, errors
+//! appear under the field, and the panel closes itself when the flow is
+//! done. Signed-in actions (refresh, sign out) are a normal
 //! Settings picker, not part of this component.
 
 use crossterm::event::KeyCode;
@@ -18,8 +18,6 @@ use super::chat::ACCENT;
 use crate::cloud::{self, AccountEvent, CloudError, SupabaseClient};
 use crate::core::ScribaConfig;
 
-/// Longest note accepted with a beta request (matches the server).
-const NOTE_MAX: usize = 500;
 /// Codes are eight digits today; accept a little either way.
 const CODE_MAX: usize = 10;
 const CODE_MIN: usize = 6;
@@ -42,9 +40,6 @@ enum Op {
 
 enum Step {
     Email,
-    Note {
-        email: String,
-    },
     Code {
         email: String,
     },
@@ -110,7 +105,6 @@ impl CloudFlow {
             KeyCode::Char(c) => {
                 let accept = match &self.step {
                     Step::Email => !c.is_whitespace() && self.buffer.len() < 254,
-                    Step::Note { .. } => self.buffer.chars().count() < NOTE_MAX,
                     Step::Code { .. } => c.is_ascii_digit() && self.buffer.len() < CODE_MAX,
                     Step::Busy { .. } | Step::Done => false,
                 };
@@ -124,17 +118,12 @@ impl CloudFlow {
         }
     }
 
-    /// Esc: one step back, or out of the flow from the first field.
+    /// Esc: out of the flow, unless a request is in flight.
     fn back(&mut self) -> CloudAction {
         let step = std::mem::replace(&mut self.step, Step::Done);
         self.error = None;
         match step {
             Step::Email | Step::Code { .. } | Step::Done => CloudAction::Finished,
-            Step::Note { email } => {
-                self.buffer = email;
-                self.step = Step::Email;
-                CloudAction::Continue
-            }
             busy @ Step::Busy { .. } => {
                 // A request in flight is short; let it finish.
                 self.step = busy;
@@ -157,12 +146,8 @@ impl CloudFlow {
                 self.buffer.clear();
                 self.step = match self.goal {
                     Goal::SignIn => self.start_send_code(email),
-                    Goal::RequestAccess => Step::Note { email },
+                    Goal::RequestAccess => self.start_request(email),
                 };
-            }
-            Step::Note { email } => {
-                let note = std::mem::take(&mut self.buffer);
-                self.step = self.start_request(email, note);
             }
             Step::Code { email } => {
                 if self.buffer.len() < CODE_MIN {
@@ -179,12 +164,12 @@ impl CloudFlow {
         CloudAction::Continue
     }
 
-    fn start_request(&self, email: String, note: String) -> Step {
+    fn start_request(&self, email: String) -> Step {
         let client = self.client.clone();
         let e = email.clone();
         Step::Busy {
             op: Op::Request { email },
-            task: tokio::spawn(async move { cloud::request_beta(&client, &e, Some(&note)).await }),
+            task: tokio::spawn(async move { cloud::request_beta(&client, &e, None).await }),
         }
     }
 
@@ -251,7 +236,7 @@ impl CloudFlow {
             (Op::SendCode { email }, CloudError::NotApproved) => (
                 Step::Email,
                 email,
-                "not on the beta yet \u{00B7} use Request access below".to_string(),
+                "this email isn't approved yet".to_string(),
             ),
             (Op::SendCode { email }, _) | (Op::Request { email }, _) => {
                 (Step::Email, email, err.to_string())
@@ -288,24 +273,13 @@ impl CloudFlow {
         match &self.step {
             Step::Email => {
                 let title = match self.goal {
-                    Goal::SignIn => "Sign in with the email that was approved for the beta.",
+                    Goal::SignIn => "Sign in with your approved email. We'll send you a code.",
                     Goal::RequestAccess => {
-                        "Ask to join the closed beta. Approval is by hand; you get an email either way."
+                        "Leave your email and we'll write to you when your access is ready."
                     }
                 };
                 lines.extend(wrap(title, white));
                 lines.push(field("email", &self.buffer));
-            }
-            Step::Note { email } => {
-                lines.push(Line::from(vec![
-                    Span::styled("Requesting access for ", white),
-                    Span::styled(email.clone(), accent),
-                ]));
-                lines.push(Line::from(Span::styled(
-                    "A line about how you would use Scriba helps. Optional.",
-                    dim,
-                )));
-                lines.push(field("note", &self.buffer));
             }
             Step::Code { email } => {
                 lines.push(Line::from(vec![
@@ -328,10 +302,12 @@ impl CloudFlow {
         if let Some(error) = &self.error {
             lines.extend(wrap(&format!("\u{2717} {error}"), bad));
         }
-        let hint = match &self.step {
-            Step::Email | Step::Code { .. } => "Enter to continue \u{00B7} Esc to cancel",
-            Step::Note { .. } => "Enter to send \u{00B7} Esc to go back",
-            Step::Busy { .. } | Step::Done => "",
+        let hint = match (&self.step, self.goal) {
+            (Step::Email, Goal::RequestAccess) => "Enter to send \u{00B7} Esc to cancel",
+            (Step::Email, Goal::SignIn) | (Step::Code { .. }, _) => {
+                "Enter to continue \u{00B7} Esc to cancel"
+            }
+            (Step::Busy { .. }, _) | (Step::Done, _) => "",
         };
         if !hint.is_empty() {
             lines.push(Line::from(Span::styled(hint, dim)));
@@ -344,7 +320,6 @@ impl std::fmt::Debug for CloudFlow {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let step = match &self.step {
             Step::Email => "Email",
-            Step::Note { .. } => "Note",
             Step::Code { .. } => "Code",
             Step::Busy { .. } => "Busy",
             Step::Done => "Done",
@@ -399,20 +374,27 @@ mod tests {
         assert!(flow.error.is_none(), "typing clears the error");
     }
 
-    #[test]
-    fn request_access_goes_email_then_note_and_esc_steps_back() {
+    #[tokio::test]
+    async fn request_access_is_one_field() {
+        let mut flow = CloudFlow::new(Goal::RequestAccess, &configured()).unwrap();
+        assert_eq!(
+            flow.handle_key(KeyCode::Esc),
+            CloudAction::Finished,
+            "Esc cancels"
+        );
         let mut flow = CloudFlow::new(Goal::RequestAccess, &configured()).unwrap();
         type_str(&mut flow, "Me@Example.com");
         flow.handle_key(KeyCode::Enter);
-        assert!(matches!(&flow.step, Step::Note { email } if email == "me@example.com"));
-        assert!(flow.buffer.is_empty());
-        assert_eq!(flow.handle_key(KeyCode::Esc), CloudAction::Continue);
-        assert!(matches!(flow.step, Step::Email));
-        assert_eq!(
-            flow.buffer, "me@example.com",
-            "the email comes back for editing"
+        assert!(
+            matches!(&flow.step, Step::Busy { op: Op::Request { email }, .. } if email == "me@example.com"),
+            "the request goes out straight from the email field"
         );
-        assert_eq!(flow.handle_key(KeyCode::Esc), CloudAction::Finished);
+        assert!(flow.buffer.is_empty());
+        assert_eq!(
+            flow.handle_key(KeyCode::Esc),
+            CloudAction::Continue,
+            "in flight: wait"
+        );
     }
 
     #[test]
@@ -467,7 +449,7 @@ mod tests {
         );
         assert!(matches!(flow.step, Step::Email));
         assert_eq!(flow.buffer, "a@b.co");
-        assert!(flow.error.as_deref().unwrap().contains("Request access"));
+        assert!(flow.error.as_deref().unwrap().contains("approved"));
 
         flow.step_after_error(
             Op::Verify {
@@ -485,9 +467,6 @@ mod tests {
         flow.error = Some("x".repeat(200));
         for step in [
             Step::Email,
-            Step::Note {
-                email: "a@b.co".into(),
-            },
             Step::Code {
                 email: "a@b.co".into(),
             },

@@ -30,6 +30,8 @@ use crate::llm::{self, LlmTarget, ModelListEntry, Protocol};
 
 /// Label column width. Labels are fixed and short; provider names live in the value column.
 const LABEL_WIDTH: usize = 14;
+/// Shown under the SCRIBA PRO header while signed out.
+const PRO_INTRO: &str = "Scriba Pro is the hosted version of Scriba: an account, cloud models with no API keys to manage, backups, and calendar integration. It is in closed beta.";
 /// Rows shown in a picker before it scrolls.
 const PICKER_VISIBLE: usize = 9;
 /// Pickers longer than this show the type-to-filter line up front.
@@ -83,7 +85,7 @@ impl Row {
             Row::MeetingWatch => "Meeting watch",
             Row::CheckUpdates => "Check updates",
             Row::SignIn => "Sign in",
-            Row::RequestAccess => "Access",
+            Row::RequestAccess => "Beta access",
             Row::Account => "Account",
         }
     }
@@ -122,7 +124,7 @@ fn settings_rows(config: &ScribaConfig) -> Vec<Row> {
     let mut rows = vec![Row::Setup];
     match crate::cloud::status(config) {
         crate::cloud::AccountStatus::SignedOut { .. } => {
-            rows.extend([Row::SignIn, Row::RequestAccess])
+            rows.extend([Row::RequestAccess, Row::SignIn])
         }
         crate::cloud::AccountStatus::SignedIn { .. }
         | crate::cloud::AccountStatus::Unavailable => rows.push(Row::Account),
@@ -1560,6 +1562,11 @@ impl Dashboard {
                         Span::raw("  "),
                         Span::styled(section, section_style),
                     ]));
+                    if row == Row::RequestAccess {
+                        for l in textwrap::wrap(PRO_INTRO, width.saturating_sub(4)) {
+                            lines.push(Line::from(Span::styled(format!("  {l}"), hint_style)));
+                        }
+                    }
                 }
                 last_section = row.section();
             }
@@ -2062,8 +2069,8 @@ impl Dashboard {
                 false,
             ),
             Row::SignIn => (
-                "Email code".to_string(),
-                "for approved beta members".to_string(),
+                "Email + code".to_string(),
+                "once your access is ready".to_string(),
                 DetailTone::Neutral,
                 "\u{2190} Enter to sign in",
                 false,
@@ -2072,7 +2079,7 @@ impl Dashboard {
                 Some(at) => (
                     "Requested".to_string(),
                     format!(
-                        "on {} \u{00B7} you get an email if approved",
+                        "on {} \u{00B7} we email you when your access is ready",
                         super::cloud::short_date(at)
                     ),
                     DetailTone::Neutral,
@@ -2080,8 +2087,8 @@ impl Dashboard {
                     false,
                 ),
                 None => (
-                    "Closed beta".to_string(),
-                    "hosted Scriba \u{00B7} approved by hand, no payment".to_string(),
+                    "Request".to_string(),
+                    "leave your email".to_string(),
                     DetailTone::Neutral,
                     "\u{2190} Enter to request access",
                     false,
@@ -2280,7 +2287,7 @@ mod tests {
         pro.cloud.supabase_url = Some("https://x.supabase.co".into());
         pro.cloud.supabase_anon_key = Some("anon".into());
         let rows = settings_rows(&pro);
-        assert_eq!(&rows[1..3], &[Row::SignIn, Row::RequestAccess]);
+        assert_eq!(&rows[1..3], &[Row::RequestAccess, Row::SignIn]);
         assert!(!rows.contains(&Row::Account));
         pro.cloud.email = Some("me@x.io".into());
         let rows = settings_rows(&pro);
