@@ -21,11 +21,39 @@ use super::app::{Dashboard, DashboardAction, DashboardView};
 // Onboarding
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// What the user picks at mode selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SetupChoice {
+    Private,
+    ScribaPro,
+    Cloud,
+}
+
+impl SetupChoice {
+    pub(super) fn title(self) -> &'static str {
+        match self {
+            SetupChoice::Private => "Private (Local)",
+            SetupChoice::ScribaPro => "Scriba Pro",
+            SetupChoice::Cloud => "Cloud",
+        }
+    }
+
+    pub(super) fn description(self) -> &'static str {
+        match self {
+            SetupChoice::Private => "Local speech + Ollama on your machine. No data leaves your computer.",
+            SetupChoice::ScribaPro => "Hosted speech + Claude through your Scriba account. No API keys.",
+            SetupChoice::Cloud => "OpenAI speech + Claude, GPT, Gemini or open-weight hosts. Needs an API key.",
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub(super) enum OnboardingStep {
     Entrance,
     Intro,
     ModeSelection,
+    /// Scriba Pro flow: sign in with the approved email and the emailed code.
+    ProSignIn,
     // Cloud flow
     WhisperApiKey,
     WhisperApiKeyValidation,
@@ -80,6 +108,8 @@ pub(super) enum OnboardingTickResult {
     FetchOllamaModels,
     /// Whisper API key validated — save transcription config.
     SaveWhisperKey(String),
+    /// The Scriba Pro sign-in flow produced an account event.
+    CloudEvent(crate::cloud::AccountEvent),
 }
 
 pub(super) const LOCAL_MODELS: &[(LocalModel, &str, &str)] = &[
@@ -160,6 +190,10 @@ pub(super) struct OnboardingState {
     pub(super) download_rx: Option<mpsc::UnboundedReceiver<DownloadProgress>>,
     pub(super) download_items: Vec<(String, DownloadStatus)>,
     pub(super) voice: Option<super::voice::VoiceEnrollment>,
+    /// Scriba Pro sign-in running at the ProSignIn step.
+    pub(super) pro: Option<super::cloud::CloudFlow>,
+    /// Whether "Scriba Pro" is offered at mode selection (project and proxy configured).
+    pub(super) pro_offered: bool,
     /// True when this is the "what's new" voice introduction for an existing
     /// user: no world setup, no step dots, Esc leaves instead of quitting.
     pub(super) upgrade_intro: bool,
@@ -214,6 +248,8 @@ impl OnboardingState {
             download_rx: None,
             download_items: Vec::new(),
             voice: None,
+            pro: None,
+            pro_offered: false,
             upgrade_intro: false,
         }
     }
@@ -236,6 +272,15 @@ impl OnboardingState {
             true,
         );
         ob
+    }
+
+    /// Choices at mode selection, in display order.
+    pub(super) fn mode_choices(&self) -> Vec<SetupChoice> {
+        if self.pro_offered {
+            vec![SetupChoice::Private, SetupChoice::ScribaPro, SetupChoice::Cloud]
+        } else {
+            vec![SetupChoice::Private, SetupChoice::Cloud]
+        }
     }
 
     pub(super) fn set_step_text(&mut self, text: &str, animated: bool) {
@@ -336,6 +381,13 @@ impl OnboardingState {
             OnboardingStep::VoiceEnrollment => {
                 if let Some(v) = &mut self.voice {
                     v.tick();
+                }
+            }
+            OnboardingStep::ProSignIn => {
+                if let Some(flow) = &mut self.pro
+                    && let Some(event) = flow.tick()
+                {
+                    return Some(OnboardingTickResult::CloudEvent(event));
                 }
             }
             OnboardingStep::ModelSetup => {
@@ -666,6 +718,13 @@ impl Dashboard {
 
         // Esc at any step → quit the application (or leave the what's-new intro)
         if matches!(key_code, KeyCode::Esc) {
+            if ob.step == OnboardingStep::ProSignIn {
+                ob.pro = None;
+                ob.step = OnboardingStep::ModeSelection;
+                ob.anim_frame = 0;
+                ob.set_step_text("Scriba uses AI to understand your recordings.\nHow do you want to run it?", false);
+                return Ok(DashboardAction::Continue);
+            }
             if ob.upgrade_intro {
                 self.onboarding = None;
                 self.current_view = DashboardView::Main;
@@ -690,15 +749,32 @@ impl Dashboard {
                 }
             }
             OnboardingStep::ModeSelection => {
+                let choices = ob.mode_choices();
                 match key_code {
                     KeyCode::Up | KeyCode::Char('k') => {
-                        ob.selected_mode = 0;
+                        ob.selected_mode = ob.selected_mode.saturating_sub(1);
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        ob.selected_mode = 1;
+                        ob.selected_mode = (ob.selected_mode + 1).min(choices.len() - 1);
                     }
                     KeyCode::Enter => {
-                        if ob.selected_mode == 0 {
+                        let choice = choices
+                            .get(ob.selected_mode)
+                            .copied()
+                            .unwrap_or(SetupChoice::Private);
+                        if choice == SetupChoice::ScribaPro {
+                            ob.pro = super::cloud::CloudFlow::new(
+                                super::cloud::Goal::SignIn,
+                                &self.config,
+                            );
+                            ob.step = OnboardingStep::ProSignIn;
+                            ob.anim_frame = 0;
+                            ob.set_step_text(
+                                "Scriba Pro runs speech and the assistant through your account.\n\
+                                 Sign in with the email that was approved for the beta.",
+                                false,
+                            );
+                        } else if choice == SetupChoice::Private {
                             // Private (Local) mode
                             self.config.enrichment.mode = EnrichmentMode::Local {
                                 ollama_endpoint: DEFAULT_OLLAMA_ENDPOINT.to_string(),
@@ -1312,6 +1388,16 @@ impl Dashboard {
                     }
                 }
             }
+            OnboardingStep::ProSignIn => {
+                if let Some(flow) = ob.pro.as_mut()
+                    && flow.handle_key(key_code) == super::cloud::CloudAction::Finished
+                {
+                    ob.pro = None;
+                    ob.step = OnboardingStep::ModeSelection;
+                    ob.anim_frame = 0;
+                    ob.set_step_text("Scriba uses AI to understand your recordings.\nHow do you want to run it?", false);
+                }
+            }
             OnboardingStep::VoiceEnrollment => {
                 let finished = match ob.voice.as_mut() {
                     Some(v) => v.handle_key(key_code, &self.config) == super::voice::VoiceAction::Finished,
@@ -1538,6 +1624,7 @@ impl Dashboard {
         let header_title = match ob.step {
             OnboardingStep::Entrance | OnboardingStep::Intro => "Welcome",
             OnboardingStep::ModeSelection => "Setup",
+            OnboardingStep::ProSignIn => "Setup \u{00B7} Scriba Pro",
             OnboardingStep::WhisperApiKey | OnboardingStep::WhisperApiKeyValidation => "Setup \u{00B7} Transcription",
             OnboardingStep::ProviderSelection => "Setup \u{00B7} Provider",
             OnboardingStep::EndpointEntry => "Setup \u{00B7} Endpoint",
@@ -1588,10 +1675,11 @@ impl Dashboard {
             let sel = ob.selected_mode;
             let sel_bg = Color::Indexed(236);
 
-            let mode_blocks: [(&str, &str); 2] = [
-                ("Private (Local)", "Local speech + Ollama on your machine. No data leaves your computer."),
-                ("Cloud", "OpenAI speech + Claude, GPT, Gemini or open-weight hosts. Needs an API key."),
-            ];
+            let mode_blocks: Vec<(&str, &str)> = ob
+                .mode_choices()
+                .into_iter()
+                .map(|c| (c.title(), c.description()))
+                .collect();
             // Use the header text width so the highlight box spans the full content area
             let header_width = visible.split('\n').map(|l| l.chars().count()).max().unwrap_or(0);
             let block_width = header_width.max(
@@ -1928,6 +2016,14 @@ impl Dashboard {
             if let Some(v) = &ob.voice {
                 lines.extend(v.render_lines(body.width as usize));
             }
+        } else if ob.step == OnboardingStep::ProSignIn {
+            for text_line in visible.split('\n') {
+                lines.push(Line::from(Span::styled(text_line, Style::default().fg(Color::White))));
+            }
+            lines.push(Line::from(""));
+            if let Some(flow) = &ob.pro {
+                lines.extend(flow.render_lines(body.width as usize));
+            }
         } else if ob.step == OnboardingStep::Confirmation {
             // Structured label/value layout
             for text_line in visible.split('\n') {
@@ -2067,6 +2163,7 @@ impl Dashboard {
         // Cloud:   Intro(0) → Mode(1) → WhisperKey(2) → Provider(3) → ApiKey(4) → Name(5) → Role(6) → Processing(7) → Confirm(8) → Done(9) = 10
         let is_cloud = matches!(ob.step,
             OnboardingStep::WhisperApiKey | OnboardingStep::ProviderSelection
+            | OnboardingStep::ProSignIn
             | OnboardingStep::EndpointEntry | OnboardingStep::ModelEntry
             | OnboardingStep::ApiKeyEntry | OnboardingStep::ApiKeyValidation
         ) || matches!(self.config.enrichment.mode, EnrichmentMode::Cloud { .. });
@@ -2075,6 +2172,7 @@ impl Dashboard {
             match ob.step {
                 OnboardingStep::Entrance | OnboardingStep::Intro => 0,
                 OnboardingStep::ModeSelection => 1,
+                OnboardingStep::ProSignIn => 2,
                 OnboardingStep::WhisperApiKey | OnboardingStep::WhisperApiKeyValidation => 2,
                 OnboardingStep::ProviderSelection | OnboardingStep::EndpointEntry | OnboardingStep::ModelEntry => 3,
                 OnboardingStep::ApiKeyEntry | OnboardingStep::ApiKeyValidation => 4,
@@ -2140,6 +2238,7 @@ impl Dashboard {
             OnboardingStep::Intro => "[Enter] Continue",
             OnboardingStep::ModeSelection | OnboardingStep::ProviderSelection
             | OnboardingStep::Confirmation => "[Up/Down] Select  [Enter] Confirm",
+            OnboardingStep::ProSignIn => "[Enter] Continue  [Esc] Back",
             OnboardingStep::WhisperApiKey => "[Enter] Validate",
             OnboardingStep::WhisperApiKeyValidation => {
                 if ob.whisper_validation_task.is_some() { "Validating..." }

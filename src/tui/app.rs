@@ -80,6 +80,9 @@ pub struct Dashboard {
     pub(super) key_probe_tx: mpsc::Sender<(Card, Result<(), String>)>,
     pub(super) key_probe_rx: mpsc::Receiver<(Card, Result<(), String>)>,
     pub(super) cloud_task: Option<tokio::task::JoinHandle<Result<crate::cloud::AccountEvent, crate::cloud::CloudError>>>, // Scriba Pro refresh / sign-out in flight
+    pub(super) cloud_session_task: Option<tokio::task::JoinHandle<Result<(), crate::cloud::CloudError>>>, // Access token refresh for the Pro proxy
+    pub(super) cloud_session_checked: Option<std::time::Instant>, // Last time the Pro session was checked
+    pub(super) cloud_usage: Option<crate::cloud::UsageSummary>, // This month's proxy usage, once fetched
     pub(super) return_to_view: Option<DashboardView>, // View to return to after message dismissal
     // File import dialog state
     pub(super) show_file_dialog: bool,
@@ -211,6 +214,9 @@ impl Dashboard {
             key_probe_tx,
             key_probe_rx,
             cloud_task: None,
+            cloud_session_task: None,
+            cloud_session_checked: None,
+            cloud_usage: None,
             return_to_view: None,
             // File import dialog state
             show_file_dialog: false,
@@ -284,6 +290,7 @@ impl Dashboard {
         // Load initial data
         self.load_recordings()?;
         self.load_stats()?;
+        crate::cloud::init(&self.config);
 
         // Spawn async update check (non-blocking, silent on failure)
         if self.config.check_for_updates {
@@ -313,7 +320,10 @@ impl Dashboard {
         // Check if onboarding is needed (no world.md exists)
         if !WorldContext::exists() {
             self.current_view = DashboardView::Onboarding;
-            self.onboarding = Some(OnboardingState::new());
+            let mut ob = OnboardingState::new();
+            ob.pro_offered = crate::cloud::is_configured(&self.config)
+                && crate::cloud::proxy_url(&self.config).is_some();
+            self.onboarding = Some(ob);
         } else {
             // Initialize chat context for global view
             self.load_entities().ok();
@@ -696,6 +706,13 @@ impl Dashboard {
                         OnboardingTickResult::SaveWhisperKey(key) => {
                             self.config.transcription = self.config.api_mode_with_key(key);
                             let _ = self.config.save();
+                        }
+                        OnboardingTickResult::CloudEvent(event) => {
+                            crate::cloud::apply_event(&mut self.config, &event);
+                            let _ = self.config.save();
+                            if matches!(event, crate::cloud::AccountEvent::SignedIn { .. }) {
+                                self.finish_pro_onboarding();
+                            }
                         }
                         OnboardingTickResult::FetchOllamaModels => {
                             let endpoint = self.config.enrichment.ollama_endpoint();

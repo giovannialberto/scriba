@@ -222,9 +222,19 @@ impl LlmTarget {
         }
     }
 
+    /// The credential to send right now. Behind the Scriba Pro proxy the
+    /// access token rotates hourly, so it is read from the session store at
+    /// call time rather than frozen when the target was built.
+    pub fn live_api_key(&self) -> Option<String> {
+        if crate::cloud::is_pro_url(&self.endpoint) {
+            return crate::cloud::access_token();
+        }
+        self.api_key.clone()
+    }
+
     fn service_target(&self) -> ServiceTarget {
-        let auth = match &self.api_key {
-            Some(key) => AuthData::from_single(key.clone()),
+        let auth = match self.live_api_key() {
+            Some(key) => AuthData::from_single(key),
             // Ollama ignores the credential but genai requires one.
             None => AuthData::from_single("ollama"),
         };
@@ -461,9 +471,21 @@ impl GenaiProvider {
     /// Build a provider for a resolved target.
     pub fn new(target: LlmTarget) -> Self {
         let service_target = target.service_target();
-        let client = Client::builder()
-            .with_web_config(WebConfig::default().with_timeout(REQUEST_TIMEOUT))
-            .build();
+        // Credentials travel in headers reqwest does not strip on redirect
+        // (x-api-key), so never follow one: providers do not redirect.
+        let http = reqwest13::Client::builder()
+            .redirect(reqwest13::redirect::Policy::none())
+            .timeout(REQUEST_TIMEOUT)
+            .gzip(true)
+            .tcp_nodelay(true)
+            .build()
+            .ok();
+        let mut builder = Client::builder();
+        builder = match http {
+            Some(http) => builder.with_reqwest(http),
+            None => builder.with_web_config(WebConfig::default().with_timeout(REQUEST_TIMEOUT)),
+        };
+        let client = builder.build();
         Self {
             target,
             service_target,
@@ -511,7 +533,12 @@ impl GenaiProvider {
 
     /// Fail fast with a helpful message instead of a bare 401 when no key is set.
     fn ensure_credentials(&self) -> Result<(), ProviderError> {
-        if self.target.protocol.requires_api_key() && self.target.api_key.is_none() {
+        if self.target.protocol.requires_api_key() && self.target.live_api_key().is_none() {
+            if crate::cloud::is_pro_url(&self.target.endpoint) {
+                return Err(ProviderError::AuthFailure {
+                    message: crate::cloud::SESSION_HINT.to_string(),
+                });
+            }
             let hint = match &self.target.api_key_env {
                 Some(env) => format!(" Add one in Settings or set {env}."),
                 None => String::new(),

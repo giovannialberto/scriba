@@ -17,8 +17,10 @@
 pub mod secrets;
 pub mod supabase;
 
+use std::sync::{Mutex, OnceLock};
+
 use crate::core::ScribaConfig;
-pub use supabase::{CloudError, Entitlement, Session, SupabaseClient};
+pub use supabase::{CloudError, Entitlement, Session, SupabaseClient, UsageSummary};
 
 /// Supabase project URL of Scriba Pro.
 pub const SUPABASE_URL: &str = "https://elnrpaedloeequmbdkgy.supabase.co";
@@ -27,6 +29,174 @@ pub const SUPABASE_ANON_KEY: &str = "sb_publishable_hDRJOngfn37hXEuf6fmbgg__UKeC
 
 /// The entitlement every beta member holds.
 pub const BETA_FEATURE: &str = "beta";
+/// The paid entitlement, once it exists.
+pub const PRO_FEATURE: &str = "pro";
+
+/// Model proxy of Scriba Pro: speech and assistant calls go through it with
+/// the account's session as the key.
+pub const PRO_PROXY_URL: &str = "https://scriba-proxy-872870393813.europe-west1.run.app";
+
+/// Seconds of validity left below which the access token is refreshed.
+const REFRESH_MARGIN_SECS: i64 = 120;
+
+/// Process-wide account state that model calls need synchronously: which
+/// proxy counts as "ours" and the current access token.
+#[derive(Debug, Default)]
+struct Store {
+    proxy_url: Option<String>,
+    access_token: Option<String>,
+    expires_at: i64,
+}
+
+fn store() -> &'static Mutex<Store> {
+    static STORE: OnceLock<Mutex<Store>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(Store::default()))
+}
+
+/// Record the proxy the client should trust. Called on startup and whenever
+/// the config changes; cheap, idempotent.
+pub fn init(config: &ScribaConfig) {
+    let url = proxy_url(config);
+    if let Ok(mut s) = store().lock() {
+        s.proxy_url = url;
+    }
+}
+
+fn remember_session(session: &Session) {
+    if let Ok(mut s) = store().lock() {
+        s.access_token = Some(session.access_token.clone());
+        s.expires_at = session.expires_at;
+    }
+}
+
+fn forget_session() {
+    if let Ok(mut s) = store().lock() {
+        s.access_token = None;
+        s.expires_at = 0;
+    }
+}
+
+/// The access token to present to the proxy, if the session is live.
+pub fn access_token() -> Option<String> {
+    let s = store().lock().ok()?;
+    let now = chrono::Utc::now().timestamp();
+    (s.expires_at > now)
+        .then(|| s.access_token.clone())
+        .flatten()
+}
+
+/// Whether the token will still be valid in a couple of minutes.
+fn token_is_fresh() -> bool {
+    store()
+        .lock()
+        .map(|s| {
+            s.access_token.is_some()
+                && s.expires_at - chrono::Utc::now().timestamp() > REFRESH_MARGIN_SECS
+        })
+        .unwrap_or(false)
+}
+
+/// Base URL of the Scriba Pro model proxy: environment, then config
+/// override, then the built-in constant. `None` when not configured or not
+/// served over TLS.
+pub fn proxy_url(config: &ScribaConfig) -> Option<String> {
+    let url = std::env::var("SCRIBA_PRO_PROXY_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| config.cloud.proxy_url.clone())
+        .unwrap_or_else(|| PRO_PROXY_URL.to_string());
+    let url = url.trim().trim_end_matches('/');
+    (!url.is_empty() && is_safe_endpoint(url)).then(|| url.to_string())
+}
+
+/// The proxy URL the process trusts right now (set by [`init`]), else what
+/// the environment or the binary say.
+fn known_proxy_url() -> Option<String> {
+    if let Ok(s) = store().lock()
+        && let Some(url) = &s.proxy_url
+    {
+        return Some(url.clone());
+    }
+    let url = std::env::var("SCRIBA_PRO_PROXY_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| PRO_PROXY_URL.to_string());
+    let url = url.trim().trim_end_matches('/');
+    (!url.is_empty() && is_safe_endpoint(url)).then(|| url.to_string())
+}
+
+/// Whether `url` points at the Scriba Pro proxy, meaning the session token
+/// is the credential to send.
+pub fn is_pro_url(url: &str) -> bool {
+    let Some(proxy) = known_proxy_url() else {
+        return false;
+    };
+    let url = url.trim().trim_end_matches('/');
+    url == proxy || url.starts_with(&format!("{proxy}/"))
+}
+
+/// Speech endpoint behind the proxy (OpenAI-compatible).
+pub fn pro_speech_url(config: &ScribaConfig) -> Option<String> {
+    proxy_url(config).map(|p| format!("{p}/openai/v1"))
+}
+
+/// Assistant endpoint behind the proxy (Anthropic Messages API).
+pub fn pro_assistant_url(config: &ScribaConfig) -> Option<String> {
+    proxy_url(config).map(|p| format!("{p}/anthropic/v1"))
+}
+
+/// Whether the config sends speech or assistant calls through the proxy.
+pub fn uses_pro(config: &ScribaConfig) -> bool {
+    init(config);
+    is_pro_url(&config.transcription_base_url())
+        || config
+            .enrichment
+            .effective_base_url()
+            .map(|u| is_pro_url(&u))
+            .unwrap_or(false)
+}
+
+/// Whether this account may use the proxy: signed in, entitled, and the
+/// proxy is configured in this build.
+pub fn pro_available(config: &ScribaConfig) -> bool {
+    config.cloud.is_signed_in()
+        && (config.cloud.has(BETA_FEATURE) || config.cloud.has(PRO_FEATURE))
+        && proxy_url(config).is_some()
+}
+
+/// Make sure a live access token is in the store when the config uses the
+/// proxy. Cheap when the token is fresh. Errors are the caller's to report;
+/// a missing token then surfaces as a clear message at the model call.
+pub async fn ensure_session(config: &ScribaConfig) -> Result<(), CloudError> {
+    if !uses_pro(config) || token_is_fresh() {
+        return Ok(());
+    }
+    let Some(client) = client_for(config) else {
+        return Err(CloudError::Other(
+            "Scriba Pro is not configured in this build".into(),
+        ));
+    };
+    // Another caller may have refreshed while this one waited for the lock.
+    {
+        let _guard = refresh_lock().lock().await;
+        if token_is_fresh() {
+            return Ok(());
+        }
+    }
+    match resume_session(&client).await {
+        Ok(_) => Ok(()),
+        Err(CloudError::SessionExpired) => {
+            let _ = secrets::delete(&secrets::session_key(client.url()));
+            forget_session();
+            Err(CloudError::SessionExpired)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// What to tell the user when a Pro call has no token.
+pub const SESSION_HINT: &str =
+    "Scriba Pro session expired. Open Settings \u{2192} Scriba Pro \u{2192} Sign in.";
 
 /// Resolve the project the client should talk to: environment, then config
 /// overrides, then the built-in constants. `None` when nothing is configured.
@@ -136,8 +306,12 @@ pub enum AccountEvent {
         user_id: String,
         entitlements: Vec<String>,
     },
-    /// Entitlements refreshed for the signed-in account.
-    Refreshed { entitlements: Vec<String> },
+    /// Entitlements refreshed for the signed-in account, with this month's
+    /// usage when the server could report it.
+    Refreshed {
+        entitlements: Vec<String>,
+        usage: Option<UsageSummary>,
+    },
     /// The stored session no longer works; the account was forgotten locally.
     SessionLost,
     /// Signed out and forgotten locally.
@@ -162,7 +336,7 @@ pub fn apply_event(config: &mut ScribaConfig, event: &AccountEvent) {
             config.cloud.entitlements = entitlements.clone();
             config.cloud.entitlements_checked_at = Some(now);
         }
-        AccountEvent::Refreshed { entitlements } => {
+        AccountEvent::Refreshed { entitlements, .. } => {
             config.cloud.entitlements = entitlements.clone();
             config.cloud.entitlements_checked_at = Some(now);
         }
@@ -207,6 +381,7 @@ pub async fn verify_code(
     let session = client.verify_code(&email, code.trim()).await?;
     secrets::store(&secrets::session_key(client.url()), &session.refresh_token)
         .map_err(|e| CloudError::Other(format!("could not store the session: {e:#}")))?;
+    remember_session(&session);
     let entitlements = client
         .entitlements(&session.access_token)
         .await
@@ -222,8 +397,16 @@ pub async fn verify_code(
     })
 }
 
+/// Refreshes rotate the stored token, so two at once would invalidate each
+/// other's result. One at a time, process-wide.
+fn refresh_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 /// Get a live session from the stored refresh token, rotating it.
 pub async fn resume_session(client: &SupabaseClient) -> Result<Session, CloudError> {
+    let _guard = refresh_lock().lock().await;
     let key = secrets::session_key(client.url());
     let token = secrets::load(&key)
         .map_err(|e| CloudError::Other(format!("could not read the session: {e:#}")))?
@@ -231,6 +414,7 @@ pub async fn resume_session(client: &SupabaseClient) -> Result<Session, CloudErr
     let session = client.refresh(&token).await?;
     secrets::store(&key, &session.refresh_token)
         .map_err(|e| CloudError::Other(format!("could not store the session: {e:#}")))?;
+    remember_session(&session);
     Ok(session)
 }
 
@@ -241,12 +425,18 @@ pub async fn refresh_entitlements(client: &SupabaseClient) -> Result<AccountEven
     match resume_session(client).await {
         Ok(session) => {
             let entitlements = client.entitlements(&session.access_token).await?;
+            let usage = client
+                .usage_this_month(&session.access_token, &session.user_id)
+                .await
+                .ok();
             Ok(AccountEvent::Refreshed {
                 entitlements: features(entitlements),
+                usage,
             })
         }
         Err(CloudError::SessionExpired) => {
             let _ = secrets::delete(&secrets::session_key(client.url()));
+            forget_session();
             Ok(AccountEvent::SessionLost)
         }
         Err(e) => Err(e),
@@ -260,6 +450,7 @@ pub async fn sign_out(client: &SupabaseClient) -> Result<AccountEvent, CloudErro
     }
     secrets::delete(&secrets::session_key(client.url()))
         .map_err(|e| CloudError::Other(format!("could not forget the session: {e:#}")))?;
+    forget_session();
     Ok(AccountEvent::SignedOut)
 }
 
@@ -310,6 +501,7 @@ mod tests {
             &mut config,
             &AccountEvent::Refreshed {
                 entitlements: vec![],
+                usage: None,
             },
         );
         assert!(!config.cloud.has(BETA_FEATURE));
@@ -336,6 +528,29 @@ mod tests {
             client_for(&config).is_none(),
             "plain http override is ignored"
         );
+    }
+
+    #[test]
+    fn pro_urls_are_recognized_from_the_configured_proxy() {
+        let mut config = ScribaConfig::default();
+        config.cloud.proxy_url = Some("https://proxy.example.com/".into());
+        init(&config);
+        assert_eq!(
+            pro_speech_url(&config).as_deref(),
+            Some("https://proxy.example.com/openai/v1")
+        );
+        assert!(is_pro_url("https://proxy.example.com/openai/v1"));
+        assert!(is_pro_url("https://proxy.example.com/anthropic/v1/"));
+        assert!(!is_pro_url("https://proxy.example.com.evil.com/openai/v1"));
+        assert!(!is_pro_url("https://api.openai.com/v1"));
+        assert!(!pro_available(&config), "signed out");
+        config.cloud.email = Some("a@b.co".into());
+        config.cloud.entitlements = vec!["beta".into()];
+        assert!(pro_available(&config));
+        assert!(access_token().is_none(), "no session in tests");
+        // Reset so other tests do not see this proxy.
+        config.cloud.proxy_url = None;
+        init(&config);
     }
 
     #[test]
