@@ -51,7 +51,7 @@ src/
     onboarding.rs      First-run setup flow
     settings.rs        Settings UI
     voice.rs           Voice enrollment component (record 12 s, embed, store) shared by onboarding and Settings
-    cloud.rs           Scriba Pro account flow (request access / sign in / sign out) inline under the Settings Account row
+    cloud.rs           Scriba Pro sign-in and access-request flows (linear, Enter/Esc, inline errors) under their Settings rows; account actions use the standard picker
     transcript.rs      Transcript viewer
     recording.rs       Recording UI
   mcp/                 Model Context Protocol server for Claude Desktop

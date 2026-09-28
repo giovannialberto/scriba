@@ -79,7 +79,7 @@ pub struct Dashboard {
     pub(super) assistant_key_status: Option<KeyStatus>, // Result of probing the assistant key
     pub(super) key_probe_tx: mpsc::Sender<(Card, Result<(), String>)>,
     pub(super) key_probe_rx: mpsc::Receiver<(Card, Result<(), String>)>,
-    pub(super) cloud_refresh: Option<tokio::task::JoinHandle<Result<crate::cloud::AccountEvent, crate::cloud::CloudError>>>, // Entitlement refresh started when Settings opens
+    pub(super) cloud_task: Option<tokio::task::JoinHandle<Result<crate::cloud::AccountEvent, crate::cloud::CloudError>>>, // Scriba Pro refresh / sign-out in flight
     pub(super) return_to_view: Option<DashboardView>, // View to return to after message dismissal
     // File import dialog state
     pub(super) show_file_dialog: bool,
@@ -210,7 +210,7 @@ impl Dashboard {
             assistant_key_status: None,
             key_probe_tx,
             key_probe_rx,
-            cloud_refresh: None,
+            cloud_task: None,
             return_to_view: None,
             // File import dialog state
             show_file_dialog: false,
