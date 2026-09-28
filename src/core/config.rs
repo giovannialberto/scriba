@@ -252,7 +252,7 @@ pub struct ScribaConfig {
     #[serde(default = "default_true")]
     pub check_for_updates: bool,
     /// Scriba Pro account (closed beta). The session token itself lives in
-    /// the OS keychain, never here.
+    /// `~/scriba_recordings/.secrets/`, never here.
     #[serde(default)]
     pub cloud: CloudConfig,
 }

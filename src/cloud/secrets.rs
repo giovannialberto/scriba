@@ -1,11 +1,8 @@
-//! Where account secrets live.
-//!
-//! macOS: the login Keychain, through the `keyring` crate, under the
-//! service name "scriba". Everything else: a file with mode 0600 under
-//! `~/scriba_recordings/.secrets/`, which is no worse than where API keys
-//! already sit in `config.json`. If the Keychain is unavailable (headless
-//! session, locked keychain) the file backend is used as a fallback so
-//! sign-in never fails because of secret storage.
+//! Where account secrets live: a file readable only by the user under
+//! `~/scriba_recordings/.secrets/`, next to the config that already holds
+//! API keys. No OS keychain on purpose: on macOS the keychain ties access to
+//! the binary's signing identity, so every rebuild of an unsigned dev binary
+//! brings up a password prompt.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,9 +12,6 @@ use anyhow::{Context, Result};
 /// The Supabase refresh token of the signed-in Scriba Pro account.
 pub const SESSION_TOKEN: &str = "cloud-session";
 
-#[cfg(target_os = "macos")]
-const KEYCHAIN_SERVICE: &str = "scriba";
-
 fn secrets_dir() -> Result<PathBuf> {
     let home = dirs::home_dir().context("Failed to get home directory")?;
     Ok(home.join("scriba_recordings").join(".secrets"))
@@ -25,42 +19,16 @@ fn secrets_dir() -> Result<PathBuf> {
 
 /// Store `value` under `name`, replacing any previous value.
 pub fn store(name: &str, value: &str) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(entry) = keyring::Entry::new(KEYCHAIN_SERVICE, name)
-            && entry.set_password(value).is_ok()
-        {
-            // A stale file copy must not shadow the keychain later.
-            let _ = file_delete(&secrets_dir()?, name);
-            return Ok(());
-        }
-    }
     file_store(&secrets_dir()?, name, value)
 }
 
 /// Read the value stored under `name`, if any.
 pub fn load(name: &str) -> Result<Option<String>> {
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(entry) = keyring::Entry::new(KEYCHAIN_SERVICE, name) {
-            match entry.get_password() {
-                Ok(value) => return Ok(Some(value)),
-                Err(keyring::Error::NoEntry) => {}
-                Err(_) => {} // locked or unavailable: try the file
-            }
-        }
-    }
     file_load(&secrets_dir()?, name)
 }
 
-/// Remove `name` from every backend. Missing entries are not an error.
+/// Remove `name`. Missing entries are not an error.
 pub fn delete(name: &str) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(entry) = keyring::Entry::new(KEYCHAIN_SERVICE, name) {
-            let _ = entry.delete_credential();
-        }
-    }
     file_delete(&secrets_dir()?, name)
 }
 

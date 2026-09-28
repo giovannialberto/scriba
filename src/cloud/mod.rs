@@ -2,7 +2,7 @@
 //!
 //! The open source client stays complete on its own; this module only adds
 //! an account. Signing in is by email one-time code against a Supabase
-//! project, the refresh token lives in the OS keychain (see [`secrets`]), and
+//! project, the refresh token lives in a user-only file (see [`secrets`]), and
 //! features are unlocked by entitlements the server grants, never by the
 //! mere existence of an account. Nothing here is required for recording,
 //! transcription, or the assistant to work.
