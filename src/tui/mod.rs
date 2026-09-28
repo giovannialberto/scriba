@@ -10,6 +10,7 @@
 mod app;
 mod browse;
 pub mod chat;
+mod cloud;
 mod entities;
 mod onboarding;
 mod recording;

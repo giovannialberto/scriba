@@ -8,6 +8,7 @@
 //! - MCP server for AI assistant integration
 
 pub mod agent;
+pub mod cloud;
 pub mod core;
 pub mod database;
 pub mod enrichment;
