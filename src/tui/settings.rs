@@ -58,6 +58,8 @@ pub(super) enum Row {
     Timeout,
     MeetingWatch,
     CheckUpdates,
+    /// Scriba Pro account (closed beta).
+    Account,
 }
 
 impl Row {
@@ -75,6 +77,7 @@ impl Row {
             Row::Timeout => "Timeout",
             Row::MeetingWatch => "Meeting watch",
             Row::CheckUpdates => "Check updates",
+            Row::Account => "Account",
         }
     }
 
@@ -95,6 +98,7 @@ impl Row {
             | Row::AssistantKey => Some("ASSISTANT"),
             Row::AutoStop | Row::Timeout | Row::MeetingWatch => Some("RECORDING"),
             Row::CheckUpdates => Some("GENERAL"),
+            Row::Account => Some("SCRIBA PRO"),
         }
     }
 }
@@ -126,6 +130,7 @@ fn settings_rows(config: &ScribaConfig) -> Vec<Row> {
         Row::Timeout,
         Row::MeetingWatch,
         Row::CheckUpdates,
+        Row::Account,
     ]);
     rows
 }
@@ -375,6 +380,8 @@ pub(super) enum SettingsEdit {
     },
     /// Owner voice enrollment running inline under the Voice row.
     Voice(super::voice::VoiceEnrollment),
+    /// Scriba Pro account flow running inline under the Account row.
+    Cloud(super::cloud::CloudFlow),
     /// List picker opened from `row`.
     Picker {
         row: Row,
@@ -453,6 +460,7 @@ impl Dashboard {
         if self.assistant_key_status.is_none() {
             self.probe_key(Card::Assistant);
         }
+        self.refresh_cloud_account();
     }
 
     fn settings_error(&mut self, what: &str, err: impl std::fmt::Display) {
@@ -496,6 +504,13 @@ impl Dashboard {
             return Ok(DashboardAction::Continue);
         }
 
+        if let SettingsEdit::Cloud(flow) = &mut self.settings_edit {
+            if flow.handle_key(key_code) == super::cloud::CloudAction::Finished {
+                self.settings_edit = SettingsEdit::None;
+            }
+            return Ok(DashboardAction::Continue);
+        }
+
         match key_code {
             KeyCode::Esc => {
                 if self.is_editing_settings_field() {
@@ -507,7 +522,7 @@ impl Dashboard {
             }
             KeyCode::Up => match &mut self.settings_edit {
                 SettingsEdit::Picker { selection, .. } => *selection = selection.saturating_sub(1),
-                SettingsEdit::Text { .. } | SettingsEdit::Voice(_) => {}
+                SettingsEdit::Text { .. } | SettingsEdit::Voice(_) | SettingsEdit::Cloud(_) => {}
                 SettingsEdit::None => {
                     self.settings_selection = self.settings_selection.saturating_sub(1);
                 }
@@ -524,7 +539,7 @@ impl Dashboard {
                         *selection = (*selection + 1).min(visible - 1);
                     }
                 }
-                SettingsEdit::Text { .. } | SettingsEdit::Voice(_) => {}
+                SettingsEdit::Text { .. } | SettingsEdit::Voice(_) | SettingsEdit::Cloud(_) => {}
                 SettingsEdit::None => {
                     self.settings_selection = (self.settings_selection + 1).min(rows.len() - 1);
                 }
@@ -532,6 +547,7 @@ impl Dashboard {
             KeyCode::Enter => {
                 match std::mem::replace(&mut self.settings_edit, SettingsEdit::None) {
                     SettingsEdit::Voice(v) => self.settings_edit = SettingsEdit::Voice(v),
+                    SettingsEdit::Cloud(c) => self.settings_edit = SettingsEdit::Cloud(c),
                     SettingsEdit::Text { row, buffer, .. } => self.commit_text(row, buffer),
                     SettingsEdit::Picker {
                         row,
@@ -577,7 +593,7 @@ impl Dashboard {
                     filter.push(c);
                     *selection = 0;
                 }
-                SettingsEdit::Voice(_) => {}
+                SettingsEdit::Voice(_) | SettingsEdit::Cloud(_) => {}
                 SettingsEdit::None => {}
             },
             KeyCode::Backspace => match &mut self.settings_edit {
@@ -590,7 +606,7 @@ impl Dashboard {
                     filter.pop();
                     *selection = 0;
                 }
-                SettingsEdit::Voice(_) => {}
+                SettingsEdit::Voice(_) | SettingsEdit::Cloud(_) => {}
                 SettingsEdit::None => {}
             },
             _ => {}
@@ -809,7 +825,49 @@ impl Dashboard {
                 self.config.check_for_updates = !self.config.check_for_updates;
                 self.save_settings("setting");
             }
+            Row::Account => {
+                self.settings_edit = SettingsEdit::Cloud(super::cloud::CloudFlow::new(&self.config));
+            }
         }
+    }
+
+    /// Collect finished account work (inline flow or the background refresh
+    /// started when Settings opened) and persist what it changed.
+    pub(super) fn tick_cloud(&mut self) {
+        let mut events = Vec::new();
+        if let SettingsEdit::Cloud(flow) = &mut self.settings_edit
+            && let Some(event) = flow.tick()
+        {
+            events.push(event);
+        }
+        if let Some(task) = &self.cloud_refresh
+            && task.is_finished()
+        {
+            let task = self.cloud_refresh.take().unwrap();
+            if let Some(Ok(Ok(event))) = futures_util::FutureExt::now_or_never(task) {
+                events.push(event);
+            }
+        }
+        for event in events {
+            crate::cloud::apply_event(&mut self.config, &event);
+            self.save_settings("account");
+            if let SettingsEdit::Cloud(flow) = &mut self.settings_edit {
+                flow.sync(&self.config);
+            }
+        }
+    }
+
+    /// Refresh entitlements in the background when an account is signed in.
+    fn refresh_cloud_account(&mut self) {
+        if self.cloud_refresh.is_some() || !self.config.cloud.is_signed_in() {
+            return;
+        }
+        let Some(client) = crate::cloud::client_for(&self.config) else {
+            return;
+        };
+        self.cloud_refresh = Some(tokio::spawn(async move {
+            crate::cloud::refresh_entitlements(&client).await
+        }));
     }
 
     /// Detail shown in the provider picker: whether a key is already saved for that host.
@@ -1514,6 +1572,14 @@ impl Dashboard {
                         lines.push(Line::from(spans));
                     }
                 }
+                SettingsEdit::Cloud(c) if row == Row::Account => {
+                    let indent = " ".repeat(2 + LABEL_WIDTH);
+                    for line in c.render_lines(width.saturating_sub(2 + LABEL_WIDTH)) {
+                        let mut spans = line.spans;
+                        spans.insert(0, Span::raw(indent.clone()));
+                        lines.push(Line::from(spans));
+                    }
+                }
                 SettingsEdit::Picker {
                     row: r,
                     title,
@@ -1630,6 +1696,7 @@ impl Dashboard {
                 ("Esc", "Back"),
             ],
             SettingsEdit::Voice(_) => &[("Enter", "Record / Continue"), ("S", "Skip"), ("Esc", "Cancel")],
+            SettingsEdit::Cloud(_) => &[("type", "Fill in"), ("Enter", "Continue"), ("Esc", "Back / Close")],
             SettingsEdit::Text { .. } => &[("Enter", "Save"), ("Esc", "Cancel")],
             SettingsEdit::Picker { .. } => &[
                 ("\u{2191}\u{2193}", "Select"),
@@ -1916,6 +1983,43 @@ impl Dashboard {
                 "\u{2190} Enter to toggle",
                 false,
             ),
+            Row::Account => match crate::cloud::status(config) {
+                crate::cloud::AccountStatus::Unavailable => (
+                    "Not available".to_string(),
+                    "this build has no Scriba Pro project configured".to_string(),
+                    DetailTone::Neutral,
+                    "\u{2190} Enter for details",
+                    false,
+                ),
+                crate::cloud::AccountStatus::SignedOut { requested_at } => (
+                    "Not signed in".to_string(),
+                    match requested_at {
+                        Some(_) => "beta access requested \u{00B7} sign in once approved".to_string(),
+                        None => "closed beta \u{00B7} request access or sign in".to_string(),
+                    },
+                    DetailTone::Neutral,
+                    "\u{2190} Enter to open",
+                    false,
+                ),
+                crate::cloud::AccountStatus::SignedIn { email, entitlements } => {
+                    let (detail, tone) = if entitlements.is_empty() {
+                        (
+                            "signed in \u{00B7} nothing unlocked yet".to_string(),
+                            DetailTone::Neutral,
+                        )
+                    } else {
+                        (
+                            entitlements
+                                .iter()
+                                .map(|f| super::cloud::feature_label(f))
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                            DetailTone::Good,
+                        )
+                    };
+                    (email, detail, tone, "\u{2190} Enter to manage", false)
+                }
+            },
         }
     }
 }
@@ -2079,7 +2183,8 @@ mod tests {
         assert_eq!(assistant_provider(&custom), AssistantProvider::Custom);
         assert_eq!(setup_badge(&custom).1, "Cloud");
         assert_eq!(rows[0], Row::Setup);
-        assert_eq!(*rows.last().unwrap(), Row::CheckUpdates);
+        assert_eq!(*rows.last().unwrap(), Row::Account);
+        assert!(rows.contains(&Row::CheckUpdates));
     }
 
     #[test]
@@ -2133,6 +2238,7 @@ mod tests {
             Row::Timeout,
             Row::MeetingWatch,
             Row::CheckUpdates,
+            Row::Account,
         ];
         for row in all {
             assert!(row.label().chars().count() < LABEL_WIDTH, "{:?}", row);

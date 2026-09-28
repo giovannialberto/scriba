@@ -79,6 +79,7 @@ pub struct Dashboard {
     pub(super) assistant_key_status: Option<KeyStatus>, // Result of probing the assistant key
     pub(super) key_probe_tx: mpsc::Sender<(Card, Result<(), String>)>,
     pub(super) key_probe_rx: mpsc::Receiver<(Card, Result<(), String>)>,
+    pub(super) cloud_refresh: Option<tokio::task::JoinHandle<Result<crate::cloud::AccountEvent, crate::cloud::CloudError>>>, // Entitlement refresh started when Settings opens
     pub(super) return_to_view: Option<DashboardView>, // View to return to after message dismissal
     // File import dialog state
     pub(super) show_file_dialog: bool,
@@ -209,6 +210,7 @@ impl Dashboard {
             assistant_key_status: None,
             key_probe_tx,
             key_probe_rx,
+            cloud_refresh: None,
             return_to_view: None,
             // File import dialog state
             show_file_dialog: false,
@@ -570,6 +572,9 @@ impl Dashboard {
             if let SettingsEdit::Voice(v) = &mut self.settings_edit {
                 v.tick();
             }
+
+            // Scriba Pro account work (inline flow or background refresh)
+            self.tick_cloud();
 
             // Handle chat-triggered recording
             if self.pending_record_from_chat {

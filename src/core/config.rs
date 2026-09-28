@@ -251,10 +251,63 @@ pub struct ScribaConfig {
     /// Check for updates on launch (default: true).
     #[serde(default = "default_true")]
     pub check_for_updates: bool,
+    /// Scriba Pro account (closed beta). The session token itself lives in
+    /// the OS keychain, never here.
+    #[serde(default)]
+    pub cloud: CloudConfig,
 }
 
 fn default_true() -> bool {
     true
+}
+
+/// Scriba Pro account state. Everything here is non-secret bookkeeping: who
+/// is signed in, what they are entitled to, and whether they asked to join
+/// the beta. The refresh token is stored by `crate::cloud::secrets`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct CloudConfig {
+    /// Email of the signed-in account, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    /// Supabase user id of the signed-in account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    /// When the user asked to join the beta (RFC 3339), if they did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub beta_requested_at: Option<String>,
+    /// Features the account is entitled to ("beta", later "pro"), as last
+    /// fetched from the server. Cached so the UI has something to show offline.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entitlements: Vec<String>,
+    /// When `entitlements` was last refreshed (RFC 3339).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entitlements_checked_at: Option<String>,
+    /// Override the Supabase project URL baked into the binary (development).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supabase_url: Option<String>,
+    /// Override the Supabase anon key baked into the binary (development).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supabase_anon_key: Option<String>,
+}
+
+impl CloudConfig {
+    /// Whether an account is signed in (a session may still have expired).
+    pub fn is_signed_in(&self) -> bool {
+        self.email.is_some()
+    }
+
+    /// Whether the account holds `feature` ("beta", "pro").
+    pub fn has(&self, feature: &str) -> bool {
+        self.entitlements.iter().any(|f| f == feature)
+    }
+
+    /// Forget the account but keep the beta request and endpoint overrides.
+    pub fn clear_session(&mut self) {
+        self.email = None;
+        self.user_id = None;
+        self.entitlements.clear();
+        self.entitlements_checked_at = None;
+    }
 }
 
 /// Configuration for voice-activated recording ("Scriba Forever" mode).
@@ -1075,6 +1128,7 @@ impl Default for ScribaConfig {
             stt_models: HashMap::new(),
             stt_custom_base_url: None,
             check_for_updates: true,
+            cloud: CloudConfig::default(),
         }
     }
 }
