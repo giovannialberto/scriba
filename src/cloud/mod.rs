@@ -33,8 +33,8 @@ pub const BETA_FEATURE: &str = "beta";
 pub const PRO_FEATURE: &str = "pro";
 
 /// Model proxy of Scriba Pro: speech and assistant calls go through it with
-/// the account's session as the key. Empty until the service is deployed.
-pub const PRO_PROXY_URL: &str = "";
+/// the account's session as the key.
+pub const PRO_PROXY_URL: &str = "https://scriba-proxy-872870393813.europe-west1.run.app";
 
 /// Seconds of validity left below which the access token is refreshed.
 const REFRESH_MARGIN_SECS: i64 = 120;
