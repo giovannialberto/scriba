@@ -20,7 +20,7 @@ pub mod supabase;
 use std::sync::{Mutex, OnceLock};
 
 use crate::core::ScribaConfig;
-pub use supabase::{CloudError, Entitlement, Session, SupabaseClient};
+pub use supabase::{CloudError, Entitlement, Session, SupabaseClient, UsageSummary};
 
 /// Supabase project URL of Scriba Pro.
 pub const SUPABASE_URL: &str = "https://elnrpaedloeequmbdkgy.supabase.co";
@@ -299,8 +299,12 @@ pub enum AccountEvent {
         user_id: String,
         entitlements: Vec<String>,
     },
-    /// Entitlements refreshed for the signed-in account.
-    Refreshed { entitlements: Vec<String> },
+    /// Entitlements refreshed for the signed-in account, with this month's
+    /// usage when the server could report it.
+    Refreshed {
+        entitlements: Vec<String>,
+        usage: Option<UsageSummary>,
+    },
     /// The stored session no longer works; the account was forgotten locally.
     SessionLost,
     /// Signed out and forgotten locally.
@@ -325,7 +329,7 @@ pub fn apply_event(config: &mut ScribaConfig, event: &AccountEvent) {
             config.cloud.entitlements = entitlements.clone();
             config.cloud.entitlements_checked_at = Some(now);
         }
-        AccountEvent::Refreshed { entitlements } => {
+        AccountEvent::Refreshed { entitlements, .. } => {
             config.cloud.entitlements = entitlements.clone();
             config.cloud.entitlements_checked_at = Some(now);
         }
@@ -406,8 +410,13 @@ pub async fn refresh_entitlements(client: &SupabaseClient) -> Result<AccountEven
     match resume_session(client).await {
         Ok(session) => {
             let entitlements = client.entitlements(&session.access_token).await?;
+            let usage = client
+                .usage_this_month(&session.access_token, &session.user_id)
+                .await
+                .ok();
             Ok(AccountEvent::Refreshed {
                 entitlements: features(entitlements),
+                usage,
             })
         }
         Err(CloudError::SessionExpired) => {
@@ -477,6 +486,7 @@ mod tests {
             &mut config,
             &AccountEvent::Refreshed {
                 entitlements: vec![],
+                usage: None,
             },
         );
         assert!(!config.cloud.has(BETA_FEATURE));

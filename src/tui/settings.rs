@@ -65,6 +65,8 @@ pub(super) enum Row {
     /// Scriba Pro: the signed-in account, or "not available" in builds
     /// without a project.
     Account,
+    /// Scriba Pro: this month's proxy usage (signed in, once known).
+    Usage,
 }
 
 impl Row {
@@ -85,6 +87,7 @@ impl Row {
             Row::SignIn => "Sign in",
             Row::RequestAccess => "Beta access",
             Row::Account => "Account",
+            Row::Usage => "Usage",
         }
     }
 
@@ -105,7 +108,7 @@ impl Row {
             | Row::AssistantKey => Some("ASSISTANT"),
             Row::AutoStop | Row::Timeout | Row::MeetingWatch => Some("RECORDING"),
             Row::CheckUpdates => Some("GENERAL"),
-            Row::SignIn | Row::RequestAccess | Row::Account => Some("SCRIBA PRO"),
+            Row::SignIn | Row::RequestAccess | Row::Account | Row::Usage => Some("SCRIBA PRO"),
         }
     }
 }
@@ -118,14 +121,25 @@ pub(super) enum Card {
 }
 
 /// Rows for the current configuration, in display order.
+#[cfg(test)]
 fn settings_rows(config: &ScribaConfig) -> Vec<Row> {
+    settings_rows_with(config, false)
+}
+
+/// Rows for the current configuration; `usage_known` adds the Usage row.
+fn settings_rows_with(config: &ScribaConfig, usage_known: bool) -> Vec<Row> {
     let mut rows = vec![Row::Setup];
     match crate::cloud::status(config) {
         crate::cloud::AccountStatus::SignedOut { .. } => {
             rows.extend([Row::RequestAccess, Row::SignIn])
         }
-        crate::cloud::AccountStatus::SignedIn { .. }
-        | crate::cloud::AccountStatus::Unavailable => rows.push(Row::Account),
+        crate::cloud::AccountStatus::SignedIn { .. } => {
+            rows.push(Row::Account);
+            if usage_known {
+                rows.push(Row::Usage);
+            }
+        }
+        crate::cloud::AccountStatus::Unavailable => rows.push(Row::Account),
     }
     rows.extend([Row::SpeechProvider, Row::SpeechModel]);
     match speech_provider(config) {
@@ -465,6 +479,32 @@ fn fit(text: &str, max: usize) -> String {
     out
 }
 
+/// 1234 -> "1.2k", 5_400_000 -> "5.4M".
+fn compact_count(n: i64) -> String {
+    let n = n.max(0) as f64;
+    if n >= 1_000_000.0 {
+        format!("{:.1}M", n / 1_000_000.0)
+    } else if n >= 1_000.0 {
+        format!("{:.1}k", n / 1_000.0)
+    } else {
+        format!("{}", n as i64)
+    }
+}
+
+/// First day of next month (UTC), as "Oct 1".
+fn next_month_start() -> String {
+    use chrono::Datelike;
+    let now = chrono::Utc::now();
+    let (y, m) = if now.month() == 12 {
+        (now.year() + 1, 1)
+    } else {
+        (now.year(), now.month() + 1)
+    };
+    chrono::NaiveDate::from_ymd_opt(y, m, 1)
+        .map(|d| d.format("%b %-d").to_string())
+        .unwrap_or_default()
+}
+
 /// Mask a secret: bullets plus the last four characters.
 fn mask_secret(secret: &str) -> String {
     let count = secret.chars().count();
@@ -525,7 +565,7 @@ impl Dashboard {
     }
 
     fn clamp_settings_selection(&mut self) {
-        let max = settings_rows(&self.config).len().saturating_sub(1);
+        let max = settings_rows_with(&self.config, self.cloud_usage.is_some()).len().saturating_sub(1);
         if self.settings_selection > max {
             self.settings_selection = max;
         }
@@ -537,7 +577,7 @@ impl Dashboard {
         &mut self,
         key_code: KeyCode,
     ) -> Result<DashboardAction> {
-        let rows = settings_rows(&self.config);
+        let rows = settings_rows_with(&self.config, self.cloud_usage.is_some());
 
         if matches!(self.settings_edit, SettingsEdit::Voice(_)) {
             let finished = if key_code == KeyCode::Esc {
@@ -906,6 +946,7 @@ impl Dashboard {
                     self.settings_edit = SettingsEdit::Cloud(flow);
                 }
             }
+            Row::Usage => {}
             Row::Account => {
                 if self.config.cloud.is_signed_in() {
                     let items = vec![
@@ -953,6 +994,15 @@ impl Dashboard {
             }
         }
         for event in events {
+            match &event {
+                crate::cloud::AccountEvent::Refreshed { usage: Some(u), .. } => {
+                    self.cloud_usage = Some(u.clone());
+                }
+                crate::cloud::AccountEvent::SessionLost | crate::cloud::AccountEvent::SignedOut => {
+                    self.cloud_usage = None;
+                }
+                _ => {}
+            }
             crate::cloud::apply_event(&mut self.config, &event);
             self.save_settings("account");
         }
@@ -1363,7 +1413,7 @@ impl Dashboard {
         self.probe_key(Card::Assistant);
         if open_models {
             // Put the cursor on the row the picker belongs to.
-            if let Some(idx) = settings_rows(&self.config)
+            if let Some(idx) = settings_rows_with(&self.config, self.cloud_usage.is_some())
                 .iter()
                 .position(|r| *r == Row::AssistantModel)
             {
@@ -1689,7 +1739,7 @@ impl Dashboard {
         let bad_style = Style::default().fg(Color::Red);
 
         let width = chunks[1].width as usize;
-        let rows = settings_rows(&self.config);
+        let rows = settings_rows_with(&self.config, self.cloud_usage.is_some());
         let sel = self.settings_selection;
         let mut lines: Vec<Line> = Vec::new();
         let mut last_section: Option<&str> = None;
@@ -2230,6 +2280,20 @@ impl Dashboard {
                     false,
                 ),
             },
+            Row::Usage => {
+                let usage = self.cloud_usage.clone().unwrap_or_default();
+                let reset = next_month_start();
+                (
+                    format!("{} requests", usage.requests),
+                    format!(
+                        "{} tokens this month \u{00B7} resets {reset}",
+                        compact_count(usage.tokens())
+                    ),
+                    DetailTone::Neutral,
+                    "",
+                    false,
+                )
+            }
             Row::Account => match crate::cloud::status(config) {
                 crate::cloud::AccountStatus::SignedIn { email, entitlements } => {
                     let (detail, tone) = if entitlements.is_empty() {
@@ -2520,10 +2584,25 @@ mod tests {
             Row::SignIn,
             Row::RequestAccess,
             Row::Account,
+            Row::Usage,
         ];
         for row in all {
             assert!(row.label().chars().count() < LABEL_WIDTH, "{:?}", row);
         }
+    }
+
+    #[test]
+    fn usage_row_appears_once_known() {
+        let mut config = ScribaConfig::default();
+        config.cloud.supabase_url = Some("https://x.supabase.co".into());
+        config.cloud.supabase_anon_key = Some("anon".into());
+        config.cloud.email = Some("me@x.io".into());
+        assert!(!settings_rows_with(&config, false).contains(&Row::Usage));
+        assert_eq!(settings_rows_with(&config, true)[2], Row::Usage);
+        assert_eq!(compact_count(999), "999");
+        assert_eq!(compact_count(1234), "1.2k");
+        assert_eq!(compact_count(5_400_000), "5.4M");
+        assert!(!next_month_start().is_empty());
     }
 
     #[test]

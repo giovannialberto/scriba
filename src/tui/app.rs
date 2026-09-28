@@ -82,6 +82,7 @@ pub struct Dashboard {
     pub(super) cloud_task: Option<tokio::task::JoinHandle<Result<crate::cloud::AccountEvent, crate::cloud::CloudError>>>, // Scriba Pro refresh / sign-out in flight
     pub(super) cloud_session_task: Option<tokio::task::JoinHandle<Result<(), crate::cloud::CloudError>>>, // Access token refresh for the Pro proxy
     pub(super) cloud_session_checked: Option<std::time::Instant>, // Last time the Pro session was checked
+    pub(super) cloud_usage: Option<crate::cloud::UsageSummary>, // This month's proxy usage, once fetched
     pub(super) return_to_view: Option<DashboardView>, // View to return to after message dismissal
     // File import dialog state
     pub(super) show_file_dialog: bool,
@@ -215,6 +216,7 @@ impl Dashboard {
             cloud_task: None,
             cloud_session_task: None,
             cloud_session_checked: None,
+            cloud_usage: None,
             return_to_view: None,
             // File import dialog state
             show_file_dialog: false,

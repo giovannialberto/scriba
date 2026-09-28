@@ -30,6 +30,25 @@ pub struct Entitlement {
     pub expires_at: Option<String>,
 }
 
+/// This month's proxy usage for the signed-in account.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+pub struct UsageSummary {
+    #[serde(default)]
+    pub requests: i64,
+    #[serde(default)]
+    pub input_tokens: i64,
+    #[serde(default)]
+    pub output_tokens: i64,
+    #[serde(default)]
+    pub response_bytes: i64,
+}
+
+impl UsageSummary {
+    pub fn tokens(&self) -> i64 {
+        self.input_tokens + self.output_tokens
+    }
+}
+
 /// Why a call failed, in terms the UI can explain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CloudError {
@@ -303,6 +322,27 @@ impl SupabaseClient {
         )
         .await
         .map(|_| ())
+    }
+
+    /// This month's usage, from the `usage_this_month` function.
+    pub async fn usage_this_month(
+        &self,
+        access_token: &str,
+        user_id: &str,
+    ) -> Result<UsageSummary, CloudError> {
+        let body = serde_json::json!({ "uid": user_id });
+        let text = self
+            .send(
+                self.request(reqwest::Method::POST, "/rest/v1/rpc/usage_this_month")
+                    .bearer_auth(access_token)
+                    .json(&body),
+            )
+            .await?;
+        // A table-returning function comes back as an array of rows.
+        let rows: Vec<UsageSummary> = serde_json::from_str(&text)
+            .or_else(|_| serde_json::from_str::<UsageSummary>(&text).map(|u| vec![u]))
+            .map_err(|e| CloudError::Other(format!("bad usage response: {e}")))?;
+        Ok(rows.into_iter().next().unwrap_or_default())
     }
 
     /// Features the signed-in account holds.
