@@ -20,10 +20,10 @@ pub mod supabase;
 use crate::core::ScribaConfig;
 pub use supabase::{CloudError, Entitlement, Session, SupabaseClient};
 
-/// Supabase project URL of Scriba Pro. Empty until the project exists.
-pub const SUPABASE_URL: &str = "";
-/// Supabase anon key of Scriba Pro. Empty until the project exists.
-pub const SUPABASE_ANON_KEY: &str = "";
+/// Supabase project URL of Scriba Pro.
+pub const SUPABASE_URL: &str = "https://elnrpaedloeequmbdkgy.supabase.co";
+/// Supabase publishable (anon) key of Scriba Pro. Public by design.
+pub const SUPABASE_ANON_KEY: &str = "sb_publishable_hDRJOngfn37hXEuf6fmbgg__UKeCGFL";
 
 /// The entitlement every beta member holds.
 pub const BETA_FEATURE: &str = "beta";
