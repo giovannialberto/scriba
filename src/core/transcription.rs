@@ -406,11 +406,15 @@ impl ApiTranscriptionTarget {
     /// come from the host's environment variable when not stored.
     pub fn from_config(config: &ScribaConfig) -> Result<Self> {
         let api_key = config.resolve_transcription_api_key().ok_or_else(|| {
-            anyhow::anyhow!(
-                "No transcription API key configured for {}. Add one in Settings or set {}.",
-                config.transcription_host_display(),
-                config.transcription_api_key_env()
-            )
+            if config.transcription_is_pro() {
+                anyhow::anyhow!("{}", crate::cloud::SESSION_HINT)
+            } else {
+                anyhow::anyhow!(
+                    "No transcription API key configured for {}. Add one in Settings or set {}.",
+                    config.transcription_host_display(),
+                    config.transcription_api_key_env()
+                )
+            }
         })?;
         Ok(Self {
             base_url: config.transcription_base_url(),

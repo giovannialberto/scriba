@@ -288,6 +288,9 @@ pub struct CloudConfig {
     /// Override the Supabase anon key baked into the binary (development).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supabase_anon_key: Option<String>,
+    /// Override the model proxy URL baked into the binary (development).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
 }
 
 impl CloudConfig {
@@ -776,6 +779,9 @@ impl EnrichmentConfig {
     /// hosts get their preset name ("deepinfra", "groq", ...) or "custom", so
     /// keys and models for different hosts do not overwrite each other.
     pub fn provider_slot(provider: &CloudProvider, base_url: Option<&str>) -> String {
+        if base_url.map(crate::cloud::is_pro_url).unwrap_or(false) {
+            return "pro".to_string();
+        }
         if provider.uses_custom_endpoint() {
             let url = base_url
                 .map(str::to_string)
@@ -942,6 +948,9 @@ impl EnrichmentConfig {
     /// conventional variable when the endpoint matches a preset, otherwise the
     /// provider's own.
     pub fn api_key_env_var(&self) -> Option<String> {
+        if self.is_pro() {
+            return None;
+        }
         match &self.mode {
             EnrichmentMode::Cloud { provider, .. } => {
                 if provider.uses_custom_endpoint()
@@ -963,9 +972,17 @@ impl EnrichmentConfig {
         }
     }
 
+    /// Whether assistant calls go through the Scriba Pro proxy.
+    pub fn is_pro(&self) -> bool {
+        self.base_url().map(crate::cloud::is_pro_url).unwrap_or(false)
+    }
+
     /// Get the provider display name. For OpenAI-compatible endpoints this
     /// names the host when it is a known preset (e.g. "DeepInfra").
     pub fn provider_display_name(&self) -> String {
+        if self.is_pro() {
+            return "Scriba Pro".to_string();
+        }
         match &self.mode {
             EnrichmentMode::Cloud { provider, .. } if provider.uses_custom_endpoint() => {
                 match self.effective_base_url().as_deref().and_then(EndpointPreset::for_url) {
@@ -991,8 +1008,12 @@ impl EnrichmentConfig {
         }
     }
 
-    /// Resolve the effective API key: config value > env var.
+    /// Resolve the effective API key: the Scriba Pro session when the
+    /// endpoint is the proxy, else config value > env var.
     pub fn resolve_api_key(&self) -> Option<String> {
+        if self.is_pro() {
+            return crate::cloud::access_token();
+        }
         match &self.mode {
             EnrichmentMode::Cloud { api_key, .. } => {
                 if !api_key.is_empty() {
@@ -1231,8 +1252,18 @@ impl ScribaConfig {
             .to_string()
     }
 
-    /// Transcription key: config value, else the host's environment variable.
+    /// Whether cloud transcription goes through the Scriba Pro proxy.
+    pub fn transcription_is_pro(&self) -> bool {
+        matches!(&self.transcription, TranscriptionMode::Api { .. })
+            && crate::cloud::is_pro_url(&self.transcription_base_url())
+    }
+
+    /// Transcription key: the Scriba Pro session when the endpoint is the
+    /// proxy, else the config value, else the host's environment variable.
     pub fn resolve_transcription_api_key(&self) -> Option<String> {
+        if self.transcription_is_pro() {
+            return crate::cloud::access_token();
+        }
         match &self.transcription {
             TranscriptionMode::Api { api_key, .. } if !api_key.trim().is_empty() => Some(api_key.clone()),
             TranscriptionMode::Api { .. } => std::env::var(self.transcription_api_key_env())
@@ -1244,6 +1275,9 @@ impl ScribaConfig {
 
     /// Human-readable transcription host ("OpenAI", "Groq", or the domain).
     pub fn transcription_host_display(&self) -> String {
+        if self.transcription_is_pro() {
+            return "Scriba Pro".to_string();
+        }
         let url = self.transcription_base_url();
         if let Some(preset) = TranscriptionPreset::for_url(&url) {
             return preset.display.to_string();
@@ -1266,6 +1300,9 @@ impl ScribaConfig {
 
     /// Slot name for a transcription endpoint URL.
     pub fn stt_slot_for_url(url: &str) -> String {
+        if crate::cloud::is_pro_url(url) {
+            return "pro".to_string();
+        }
         TranscriptionPreset::for_url(url)
             .map(|p| p.name.to_string())
             .unwrap_or_else(|| "custom".to_string())

@@ -129,7 +129,7 @@ fn settings_rows(config: &ScribaConfig) -> Vec<Row> {
     }
     rows.extend([Row::SpeechProvider, Row::SpeechModel]);
     match speech_provider(config) {
-        SpeechProvider::Local => {}
+        SpeechProvider::Local | SpeechProvider::ScribaPro => {}
         SpeechProvider::Custom => rows.extend([Row::SpeechEndpoint, Row::SpeechKey]),
         _ => rows.push(Row::SpeechKey),
     }
@@ -137,6 +137,7 @@ fn settings_rows(config: &ScribaConfig) -> Vec<Row> {
     rows.extend([Row::AssistantProvider, Row::AssistantModel]);
     match assistant_provider(config) {
         AssistantProvider::Ollama => rows.push(Row::AssistantServer),
+        AssistantProvider::ScribaPro => {}
         AssistantProvider::Custom => rows.extend([Row::AssistantEndpoint, Row::AssistantKey]),
         _ => rows.push(Row::AssistantKey),
     }
@@ -154,6 +155,8 @@ fn settings_rows(config: &ScribaConfig) -> Vec<Row> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SpeechProvider {
     Local,
+    /// Hosted speech through the Scriba Pro proxy (session as the key).
+    ScribaPro,
     OpenAI,
     Groq,
     DeepInfra,
@@ -161,8 +164,9 @@ pub(super) enum SpeechProvider {
 }
 
 impl SpeechProvider {
-    const ALL: [SpeechProvider; 5] = [
+    const ALL: [SpeechProvider; 6] = [
         SpeechProvider::Local,
+        SpeechProvider::ScribaPro,
         SpeechProvider::OpenAI,
         SpeechProvider::Groq,
         SpeechProvider::DeepInfra,
@@ -172,6 +176,7 @@ impl SpeechProvider {
     fn label(self) -> &'static str {
         match self {
             SpeechProvider::Local => "Local (on this Mac)",
+            SpeechProvider::ScribaPro => "Scriba Pro",
             SpeechProvider::OpenAI => "OpenAI",
             SpeechProvider::Groq => "Groq",
             SpeechProvider::DeepInfra => "DeepInfra",
@@ -182,6 +187,7 @@ impl SpeechProvider {
     fn detail(self) -> &'static str {
         match self {
             SpeechProvider::Local => "nothing leaves your computer",
+            SpeechProvider::ScribaPro => "hosted speech through your account, no key to manage",
             SpeechProvider::OpenAI => "whisper-1, gpt-4o-transcribe",
             SpeechProvider::Groq => "fast hosted Whisper",
             SpeechProvider::DeepInfra => "hosted Whisper, low cost",
@@ -201,6 +207,7 @@ impl SpeechProvider {
     fn slot(self) -> &'static str {
         match self {
             SpeechProvider::Local => "local",
+            SpeechProvider::ScribaPro => "pro",
             SpeechProvider::OpenAI => "openai",
             SpeechProvider::Groq => "groq",
             SpeechProvider::DeepInfra => "deepinfra",
@@ -212,6 +219,7 @@ impl SpeechProvider {
 fn speech_provider(config: &ScribaConfig) -> SpeechProvider {
     match &config.transcription {
         TranscriptionMode::Local { .. } => SpeechProvider::Local,
+        TranscriptionMode::Api { .. } if config.transcription_is_pro() => SpeechProvider::ScribaPro,
         TranscriptionMode::Api { .. } => {
             match TranscriptionPreset::for_url(&config.transcription_base_url()).map(|p| p.name) {
                 Some("openai") => SpeechProvider::OpenAI,
@@ -226,6 +234,8 @@ fn speech_provider(config: &ScribaConfig) -> SpeechProvider {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum AssistantProvider {
     Ollama,
+    /// Claude through the Scriba Pro proxy (session as the key).
+    ScribaPro,
     Anthropic,
     OpenAI,
     Google,
@@ -237,8 +247,9 @@ pub(super) enum AssistantProvider {
 }
 
 impl AssistantProvider {
-    const ALL: [AssistantProvider; 9] = [
+    const ALL: [AssistantProvider; 10] = [
         AssistantProvider::Ollama,
+        AssistantProvider::ScribaPro,
         AssistantProvider::Anthropic,
         AssistantProvider::OpenAI,
         AssistantProvider::Google,
@@ -252,6 +263,7 @@ impl AssistantProvider {
     fn label(self) -> &'static str {
         match self {
             AssistantProvider::Ollama => "Ollama (local)",
+            AssistantProvider::ScribaPro => "Scriba Pro",
             AssistantProvider::Anthropic => "Anthropic",
             AssistantProvider::OpenAI => "OpenAI",
             AssistantProvider::Google => "Google",
@@ -266,6 +278,7 @@ impl AssistantProvider {
     fn detail(self) -> &'static str {
         match self {
             AssistantProvider::Ollama => "runs on this Mac",
+            AssistantProvider::ScribaPro => "Claude through your account, no key to manage",
             AssistantProvider::Anthropic => "Claude",
             AssistantProvider::OpenAI => "GPT",
             AssistantProvider::Google => "Gemini",
@@ -280,7 +293,9 @@ impl AssistantProvider {
     fn cloud_provider(self) -> Option<CloudProvider> {
         match self {
             AssistantProvider::Ollama => None,
-            AssistantProvider::Anthropic => Some(CloudProvider::Anthropic),
+            AssistantProvider::ScribaPro | AssistantProvider::Anthropic => {
+                Some(CloudProvider::Anthropic)
+            }
             AssistantProvider::OpenAI => Some(CloudProvider::OpenAI),
             AssistantProvider::Google => Some(CloudProvider::Google),
             _ => Some(CloudProvider::OpenAICompatible),
@@ -300,6 +315,7 @@ impl AssistantProvider {
     fn slot(self) -> &'static str {
         match self {
             AssistantProvider::Ollama => "ollama",
+            AssistantProvider::ScribaPro => "pro",
             AssistantProvider::Anthropic => "anthropic",
             AssistantProvider::OpenAI => "openai",
             AssistantProvider::Google => "google",
@@ -315,7 +331,10 @@ impl AssistantProvider {
     fn lists_models_live(self) -> bool {
         !matches!(
             self,
-            AssistantProvider::Anthropic | AssistantProvider::OpenAI | AssistantProvider::Google
+            AssistantProvider::ScribaPro
+                | AssistantProvider::Anthropic
+                | AssistantProvider::OpenAI
+                | AssistantProvider::Google
         )
     }
 }
@@ -323,6 +342,7 @@ impl AssistantProvider {
 fn assistant_provider(config: &ScribaConfig) -> AssistantProvider {
     match &config.enrichment.mode {
         EnrichmentMode::Local { .. } => AssistantProvider::Ollama,
+        EnrichmentMode::Cloud { .. } if config.enrichment.is_pro() => AssistantProvider::ScribaPro,
         EnrichmentMode::Cloud { provider, .. } => match provider {
             CloudProvider::Anthropic => AssistantProvider::Anthropic,
             CloudProvider::OpenAI => AssistantProvider::OpenAI,
@@ -345,6 +365,8 @@ fn assistant_provider(config: &ScribaConfig) -> AssistantProvider {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Profile {
     FullyPrivate,
+    /// Hosted speech + Claude through the Scriba Pro proxy.
+    ScribaPro,
     Cloud,
     LocalSpeechClaude,
     KeepCustom,
@@ -352,8 +374,13 @@ pub(super) enum Profile {
 
 /// What the combination of the two cards amounts to.
 fn setup_badge(config: &ScribaConfig) -> (&'static str, &'static str) {
-    let speech_local = speech_provider(config) == SpeechProvider::Local;
-    let assistant_local = assistant_provider(config) == AssistantProvider::Ollama;
+    let speech = speech_provider(config);
+    let assistant = assistant_provider(config);
+    if speech == SpeechProvider::ScribaPro && assistant == AssistantProvider::ScribaPro {
+        return ("\u{25CF}", "Scriba Pro");
+    }
+    let speech_local = speech == SpeechProvider::Local;
+    let assistant_local = assistant == AssistantProvider::Ollama;
     match (speech_local, assistant_local) {
         (true, true) => ("\u{25CF}", "Fully private"),
         (false, false) => ("\u{25CF}", "Cloud"),
@@ -708,12 +735,21 @@ impl Dashboard {
     fn activate_row(&mut self, row: Row) {
         match row {
             Row::Setup => {
-                let items = vec![
+                let mut items = vec![
                     PickerItem {
                         label: "Fully private".into(),
                         detail: "local speech + Ollama".into(),
                         value: PickerValue::Profile(Profile::FullyPrivate),
                     },
+                ];
+                if crate::cloud::pro_available(&self.config) {
+                    items.push(PickerItem {
+                        label: "Scriba Pro".into(),
+                        detail: "hosted speech + Claude through your account, no keys".into(),
+                        value: PickerValue::Profile(Profile::ScribaPro),
+                    });
+                }
+                items.extend([
                     PickerItem {
                         label: "Cloud".into(),
                         detail: "OpenAI speech + Claude".into(),
@@ -729,13 +765,15 @@ impl Dashboard {
                         detail: String::new(),
                         value: PickerValue::Profile(Profile::KeepCustom),
                     },
-                ];
+                ]);
                 self.open_picker(row, items, 0);
             }
             Row::SpeechProvider => {
                 let current = speech_provider(&self.config);
+                let pro = crate::cloud::pro_available(&self.config);
                 let items: Vec<PickerItem> = SpeechProvider::ALL
                     .iter()
+                    .filter(|p| pro || **p != SpeechProvider::ScribaPro)
                     .map(|p| PickerItem {
                         label: p.label().into(),
                         detail: self.speech_provider_detail(*p),
@@ -750,8 +788,10 @@ impl Dashboard {
             }
             Row::AssistantProvider => {
                 let current = assistant_provider(&self.config);
+                let pro = crate::cloud::pro_available(&self.config);
                 let items: Vec<PickerItem> = AssistantProvider::ALL
                     .iter()
+                    .filter(|p| pro || **p != AssistantProvider::ScribaPro)
                     .map(|p| PickerItem {
                         label: p.label().into(),
                         detail: self.assistant_provider_detail(*p),
@@ -890,6 +930,7 @@ impl Dashboard {
     /// for refresh / sign out) and persist what it changed. A finished flow
     /// closes itself: the row it sat under now shows the result.
     pub(super) fn tick_cloud(&mut self) {
+        self.keep_pro_session_fresh();
         let mut events = Vec::new();
         let mut close = false;
         if let SettingsEdit::Cloud(flow) = &mut self.settings_edit {
@@ -918,6 +959,35 @@ impl Dashboard {
         self.clamp_settings_selection();
     }
 
+    /// While speech or the assistant go through the proxy, keep a live access
+    /// token in the process store, checking once a minute. A dead refresh
+    /// token forgets the account so the UI says so.
+    fn keep_pro_session_fresh(&mut self) {
+        if let Some(task) = &self.cloud_session_task
+            && task.is_finished()
+        {
+            let task = self.cloud_session_task.take().unwrap();
+            if let Some(Ok(Err(crate::cloud::CloudError::SessionExpired))) =
+                futures_util::FutureExt::now_or_never(task)
+            {
+                crate::cloud::apply_event(&mut self.config, &crate::cloud::AccountEvent::SessionLost);
+                self.save_settings("account");
+            }
+        }
+        let due = self
+            .cloud_session_checked
+            .map(|t| t.elapsed() >= std::time::Duration::from_secs(60))
+            .unwrap_or(true);
+        if !due || self.cloud_session_task.is_some() || !crate::cloud::uses_pro(&self.config) {
+            return;
+        }
+        self.cloud_session_checked = Some(std::time::Instant::now());
+        let config = self.config.clone();
+        self.cloud_session_task = Some(tokio::spawn(async move {
+            crate::cloud::ensure_session(&config).await
+        }));
+    }
+
     /// Run an account operation in the background; `tick_cloud` applies it.
     fn spawn_cloud_task(&mut self, choice: AccountChoice) {
         if self.cloud_task.is_some() {
@@ -944,7 +1014,7 @@ impl Dashboard {
     /// Detail shown in the provider picker: whether a key is already saved for that host.
     fn speech_provider_detail(&self, p: SpeechProvider) -> String {
         let base = p.detail().to_string();
-        if p == SpeechProvider::Local {
+        if matches!(p, SpeechProvider::Local | SpeechProvider::ScribaPro) {
             return base;
         }
         let has_key = if speech_provider(&self.config) == p {
@@ -961,7 +1031,7 @@ impl Dashboard {
 
     fn assistant_provider_detail(&self, p: AssistantProvider) -> String {
         let base = p.detail().to_string();
-        if p == AssistantProvider::Ollama {
+        if matches!(p, AssistantProvider::Ollama | AssistantProvider::ScribaPro) {
             return base;
         }
         let has_key = if assistant_provider(&self.config) == p {
@@ -984,7 +1054,11 @@ impl Dashboard {
     fn same_host_key(&self, card: Card) -> Option<String> {
         let speech_slot = speech_provider(&self.config).slot();
         let assistant_slot = assistant_provider(&self.config).slot();
-        if speech_slot != assistant_slot || speech_slot == "local" || speech_slot == "custom" {
+        if speech_slot != assistant_slot
+            || speech_slot == "local"
+            || speech_slot == "custom"
+            || speech_slot == "pro"
+        {
             return None;
         }
         match card {
@@ -1106,6 +1180,10 @@ impl Dashboard {
                 self.apply_speech_provider(SpeechProvider::Local);
                 self.apply_assistant_provider(AssistantProvider::Ollama);
             }
+            Profile::ScribaPro => {
+                self.apply_speech_provider(SpeechProvider::ScribaPro);
+                self.apply_assistant_provider(AssistantProvider::ScribaPro);
+            }
             Profile::Cloud => {
                 self.apply_speech_provider(SpeechProvider::OpenAI);
                 self.apply_assistant_provider(AssistantProvider::Anthropic);
@@ -1129,6 +1207,14 @@ impl Dashboard {
                     .config
                     .last_local_model
                     .unwrap_or(LocalModel::ParakeetTdt),
+            },
+            SpeechProvider::ScribaPro => TranscriptionMode::Api {
+                api_key: String::new(),
+                base_url: crate::cloud::pro_speech_url(&self.config),
+                model: self
+                    .config
+                    .stt_model_for_slot("pro")
+                    .or_else(|| Some(crate::core::DEFAULT_TRANSCRIPTION_MODEL.to_string())),
             },
             _ => {
                 let slot = p.slot();
@@ -1169,6 +1255,7 @@ impl Dashboard {
         if assistant_provider(&self.config) == p {
             return;
         }
+        let pro_assistant_url = crate::cloud::pro_assistant_url(&self.config);
         let e = &mut self.config.enrichment;
         e.remember_cloud_settings();
         if let EnrichmentMode::Local {
@@ -1195,6 +1282,7 @@ impl Dashboard {
             Some(provider) => {
                 let base_url = match p {
                     AssistantProvider::Custom => e.load_base_url_for_slot("custom"),
+                    AssistantProvider::ScribaPro => pro_assistant_url.clone(),
                     _ => p.endpoint_preset().map(|pr| pr.base_url.to_string()),
                 };
                 let model = e.load_model_for_slot(slot);
@@ -1209,7 +1297,11 @@ impl Dashboard {
                     );
                 EnrichmentMode::Cloud {
                     provider,
-                    api_key: e.load_key_for_slot(slot),
+                    api_key: if p == AssistantProvider::ScribaPro {
+                        String::new()
+                    } else {
+                        e.load_key_for_slot(slot)
+                    },
                     model,
                     base_url,
                 }
@@ -1266,7 +1358,7 @@ impl Dashboard {
                         .unwrap_or(0);
                     self.open_picker(row, items, idx);
                 }
-                SpeechProvider::OpenAI => {
+                SpeechProvider::OpenAI | SpeechProvider::ScribaPro => {
                     let current = self.config.transcription_model();
                     let mut items: Vec<PickerItem> = OPENAI_TRANSCRIPTION_MODELS
                         .iter()

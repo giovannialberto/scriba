@@ -295,6 +295,7 @@ impl WorkflowManager {
         mode: TranscriptionMode,
         verbose: bool,
     ) -> Result<ManagedRecording> {
+        let _ = crate::cloud::ensure_session(&self.config).await;
         let directory_path = PathBuf::from(&recording.directory_name);
         if let Err(e) = transcribe_audio(&directory_path, Some(mode), verbose).await {
             // Persist the reason: the row shows a failed state with the error
@@ -333,6 +334,7 @@ impl WorkflowManager {
         transcript_path: &Path,
         verbose: bool,
     ) -> Result<()> {
+        let _ = crate::cloud::ensure_session(&self.config).await;
         let config = &self.config.enrichment;
 
         if verbose {
@@ -744,6 +746,7 @@ impl WorkflowManager {
         transcription_mode: TranscriptionMode,
         verbose: bool,
     ) -> Result<()> {
+        let _ = crate::cloud::ensure_session(&self.config).await;
         let recording_dir = BASE_PATH.join(directory_name);
         if !recording_dir.exists() {
             return Err(anyhow::anyhow!(
