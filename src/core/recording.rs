@@ -10,7 +10,7 @@ use tokio::signal;
 use tokio::sync::mpsc;
 
 use super::audio::{
-    convert_wav_to_mp3, create_encoder, merge_wav_files, AudioEncoder, AudioFormat,
+    convert_wav_to_mp3, create_encoder, merge_tracks_to_stereo, AudioEncoder, AudioFormat,
     CompressionSettings,
 };
 use super::files::FileManager;
@@ -404,10 +404,10 @@ fn record_core(
             .context("Failed to finalize loopback capture")?;
 
         if verbose {
-            println!("🔀 Merging mic and system audio...");
+            println!("🔀 Combining mic and system audio into two tracks...");
         }
-        merge_wav_files(&mic_wav_path, &loopback_wav_path, &wav_file_path)
-            .context("Failed to merge mic and loopback audio")?;
+        merge_tracks_to_stereo(&mic_wav_path, &loopback_wav_path, &wav_file_path)
+            .context("Failed to combine mic and loopback audio")?;
 
         // Clean up temp files
         let _ = std::fs::remove_file(&mic_wav_path);

@@ -65,6 +65,7 @@ src/
 - **World = single source of truth** — DB entities are a materialized index derived from `~/scriba_recordings/world.md`
 - **Entity linking is LLM-driven** — no fuzzy matching, no substring scanning
 - **Nothing hosted by the TUI may print** — background work (autopilot, workflows) takes a `quiet`/`verbose` flag; stdout corrupts the ratatui screen. Use the `_silent` workflow variants and desktop notifications instead
+- **Meeting recordings are two-track stereo** — left channel = microphone (the owner), right channel = system audio (other participants). Never downmix at rest; transcription downmixes on the fly, playback folds to mono, diarization relies on the split
 - **Never delete by heuristic in `~/scriba_recordings`** — `world.md`, `scriba.db`, and `config.json` live there next to recording directories
 
 ## Release process

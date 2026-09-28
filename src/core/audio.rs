@@ -195,6 +195,12 @@ pub fn convert_wav_to_mp3(
 ) -> Result<()> {
     let bitrate = settings.bitrate_kbps.unwrap_or(32);
     let sample_rate = settings.sample_rate;
+    // A two-track recording (mic left, system audio right) must keep both
+    // channels; a plain mic recording follows the configured channel count.
+    let wav_channels = hound::WavReader::open(wav_path)
+        .map(|r| r.spec().channels)
+        .unwrap_or(settings.channels);
+    let channels = output_channels(wav_channels, settings.channels);
 
     let output = std::process::Command::new("ffmpeg")
         .arg("-i")
@@ -206,7 +212,7 @@ pub fn convert_wav_to_mp3(
         .arg("-ar")
         .arg(sample_rate.to_string())
         .arg("-ac")
-        .arg(settings.channels.to_string())
+        .arg(channels.to_string())
         .arg("-y")
         .arg(mp3_path)
         .output()
@@ -220,12 +226,21 @@ pub fn convert_wav_to_mp3(
     Ok(())
 }
 
-/// Merge a microphone WAV and a loopback WAV into a single mono WAV.
+/// Channel count for an encoded recording: two-track sources keep both tracks,
+/// everything else follows the configured count.
+pub fn output_channels(wav_channels: u16, configured: u16) -> u16 {
+    if wav_channels >= 2 { 2 } else { configured.max(1) }
+}
+
+/// Combine a microphone WAV and a loopback WAV into one two-track stereo WAV:
+/// left channel = microphone (the owner), right channel = system audio (the
+/// other participants). Keeping the tracks apart is what lets diarization
+/// tell "you" from "everyone else" without any voice model.
 ///
 /// Handles sample rate mismatches (resamples loopback to match mic via rubato),
-/// channel count mismatches (downmixes stereo to mono), and different lengths
-/// (pads the shorter file with silence). No external tools needed.
-pub fn merge_wav_files(
+/// channel count mismatches (downmixes each source to mono first), and
+/// different lengths (pads the shorter track with silence). No external tools.
+pub fn merge_tracks_to_stereo(
     mic_wav: &Path,
     loopback_wav: &Path,
     output_wav: &Path,
@@ -266,32 +281,21 @@ pub fn merge_wav_files(
         lb_mono
     };
 
-    // Mix: add samples with clamping, pad shorter with silence
+    // Interleave: left = mic, right = loopback, pad the shorter track with silence
     let max_len = mic_mono.len().max(lb_resampled.len());
-    let mut mixed = Vec::with_capacity(max_len);
-    for i in 0..max_len {
-        let s1 = if i < mic_mono.len() { mic_mono[i] } else { 0.0 };
-        let s2 = if i < lb_resampled.len() {
-            lb_resampled[i]
-        } else {
-            0.0
-        };
-        mixed.push((s1 + s2).clamp(-1.0, 1.0));
-    }
-
-    // Write merged mono WAV
     let out_spec = hound::WavSpec {
-        channels: 1,
+        channels: 2,
         sample_rate: mic_rate,
         bits_per_sample: 32,
         sample_format: hound::SampleFormat::Float,
     };
     let mut writer =
         hound::WavWriter::create(output_wav, out_spec).context("Failed to create merged WAV")?;
-    for sample in &mixed {
-        writer
-            .write_sample(*sample)
-            .context("Failed to write merged sample")?;
+    for i in 0..max_len {
+        let left = mic_mono.get(i).copied().unwrap_or(0.0).clamp(-1.0, 1.0);
+        let right = lb_resampled.get(i).copied().unwrap_or(0.0).clamp(-1.0, 1.0);
+        writer.write_sample(left).context("Failed to write merged sample")?;
+        writer.write_sample(right).context("Failed to write merged sample")?;
     }
     writer.finalize().context("Failed to finalize merged WAV")?;
 
@@ -366,4 +370,61 @@ fn resample_mono(samples: &[f32], from_rate: u32, to_rate: u32) -> Result<Vec<f3
     }
 
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_wav(path: &Path, rate: u32, channels: u16, frames: &[f32]) {
+        let spec = hound::WavSpec {
+            channels,
+            sample_rate: rate,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut w = hound::WavWriter::create(path, spec).unwrap();
+        for f in frames {
+            for _ in 0..channels {
+                w.write_sample(*f).unwrap();
+            }
+        }
+        w.finalize().unwrap();
+    }
+
+    #[test]
+    fn output_channels_keeps_two_tracks() {
+        assert_eq!(output_channels(2, 1), 2);
+        assert_eq!(output_channels(1, 1), 1);
+        assert_eq!(output_channels(1, 2), 2);
+        assert_eq!(output_channels(1, 0), 1);
+    }
+
+    #[test]
+    fn tracks_are_kept_apart_in_stereo() {
+        let dir = std::env::temp_dir().join(format!("scriba-merge-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mic = dir.join("mic.wav");
+        let lb = dir.join("lb.wav");
+        let out = dir.join("out.wav");
+
+        // Mic: 4 mono frames at 16 kHz. Loopback: stereo, same rate, longer.
+        write_wav(&mic, 16_000, 1, &[0.1, 0.2, 0.3, 0.4]);
+        write_wav(&lb, 16_000, 2, &[-0.5, -0.6, -0.7, -0.8, -0.9, -1.0]);
+
+        merge_tracks_to_stereo(&mic, &lb, &out).unwrap();
+
+        let mut reader = hound::WavReader::open(&out).unwrap();
+        let spec = reader.spec();
+        assert_eq!(spec.channels, 2);
+        assert_eq!(spec.sample_rate, 16_000);
+        let samples: Vec<f32> = reader.samples::<f32>().map(|s| s.unwrap()).collect();
+        assert_eq!(samples.len(), 12, "6 frames x 2 channels, padded to the longer track");
+        let left: Vec<f32> = samples.iter().step_by(2).copied().collect();
+        let right: Vec<f32> = samples.iter().skip(1).step_by(2).copied().collect();
+        assert_eq!(left, vec![0.1, 0.2, 0.3, 0.4, 0.0, 0.0]);
+        assert_eq!(right, vec![-0.5, -0.6, -0.7, -0.8, -0.9, -1.0]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -5,7 +5,8 @@
 //! FLAC and other formats via symphonia (included by rodio).
 
 use anyhow::{Context, Result};
-use rodio::Decoder;
+use rodio::source::UniformSourceIterator;
+use rodio::{ChannelCount, Decoder, Source};
 use rodio::stream::{DeviceSinkBuilder, MixerDeviceSink};
 use rodio::Player;
 use std::fs::File;
@@ -38,8 +39,13 @@ impl AudioPlayer {
         let source = Decoder::new(reader)
             .with_context(|| format!("Failed to decode audio file: {}", path.display()))?;
 
+        // Two-track recordings keep the mic on the left and system audio on the
+        // right; fold them to mono so headphones do not split the conversation.
+        let sample_rate = source.sample_rate();
+        let mono = UniformSourceIterator::new(source, ChannelCount::new(1).expect("nonzero"), sample_rate);
+
         let player = Player::connect_new(&handle.mixer());
-        player.append(source);
+        player.append(mono);
 
         Ok(Self {
             player,
