@@ -2283,10 +2283,16 @@ impl Dashboard {
             Row::Usage => {
                 let usage = self.cloud_usage.clone().unwrap_or_default();
                 let reset = next_month_start();
+                let audio = usage.audio_display();
+                let audio = if audio.is_empty() {
+                    String::new()
+                } else {
+                    format!("{audio} of audio \u{00B7} ")
+                };
                 (
                     format!("{} requests", usage.requests),
                     format!(
-                        "{} tokens this month \u{00B7} resets {reset}",
+                        "{audio}{} tokens this month \u{00B7} resets {reset}",
                         compact_count(usage.tokens())
                     ),
                     DetailTone::Neutral,

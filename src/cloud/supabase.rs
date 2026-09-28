@@ -41,11 +41,23 @@ pub struct UsageSummary {
     pub output_tokens: i64,
     #[serde(default)]
     pub response_bytes: i64,
+    /// Seconds of audio transcribed this month.
+    #[serde(default)]
+    pub audio_seconds: i64,
 }
 
 impl UsageSummary {
     pub fn tokens(&self) -> i64 {
         self.input_tokens + self.output_tokens
+    }
+
+    /// "45 min", "2.5 h", or "" when nothing was transcribed.
+    pub fn audio_display(&self) -> String {
+        match self.audio_seconds {
+            s if s <= 0 => String::new(),
+            s if s < 3600 => format!("{} min", (s + 59) / 60),
+            s => format!("{:.1} h", s as f64 / 3600.0),
+        }
     }
 }
 
@@ -444,6 +456,18 @@ mod tests {
         let text = r#"{"access_token":"a","refresh_token":"r","expires_at":42,"user":{"id":"u1"}}"#;
         assert_eq!(parse_session(text).unwrap().expires_at, 42);
         assert!(parse_session("{}").is_err());
+    }
+
+    #[test]
+    fn audio_usage_reads_naturally() {
+        let mut u = UsageSummary::default();
+        assert_eq!(u.audio_display(), "");
+        u.audio_seconds = 61;
+        assert_eq!(u.audio_display(), "2 min");
+        u.audio_seconds = 9000;
+        assert_eq!(u.audio_display(), "2.5 h");
+        let parsed: UsageSummary = serde_json::from_str(r#"{"requests":1,"unmetered_bytes":5}"#).unwrap();
+        assert_eq!(parsed.requests, 1, "unknown fields are ignored");
     }
 
     #[test]
