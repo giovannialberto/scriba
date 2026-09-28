@@ -165,6 +165,7 @@ impl WorkflowManager {
                         silence_timeout: None,
                         input_device,
                         loopback_device,
+                        register_in_db: true,
                     },
                 )
                 .await?;
@@ -181,6 +182,7 @@ impl WorkflowManager {
                         silence_timeout,
                         input_device,
                         loopback_device,
+                        register_in_db: true,
                     },
                 )
                 .await?;
@@ -197,6 +199,7 @@ impl WorkflowManager {
                         silence_timeout,
                         input_device,
                         loopback_device,
+                        register_in_db: true,
                     },
                 )
                 .await?;

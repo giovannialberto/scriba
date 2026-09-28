@@ -15,5 +15,6 @@ mod onboarding;
 mod recording;
 mod settings;
 mod transcript;
+mod voice;
 
 pub use app::Dashboard;

@@ -76,14 +76,14 @@ pub const TRANSCRIPTION_PRESETS: &[TranscriptionPreset] = &[
         name: "groq",
         display: "Groq",
         base_url: "https://api.groq.com/openai/v1",
-        model: "whisper-large-v3-turbo",
+        model: "whisper-large-v3",
         env_var: "GROQ_API_KEY",
     },
     TranscriptionPreset {
         name: "deepinfra",
         display: "DeepInfra",
         base_url: "https://api.deepinfra.com/v1/openai",
-        model: "openai/whisper-large-v3-turbo",
+        model: "openai/whisper-large-v3",
         env_var: "DEEPINFRA_API_KEY",
     },
 ];
@@ -220,6 +220,10 @@ pub struct ScribaConfig {
     /// Speaker diarization settings.
     #[serde(default)]
     pub diarization: DiarizationConfig,
+    /// Whether the one-time "learn your voice" introduction was shown to a
+    /// user who set up Scriba before voice profiles existed.
+    #[serde(default)]
+    pub voice_intro_seen: bool,
     /// Voice-activated recording settings (reserved for future use).
     #[serde(default, skip_serializing)]
     pub voice: VoiceConfig,
@@ -1061,6 +1065,7 @@ impl Default for ScribaConfig {
             silence_auto_stop: SilenceAutoStopConfig::default(),
             meeting_detection: MeetingDetectionConfig::default(),
             diarization: DiarizationConfig::default(),
+            voice_intro_seen: false,
             voice: VoiceConfig::default(),
             last_local_model: None,
             last_cloud_provider: None,
@@ -1387,7 +1392,7 @@ mod tests {
         let json = r#"{"Api":{"api_key":"sk"}}"#;
         let mode: TranscriptionMode = serde_json::from_str(json).unwrap();
         assert!(matches!(mode, TranscriptionMode::Api { base_url: None, model: None, .. }));
-        assert_eq!(TranscriptionPreset::by_name("Groq").unwrap().model, "whisper-large-v3-turbo");
+        assert_eq!(TranscriptionPreset::by_name("Groq").unwrap().model, "whisper-large-v3");
         assert!(TranscriptionPreset::for_url("https://api.deepinfra.com/v1/openai/").is_some());
     }
 

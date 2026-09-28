@@ -166,3 +166,52 @@ impl RecordingStats {
         }
     }
 }
+
+/// A known voice: the normalized centroid of a speaker's stored embeddings.
+#[derive(Debug, Clone)]
+pub struct SpeakerProfile {
+    /// `"owner"` for the owner, otherwise an entity canonical name.
+    pub speaker: String,
+    pub is_owner: bool,
+    pub centroid: Vec<f32>,
+    pub samples: usize,
+    pub total_secs: f32,
+}
+
+impl SpeakerProfile {
+    pub fn new(speaker: String, is_owner: bool, embedding: &[f32], secs: f32) -> Self {
+        Self {
+            speaker,
+            is_owner,
+            centroid: embedding.to_vec(),
+            samples: 1,
+            total_secs: secs,
+        }
+    }
+
+    /// Accumulate another embedding (call `normalize` when done).
+    pub fn add(&mut self, embedding: &[f32], secs: f32) {
+        if self.centroid.len() != embedding.len() {
+            return;
+        }
+        for (c, e) in self.centroid.iter_mut().zip(embedding) {
+            *c += e;
+        }
+        self.samples += 1;
+        self.total_secs += secs;
+    }
+
+    /// Scale the centroid to unit length.
+    pub fn normalize(&mut self) {
+        let norm = self.centroid.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            self.centroid.iter_mut().for_each(|x| *x /= norm);
+        }
+    }
+
+    /// Cosine similarity with a normalized embedding.
+    pub fn similarity(&self, embedding: &[f32]) -> f32 {
+        self.centroid.iter().zip(embedding).map(|(a, b)| a * b).sum()
+    }
+}
+

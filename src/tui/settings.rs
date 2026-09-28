@@ -47,6 +47,8 @@ pub(super) enum Row {
     SpeechKey,
     /// Local speaker labelling toggle.
     Speakers,
+    /// Owner voice enrollment status / re-record.
+    Voice,
     AssistantProvider,
     AssistantModel,
     AssistantServer,
@@ -68,6 +70,7 @@ impl Row {
             Row::SpeechKey | Row::AssistantKey => "API key",
             Row::AssistantServer => "Server",
             Row::Speakers => "Speakers",
+            Row::Voice => "Your voice",
             Row::AutoStop => "Auto-stop",
             Row::Timeout => "Timeout",
             Row::MeetingWatch => "Meeting watch",
@@ -83,7 +86,8 @@ impl Row {
             | Row::SpeechModel
             | Row::SpeechEndpoint
             | Row::SpeechKey
-            | Row::Speakers => Some("SPEECH TO TEXT"),
+            | Row::Speakers
+            | Row::Voice => Some("SPEECH TO TEXT"),
             Row::AssistantProvider
             | Row::AssistantModel
             | Row::AssistantServer
@@ -106,10 +110,11 @@ pub(super) enum Card {
 fn settings_rows(config: &ScribaConfig) -> Vec<Row> {
     let mut rows = vec![Row::Setup, Row::SpeechProvider, Row::SpeechModel];
     match speech_provider(config) {
-        SpeechProvider::Local => rows.push(Row::Speakers),
+        SpeechProvider::Local => {}
         SpeechProvider::Custom => rows.extend([Row::SpeechEndpoint, Row::SpeechKey]),
         _ => rows.push(Row::SpeechKey),
     }
+    rows.extend([Row::Speakers, Row::Voice]);
     rows.extend([Row::AssistantProvider, Row::AssistantModel]);
     match assistant_provider(config) {
         AssistantProvider::Ollama => rows.push(Row::AssistantServer),
@@ -358,7 +363,7 @@ pub(super) struct PickerItem {
 }
 
 /// What the settings screen is doing besides navigating.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(super) enum SettingsEdit {
     None,
     /// Inline text entry on `row`.
@@ -368,6 +373,8 @@ pub(super) enum SettingsEdit {
         secret: bool,
         note: Option<String>,
     },
+    /// Owner voice enrollment running inline under the Voice row.
+    Voice(super::voice::VoiceEnrollment),
     /// List picker opened from `row`.
     Picker {
         row: Row,
@@ -475,6 +482,20 @@ impl Dashboard {
     ) -> Result<DashboardAction> {
         let rows = settings_rows(&self.config);
 
+        if matches!(self.settings_edit, SettingsEdit::Voice(_)) {
+            let finished = if key_code == KeyCode::Esc {
+                true
+            } else if let SettingsEdit::Voice(v) = &mut self.settings_edit {
+                v.handle_key(key_code, &self.config) == super::voice::VoiceAction::Finished
+            } else {
+                false
+            };
+            if finished {
+                self.settings_edit = SettingsEdit::None;
+            }
+            return Ok(DashboardAction::Continue);
+        }
+
         match key_code {
             KeyCode::Esc => {
                 if self.is_editing_settings_field() {
@@ -486,7 +507,7 @@ impl Dashboard {
             }
             KeyCode::Up => match &mut self.settings_edit {
                 SettingsEdit::Picker { selection, .. } => *selection = selection.saturating_sub(1),
-                SettingsEdit::Text { .. } => {}
+                SettingsEdit::Text { .. } | SettingsEdit::Voice(_) => {}
                 SettingsEdit::None => {
                     self.settings_selection = self.settings_selection.saturating_sub(1);
                 }
@@ -503,13 +524,14 @@ impl Dashboard {
                         *selection = (*selection + 1).min(visible - 1);
                     }
                 }
-                SettingsEdit::Text { .. } => {}
+                SettingsEdit::Text { .. } | SettingsEdit::Voice(_) => {}
                 SettingsEdit::None => {
                     self.settings_selection = (self.settings_selection + 1).min(rows.len() - 1);
                 }
             },
             KeyCode::Enter => {
                 match std::mem::replace(&mut self.settings_edit, SettingsEdit::None) {
+                    SettingsEdit::Voice(v) => self.settings_edit = SettingsEdit::Voice(v),
                     SettingsEdit::Text { row, buffer, .. } => self.commit_text(row, buffer),
                     SettingsEdit::Picker {
                         row,
@@ -555,6 +577,7 @@ impl Dashboard {
                     filter.push(c);
                     *selection = 0;
                 }
+                SettingsEdit::Voice(_) => {}
                 SettingsEdit::None => {}
             },
             KeyCode::Backspace => match &mut self.settings_edit {
@@ -567,6 +590,7 @@ impl Dashboard {
                     filter.pop();
                     *selection = 0;
                 }
+                SettingsEdit::Voice(_) => {}
                 SettingsEdit::None => {}
             },
             _ => {}
@@ -755,6 +779,10 @@ impl Dashboard {
             Row::Speakers => {
                 self.config.diarization.enabled = !self.config.diarization.enabled;
                 self.save_settings("setting");
+            }
+            Row::Voice => {
+                let name = crate::core::transcription::owner_display_name();
+                self.settings_edit = SettingsEdit::Voice(super::voice::VoiceEnrollment::new(&name));
             }
             Row::AutoStop => {
                 self.config.silence_auto_stop.enabled = !self.config.silence_auto_stop.enabled;
@@ -1478,6 +1506,14 @@ impl Dashboard {
                         hint_style,
                     )));
                 }
+                SettingsEdit::Voice(v) if row == Row::Voice => {
+                    let indent = " ".repeat(2 + LABEL_WIDTH);
+                    for line in v.render_lines(width.saturating_sub(2 + LABEL_WIDTH)) {
+                        let mut spans = line.spans;
+                        spans.insert(0, Span::raw(indent.clone()));
+                        lines.push(Line::from(spans));
+                    }
+                }
                 SettingsEdit::Picker {
                     row: r,
                     title,
@@ -1593,6 +1629,7 @@ impl Dashboard {
                 ("Enter", "Change"),
                 ("Esc", "Back"),
             ],
+            SettingsEdit::Voice(_) => &[("Enter", "Record / Continue"), ("S", "Skip"), ("Esc", "Cancel")],
             SettingsEdit::Text { .. } => &[("Enter", "Save"), ("Esc", "Cancel")],
             SettingsEdit::Picker { .. } => &[
                 ("\u{2191}\u{2193}", "Select"),
@@ -1791,12 +1828,32 @@ impl Dashboard {
                     &self.assistant_key_status,
                 )
             }
+            Row::Voice => {
+                let (count, secs) = self.db.speaker_sample_stats("owner", crate::core::diarization::EMBEDDING_MODEL_ID).unwrap_or((0, 0.0));
+                if count == 0 {
+                    (
+                        "not learned yet".to_string(),
+                        "Scriba cannot tell you apart in single-mic recordings".to_string(),
+                        DetailTone::Bad,
+                        "\u{2190} Enter to record 12 seconds",
+                        false,
+                    )
+                } else {
+                    (
+                        "learned".to_string(),
+                        format!("{} sample(s), {:.0}s \u{00B7} grows with every meeting", count, secs),
+                        DetailTone::Good,
+                        "\u{2190} Enter to record again",
+                        false,
+                    )
+                }
+            }
             Row::Speakers => {
                 let detail = if config.diarization.enabled {
                     if crate::core::diarization::models_downloaded() {
                         "who said what \u{00B7} models installed \u{2713}"
                     } else {
-                        "who said what \u{00B7} 40 MB download on first use"
+                        "who said what \u{00B7} 100 MB download on first use"
                     }
                 } else {
                     "transcripts without speaker labels"
@@ -2066,7 +2123,7 @@ mod tests {
             Row::SpeechModel,
             Row::SpeechEndpoint,
             Row::SpeechKey,
-            Row::Speakers,
+            Row::Speakers, Row::Voice,
             Row::AssistantProvider,
             Row::AssistantModel,
             Row::AssistantServer,

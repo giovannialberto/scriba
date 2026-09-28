@@ -132,6 +132,9 @@ pub struct RecordOptions {
     /// On macOS uses ScreenCaptureKit natively; on Linux uses PulseAudio/PipeWire
     /// monitor sources. When set, both mic and system audio are recorded and merged.
     pub loopback_device: Option<String>,
+    /// Register the result as a recording in the database (default). Off for
+    /// utility captures such as voice enrollment.
+    pub register_in_db: bool,
 }
 
 impl Default for RecordOptions {
@@ -144,6 +147,7 @@ impl Default for RecordOptions {
             silence_timeout: None,
             input_device: None,
             loopback_device: None,
+            register_in_db: true,
         }
     }
 }
@@ -244,6 +248,7 @@ fn record_core(
     wait_stop: Box<dyn FnOnce()>,
     input_device_name: Option<String>,
     loopback_device_name: Option<String>,
+    register_in_db: bool,
 ) -> Result<RecordingResult, anyhow::Error> {
     let device = resolve_input_device(input_device_name.as_deref())?;
 
@@ -433,16 +438,18 @@ fn record_core(
         &wav_file_path
     };
 
-    let mut db = Database::new().context("Failed to connect to database")?;
-    let recording = create_recording_entry(&output_path, metadata_file_path)?;
+    if register_in_db {
+        let mut db = Database::new().context("Failed to connect to database")?;
+        let recording = create_recording_entry(&output_path, metadata_file_path)?;
 
-    match db.insert_recording(&recording) {
-        Ok(id) => {
-            if verbose {
-                println!("📊 Recording saved to database with ID: {}", id);
+        match db.insert_recording(&recording) {
+            Ok(id) => {
+                if verbose {
+                    println!("📊 Recording saved to database with ID: {}", id);
+                }
             }
+            Err(e) => eprintln!("⚠️ Warning: Failed to save recording to database: {}", e),
         }
-        Err(e) => eprintln!("⚠️ Warning: Failed to save recording to database: {}", e),
     }
 
     if verbose {
@@ -559,6 +566,7 @@ pub async fn record_audio(output_path: PathBuf, options: RecordOptions) -> Resul
         wait_strategy,
         options.input_device,
         options.loopback_device,
+        options.register_in_db,
     )
 }
 

@@ -95,7 +95,10 @@ fn main() {
 
     let home = std::env::var("HOME").unwrap();
     let models = DiarizationModels {
-        embedding: Path::new(&home).join("scriba_recordings/models/sherpa/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx"),
+        embedding: match std::env::var("SCRIBA_SPK_MODEL") {
+            Ok(p) => Path::new(&p).to_path_buf(),
+            Err(_) => Path::new(&home).join("scriba_recordings/models/sherpa/nemo_en_titanet_large.onnx"),
+        },
     };
     let embedder = SpeakerEmbedder::load(&models).expect("model");
     let transcript: Vec<TranscriptSegment> = segs

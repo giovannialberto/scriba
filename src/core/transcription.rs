@@ -14,13 +14,14 @@ use sherpa_onnx::{OfflineRecognizer, OfflineRecognizerConfig, Wave};
 use std::io::{stdout, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::io::BufReader;
 use std::process::Command;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 use super::config::{LocalModel, ScribaConfig, TranscriptionMode};
-use super::diarization::{self, Diarized, TranscriptSegment};
+use super::diarization::{self, Diarized, TimedWord, TranscriptSegment};
 use super::files::FileManager;
 use crate::database::Database;
 use crate::utils::BASE_PATH;
@@ -146,6 +147,21 @@ fn save_transcript_to_files_and_db(
                 }
                 if let Ok(speakers) = serde_json::to_string(&d.speakers) {
                     let _ = db.update_recording_speakers(recording_id, &speakers);
+                }
+                // Every meeting teaches Scriba a little more about the owner's voice.
+                for sample in &d.owner_samples {
+                    let _ = db.add_speaker_sample(
+                        "owner",
+                        true,
+                        &sample.embedding,
+                        sample.duration_secs,
+                        "mic-track",
+                        diarization::EMBEDDING_MODEL_ID,
+                        Some(recording_id),
+                    );
+                }
+                if !d.owner_samples.is_empty() {
+                    let _ = db.prune_speaker_samples("owner", diarization::OWNER_SAMPLES_KEPT, diarization::EMBEDDING_MODEL_ID);
                 }
             }
         }
@@ -458,27 +474,126 @@ fn render_diarized(response: &Value) -> Option<String> {
     )
 }
 
+/// One transcribed API chunk: the text, plus timed segments when the host
+/// returned them (`verbose_json`), which is what speaker labelling needs.
+#[derive(Debug, Clone, Default)]
+struct ApiChunk {
+    text: String,
+    segments: Vec<TranscriptSegment>,
+    words: Vec<TimedWord>,
+}
+
+/// Parse a `json` or `verbose_json` transcription response.
+fn parse_api_chunk(response: &Value) -> Option<ApiChunk> {
+    let segments: Vec<TranscriptSegment> = response
+        .get("segments")
+        .and_then(|s| s.as_array())
+        .map(|segs| {
+            segs.iter()
+                .filter_map(|seg| {
+                    let text = seg.get("text").and_then(|t| t.as_str())?.trim();
+                    let start = seg.get("start").and_then(|v| v.as_f64())? as f32;
+                    let end = seg.get("end").and_then(|v| v.as_f64())? as f32;
+                    (!text.is_empty() && end > start).then(|| TranscriptSegment {
+                        start,
+                        end,
+                        text: text.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let words: Vec<TimedWord> = response
+        .get("words")
+        .and_then(|w| w.as_array())
+        .map(|ws| {
+            ws.iter()
+                .filter_map(|w| {
+                    let text = w.get("word").and_then(|t| t.as_str())?.trim();
+                    let start = w.get("start").and_then(|v| v.as_f64())? as f32;
+                    let end = w.get("end").and_then(|v| v.as_f64())? as f32;
+                    (!text.is_empty()).then(|| TimedWord {
+                        start,
+                        end,
+                        text: text.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let text = match response.get("text").and_then(|t| t.as_str()) {
+        Some(t) => t.trim().to_string(),
+        None if !segments.is_empty() => join_segments(&segments),
+        None => return None,
+    };
+    Some(ApiChunk {
+        text,
+        segments,
+        words,
+    })
+}
+
+/// Shift a chunk's segment and word times by the chunk's start within the recording.
+fn offset_segments(chunk: &mut ApiChunk, offset_secs: f32) {
+    for seg in &mut chunk.segments {
+        seg.start += offset_secs;
+        seg.end += offset_secs;
+    }
+    for w in &mut chunk.words {
+        w.start += offset_secs;
+        w.end += offset_secs;
+    }
+}
+
 /// Transcribe a single audio chunk via the API (one attempt).
+///
+/// Segment timestamps (`verbose_json`) are requested while `timestamps` is
+/// set; a host that rejects that format clears the flag for the remaining
+/// chunks and the request is repeated once as plain `json`.
 async fn transcribe_single_chunk(
     client: &Client,
     audio_path: &Path,
     target: &ApiTranscriptionTarget,
-) -> Result<String, ChunkError> {
+    timestamps: &AtomicBool,
+) -> Result<ApiChunk, ChunkError> {
     let fatal = |error: anyhow::Error| ChunkError { retryable: false, error };
-    let transient = |error: anyhow::Error| ChunkError { retryable: true, error };
 
     let audio_file = std::fs::read(audio_path)
         .context("Unable to read audio chunk")
         .map_err(fatal)?;
-
     let filename = audio_path
         .file_name()
         .and_then(|f| f.to_str())
         .unwrap_or("audio")
         .to_string();
 
-    let part = Part::bytes(audio_file)
-        .file_name(filename)
+    let with_timestamps = !target.diarizes() && timestamps.load(Ordering::Relaxed);
+    match send_chunk(client, &audio_file, &filename, target, with_timestamps).await {
+        Err(ChunkError { retryable: false, error }) if with_timestamps && is_bad_request(&error) => {
+            timestamps.store(false, Ordering::Relaxed);
+            send_chunk(client, &audio_file, &filename, target, false).await
+        }
+        other => other,
+    }
+}
+
+fn is_bad_request(error: &anyhow::Error) -> bool {
+    let msg = error.to_string();
+    msg.contains("status 400") || msg.contains("status 422")
+}
+
+async fn send_chunk(
+    client: &Client,
+    audio_file: &[u8],
+    filename: &str,
+    target: &ApiTranscriptionTarget,
+    with_timestamps: bool,
+) -> Result<ApiChunk, ChunkError> {
+    let fatal = |error: anyhow::Error| ChunkError { retryable: false, error };
+    let transient = |error: anyhow::Error| ChunkError { retryable: true, error };
+
+    let part = Part::bytes(audio_file.to_vec())
+        .file_name(filename.to_string())
         .mime_str("audio/mpeg")
         .context("Failed to create multipart form data")
         .map_err(fatal)?;
@@ -490,6 +605,11 @@ async fn transcribe_single_chunk(
         form = form
             .text("response_format", "diarized_json")
             .text("chunking_strategy", "auto");
+    } else if with_timestamps {
+        form = form
+            .text("response_format", "verbose_json")
+            .text("timestamp_granularities[]", "word")
+            .text("timestamp_granularities[]", "segment");
     } else {
         form = form.text("response_format", "json");
     }
@@ -528,15 +648,12 @@ async fn transcribe_single_chunk(
         .with_context(|| format!("Failed to parse {host} response as JSON"))
         .map_err(transient)?;
 
-    let text = if target.diarizes() {
-        render_diarized(&response_json)
+    let chunk = if target.diarizes() {
+        render_diarized(&response_json).map(|text| ApiChunk { text, ..Default::default() })
     } else {
-        response_json
-            .get("text")
-            .and_then(|t| t.as_str())
-            .map(|s| s.to_string())
+        parse_api_chunk(&response_json)
     };
-    text.ok_or_else(|| fatal(anyhow::anyhow!("No transcript text found in {host} response")))
+    chunk.ok_or_else(|| fatal(anyhow::anyhow!("No transcript text found in {host} response")))
 }
 
 /// Transcribe one chunk with exponential backoff on transient failures.
@@ -544,13 +661,14 @@ async fn transcribe_chunk_with_retry(
     client: &Client,
     audio_path: &Path,
     target: &ApiTranscriptionTarget,
+    timestamps: &AtomicBool,
     index: usize,
     total: usize,
-) -> Result<String> {
+) -> Result<ApiChunk> {
     let mut attempt = 1;
     loop {
-        match transcribe_single_chunk(client, audio_path, target).await {
-            Ok(text) => return Ok(text),
+        match transcribe_single_chunk(client, audio_path, target, timestamps).await {
+            Ok(chunk) => return Ok(chunk),
             Err(ChunkError { retryable: true, .. }) if attempt < API_MAX_ATTEMPTS => {
                 sleep(Duration::from_secs(2u64.pow(attempt))).await;
                 attempt += 1;
@@ -873,9 +991,22 @@ async fn ensure_vad_model() -> Result<PathBuf> {
 
 /// Create a Silero VAD for segmenting long audio.
 fn create_vad(vad_model_path: &Path) -> Result<sherpa_onnx::VoiceActivityDetector> {
+    create_vad_with_threshold(vad_model_path, 0.5)
+}
+
+/// Silero speech probability above which audio counts as speech when
+/// cutting cloud transcripts into turns. Lower than the 0.5 used for local
+/// transcription so a quiet participant further from the microphone still
+/// gets units of their own; units without words are dropped anyway.
+const DIARIZATION_VAD_THRESHOLD: f32 = 0.35;
+
+fn create_vad_with_threshold(
+    vad_model_path: &Path,
+    threshold: f32,
+) -> Result<sherpa_onnx::VoiceActivityDetector> {
     let mut vad_config = sherpa_onnx::VadModelConfig::default();
     vad_config.silero_vad.model = Some(vad_model_path.to_string_lossy().into_owned());
-    vad_config.silero_vad.threshold = 0.5;
+    vad_config.silero_vad.threshold = threshold;
     vad_config.silero_vad.min_silence_duration = 0.5;
     vad_config.silero_vad.min_speech_duration = 0.25;
     vad_config.silero_vad.window_size = 512;
@@ -953,6 +1084,38 @@ fn run_sherpa_transcription(model: LocalModel, model_dir: &Path, wav_path: &Path
     Ok(segments)
 }
 
+/// Speech segments found by Silero VAD, with empty text: the units speaker
+/// labelling works on when the transcript came from a cloud host.
+fn speech_segments(wav_path: &Path, vad_model_path: &Path) -> Result<Vec<TranscriptSegment>> {
+    let wave = Wave::read(wav_path.to_string_lossy().as_ref())
+        .ok_or_else(|| anyhow::anyhow!("Failed to read WAV file: {}", wav_path.display()))?;
+    let samples = wave.samples();
+    let sample_rate = wave.sample_rate();
+    let vad = create_vad_with_threshold(vad_model_path, DIARIZATION_VAD_THRESHOLD)?;
+    let mut segments: Vec<TranscriptSegment> = Vec::new();
+    let drain = |vad: &sherpa_onnx::VoiceActivityDetector, segments: &mut Vec<TranscriptSegment>| {
+        while !vad.is_empty() {
+            if let Some(segment) = vad.front() {
+                let start = segment.start() as f32 / sample_rate as f32;
+                let end = start + segment.samples().len() as f32 / sample_rate as f32;
+                segments.push(TranscriptSegment {
+                    start,
+                    end,
+                    text: String::new(),
+                });
+            }
+            vad.pop();
+        }
+    };
+    for chunk in samples.chunks(512) {
+        vad.accept_waveform(chunk);
+        drain(&vad, &mut segments);
+    }
+    vad.flush();
+    drain(&vad, &mut segments);
+    Ok(segments)
+}
+
 /// Plain transcript text: segments joined by spaces.
 fn join_segments(segments: &[TranscriptSegment]) -> String {
     segments
@@ -985,12 +1148,13 @@ async fn diarize_local_transcript(
     let channels = get_audio_channels(audio_file_path).unwrap_or(1);
     let stereo = if channels >= 2 { Some(ensure_stereo_16k_wav(audio_file_path)?) } else { None };
     let owner = owner_label();
+    let known = known_speakers(&owner);
     let options = diarization::DiarizationOptions {
         similarity_threshold: diarization::DEFAULT_SIMILARITY_THRESHOLD,
         max_speakers: config.diarization.max_speakers.max(1) as usize,
     };
     let started = Instant::now();
-    let result = diarization::diarize_transcript(segments, wav_path, stereo.as_deref(), &models, options, &owner);
+    let result = diarization::diarize_transcript(segments, wav_path, stereo.as_deref(), &models, options, &owner, &known);
     if let Some(p) = stereo {
         let _ = std::fs::remove_file(p);
     }
@@ -1005,13 +1169,35 @@ async fn diarize_local_transcript(
     Ok(diarized)
 }
 
+/// Voices Scriba already knows, labelled with their current display names.
+fn known_speakers(owner_name: &str) -> Vec<diarization::KnownSpeaker> {
+    Database::new()
+        .and_then(|db| db.speaker_profiles(diarization::EMBEDDING_MODEL_ID))
+        .map(|profiles| {
+            profiles
+                .into_iter()
+                .map(|p| diarization::KnownSpeaker {
+                    name: if p.is_owner { owner_name.to_string() } else { p.speaker.clone() },
+                    is_owner: p.is_owner,
+                    centroid: p.centroid,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Owner's name for speaker labels, from the world; "You" until known.
+pub fn owner_display_name() -> String {
+    owner_label()
+}
+
 async fn ensure_diarization_models_with_timeout() -> Result<diarization::DiarizationModels> {
     tokio::time::timeout(Duration::from_secs(600), diarization::ensure_diarization_models(true))
         .await
         .context("Diarization model download timed out after 10 minutes")?
 }
 
-async fn transcribe_with_api(audio_path: &PathBuf, target: ApiTranscriptionTarget) -> Result<String> {
+async fn transcribe_with_api(audio_path: &PathBuf, target: ApiTranscriptionTarget) -> Result<ApiChunk> {
     let file_size = std::fs::metadata(audio_path)
         .context("Failed to read audio file metadata")?
         .len();
@@ -1019,9 +1205,10 @@ async fn transcribe_with_api(audio_path: &PathBuf, target: ApiTranscriptionTarge
     let duration_secs = get_audio_duration_secs(audio_path).unwrap_or(0.0);
     let num_chunks = plan_chunks(file_size, duration_secs);
     let client = api_client()?;
+    let timestamps = Arc::new(AtomicBool::new(true));
 
     if num_chunks <= 1 {
-        return transcribe_chunk_with_retry(&client, audio_path, &target, 0, 1).await;
+        return transcribe_chunk_with_retry(&client, audio_path, &target, &timestamps, 0, 1).await;
     }
 
     // Long or large file: split, transcribe chunks concurrently (bounded by a
@@ -1029,26 +1216,39 @@ async fn transcribe_with_api(audio_path: &PathBuf, target: ApiTranscriptionTarge
     let chunk_paths = split_audio_into_chunks(audio_path, duration_secs, num_chunks)?;
     let tmp_dir = chunk_paths.first().and_then(|p| p.parent()).map(Path::to_path_buf);
 
+    let chunk_secs = (duration_secs / num_chunks as f64) as f32;
     let target = Arc::new(target);
     let semaphore = Arc::new(tokio::sync::Semaphore::new(API_CHUNK_CONCURRENCY));
     let mut tasks = tokio::task::JoinSet::new();
     for (i, chunk_path) in chunk_paths.iter().cloned().enumerate() {
         let client = client.clone();
         let target = target.clone();
+        let timestamps = timestamps.clone();
         let semaphore = semaphore.clone();
         tasks.spawn(async move {
             let _permit = semaphore.acquire_owned().await;
-            let text =
-                transcribe_chunk_with_retry(&client, &chunk_path, &target, i, num_chunks).await;
-            (i, text)
+            let chunk = transcribe_chunk_with_retry(
+                &client,
+                &chunk_path,
+                &target,
+                &timestamps,
+                i,
+                num_chunks,
+            )
+            .await
+            .map(|mut c| {
+                offset_segments(&mut c, i as f32 * chunk_secs);
+                c
+            });
+            (i, chunk)
         });
     }
 
-    let mut transcripts: Vec<Option<String>> = vec![None; num_chunks];
+    let mut transcripts: Vec<Option<ApiChunk>> = vec![None; num_chunks];
     let mut first_error: Option<anyhow::Error> = None;
     while let Some(joined) = tasks.join_next().await {
         match joined {
-            Ok((i, Ok(text))) => transcripts[i] = Some(text),
+            Ok((i, Ok(chunk))) => transcripts[i] = Some(chunk),
             Ok((_, Err(e))) => {
                 if first_error.is_none() {
                     first_error = Some(e);
@@ -1071,11 +1271,20 @@ async fn transcribe_with_api(audio_path: &PathBuf, target: ApiTranscriptionTarge
     if let Some(e) = first_error {
         return Err(e);
     }
-    Ok(transcripts
-        .into_iter()
-        .map(|t| t.unwrap_or_default())
-        .collect::<Vec<_>>()
-        .join(" "))
+    // A host that dropped timestamps for some chunks cannot be labelled
+    // consistently: keep the text, drop the partial timing.
+    let chunks: Vec<ApiChunk> = transcripts.into_iter().map(|t| t.unwrap_or_default()).collect();
+    let all_timed = chunks.iter().all(|c| !c.segments.is_empty());
+    let all_worded = chunks.iter().all(|c| !c.words.is_empty());
+    let mut result = ApiChunk::default();
+    result.text = chunks.iter().map(|c| c.text.as_str()).collect::<Vec<_>>().join(" ");
+    if all_timed {
+        if all_worded {
+            result.words = chunks.iter().flat_map(|c| c.words.clone()).collect();
+        }
+        result.segments = chunks.into_iter().flat_map(|c| c.segments).collect();
+    }
+    Ok(result)
 }
 
 /// Unified transcription function.
@@ -1212,7 +1421,73 @@ pub async fn transcribe_audio(
             if let Some(task) = progress_task {
                 task.abort();
             }
-            (result, model_used)
+            let mut text = result.text;
+
+            // Speaker labelling is local either way: the host's timestamps
+            // place the words, the voice activity detector cuts the turns,
+            // and the same embeddings pipeline labels them.
+            if config.diarization.enabled && !result.segments.is_empty() {
+                if verbose {
+                    print!("\r{}\r", " ".repeat(80));
+                    println!("👥 Identifying speakers...");
+                }
+                let _stderr_guard = suppress_stderr();
+                let labelled = match ensure_mono_16k_wav(&audio_file_path) {
+                    Ok(wav_path) => {
+                        // Pauses in the audio cut the turns; the host's
+                        // words place the text and cover speech the
+                        // detector missed. Without a detector, words alone;
+                        // without words, the host's segments.
+                        let speech = match ensure_vad_model().await {
+                            Ok(vad) => speech_segments(&wav_path, &vad).ok(),
+                            Err(_) => None,
+                        };
+                        let units = match (speech, result.words.is_empty()) {
+                            (Some(speech), false) => {
+                                let units = diarization::units_from_speech_and_words(
+                                    &speech,
+                                    &result.words,
+                                );
+                                diarization::realign_to_speech(&units, &result.segments, &result.words)
+                            }
+                            (Some(speech), true) => {
+                                diarization::realign_to_speech(&speech, &result.segments, &[])
+                            }
+                            (None, false) => {
+                                let turns = diarization::turns_from_words(
+                                    &result.words,
+                                    diarization::WORD_TURN_GAP_SECS,
+                                );
+                                diarization::realign_to_speech(&turns, &result.segments, &result.words)
+                            }
+                            (None, true) => result.segments.clone(),
+                        };
+                        let r = diarize_local_transcript(
+                            &audio_file_path,
+                            &wav_path,
+                            &units,
+                            &config,
+                            verbose,
+                        )
+                        .await;
+                        let _ = std::fs::remove_file(&wav_path);
+                        r
+                    }
+                    Err(e) => Err(e),
+                };
+                match labelled {
+                    Ok(d) => {
+                        text = d.text.clone();
+                        diarized = Some(d);
+                    }
+                    Err(e) => {
+                        if verbose {
+                            println!("⚠️ Speaker identification skipped: {}", e);
+                        }
+                    }
+                }
+            }
+            (text, model_used)
         }
     };
 
@@ -1299,6 +1574,42 @@ mod api_chunking_tests {
         let plain = serde_json::json!({"text": "fallback"});
         assert_eq!(render_diarized(&plain).unwrap(), "fallback");
         assert!(render_diarized(&serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn verbose_json_segments_become_timed_transcript_segments() {
+        let body = serde_json::json!({
+            "text": "Hello there. How are you?",
+            "segments": [
+                {"start": 0.0, "end": 1.5, "text": " Hello there."},
+                {"start": 1.5, "end": 1.5, "text": "zero length"},
+                {"start": 1.6, "end": 3.0, "text": "   "},
+                {"start": 1.6, "end": 3.0, "text": "How are you?"}
+            ]
+        });
+        let mut chunk = parse_api_chunk(&body).unwrap();
+        assert_eq!(chunk.text, "Hello there. How are you?");
+        assert_eq!(chunk.segments.len(), 2);
+        assert_eq!(chunk.segments[0].text, "Hello there.");
+        offset_segments(&mut chunk, 600.0);
+        assert_eq!(chunk.segments[1].start, 601.6);
+
+        let worded = serde_json::json!({
+            "text": "Hi there",
+            "segments": [{"start": 0.0, "end": 1.0, "text": "Hi there"}],
+            "words": [{"word": "Hi", "start": 0.0, "end": 0.4}, {"word": "there", "start": 0.4, "end": 1.0}]
+        });
+        let mut chunk = parse_api_chunk(&worded).unwrap();
+        assert_eq!(chunk.words.len(), 2);
+        offset_segments(&mut chunk, 10.0);
+        assert_eq!(chunk.words[1].start, 10.4);
+
+        let plain = parse_api_chunk(&serde_json::json!({"text": "just text"})).unwrap();
+        assert_eq!(plain.text, "just text");
+        assert!(plain.segments.is_empty());
+        assert!(parse_api_chunk(&serde_json::json!({})).is_none());
+        assert!(is_bad_request(&anyhow::anyhow!("x request failed with status 400: bad")));
+        assert!(!is_bad_request(&anyhow::anyhow!("x request failed with status 500: boom")));
     }
 
     #[test]

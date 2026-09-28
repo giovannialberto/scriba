@@ -8,5 +8,5 @@
 mod models;
 mod repository;
 
-pub use models::{Entity, EntityMentionRecord, Recording, RecordingStats, Tag, Transcript};
+pub use models::{Entity, EntityMentionRecord, Recording, RecordingStats, SpeakerProfile, Tag, Transcript};
 pub use repository::Database;
