@@ -959,6 +959,57 @@ impl Dashboard {
         self.clamp_settings_selection();
     }
 
+    /// Point both cards at the Scriba Pro proxy without touching stored keys
+    /// for other hosts. Used by onboarding; Settings goes through the pickers.
+    pub(super) fn apply_pro_profile(&mut self) {
+        self.config.remember_stt_settings();
+        self.config.enrichment.remember_cloud_settings();
+        self.config.transcription = TranscriptionMode::Api {
+            api_key: String::new(),
+            base_url: crate::cloud::pro_speech_url(&self.config),
+            model: Some(crate::core::DEFAULT_TRANSCRIPTION_MODEL.to_string()),
+        };
+        self.config.enrichment.mode = EnrichmentMode::Cloud {
+            provider: CloudProvider::Anthropic,
+            api_key: String::new(),
+            model: None,
+            base_url: crate::cloud::pro_assistant_url(&self.config),
+        };
+        self.save_settings("Scriba Pro setup");
+    }
+
+    /// The onboarding sign-in succeeded: switch to the Pro profile when the
+    /// account is entitled, else send the user back to choose again.
+    pub(super) fn finish_pro_onboarding(&mut self) {
+        let entitled = crate::cloud::pro_available(&self.config);
+        if entitled {
+            self.apply_pro_profile();
+        }
+        let Some(ob) = self.onboarding.as_mut() else {
+            return;
+        };
+        ob.pro = None;
+        ob.anim_frame = 0;
+        if entitled {
+            ob.step = super::onboarding::OnboardingStep::AskName;
+            ob.set_step_text(
+                "You're signed in. Speech and the assistant now run\n\
+                 through your Scriba Pro account.\n\n\
+                 Scriba uses your name and role to better\n\
+                 understand your recordings.\n\n\
+                 What's your name?",
+                true,
+            );
+        } else {
+            ob.step = super::onboarding::OnboardingStep::ModeSelection;
+            ob.set_step_text(
+                "You're signed in, but this account has no Pro access yet.\n\
+                 Pick another setup for now; Settings lets you switch later.",
+                false,
+            );
+        }
+    }
+
     /// While speech or the assistant go through the proxy, keep a live access
     /// token in the process store, checking once a minute. A dead refresh
     /// token forgets the account so the UI says so.
@@ -2411,6 +2462,41 @@ mod tests {
             assistant_provider(&deepinfra_default),
             AssistantProvider::DeepInfra
         );
+    }
+
+    #[test]
+    fn pro_endpoints_are_their_own_provider_without_key_rows() {
+        let mut config = config_with(
+            TranscriptionMode::Api {
+                api_key: String::new(),
+                base_url: Some("https://proxy.example.com/openai/v1".into()),
+                model: None,
+            },
+            EnrichmentMode::Cloud {
+                provider: CloudProvider::Anthropic,
+                api_key: String::new(),
+                model: None,
+                base_url: Some("https://proxy.example.com/anthropic/v1".into()),
+            },
+        );
+        config.cloud.proxy_url = Some("https://proxy.example.com".into());
+        crate::cloud::init(&config);
+        assert_eq!(speech_provider(&config), SpeechProvider::ScribaPro);
+        assert_eq!(assistant_provider(&config), AssistantProvider::ScribaPro);
+        assert_eq!(setup_badge(&config).1, "Scriba Pro");
+        let rows = settings_rows(&config);
+        assert!(!rows.contains(&Row::SpeechKey), "the session is the key");
+        assert!(!rows.contains(&Row::AssistantKey));
+        assert!(!rows.contains(&Row::SpeechEndpoint));
+        assert_eq!(config.transcription_host_display(), "Scriba Pro");
+        assert_eq!(config.enrichment.provider_display_name(), "Scriba Pro");
+        assert_eq!(config.stt_slot().as_deref(), Some("pro"));
+        assert_eq!(config.enrichment.current_slot().as_deref(), Some("pro"));
+        assert!(config.resolve_transcription_api_key().is_none(), "no session in tests");
+        // Without the proxy configured the same URLs are just a custom host.
+        config.cloud.proxy_url = None;
+        crate::cloud::init(&config);
+        assert_eq!(speech_provider(&config), SpeechProvider::Custom);
     }
 
     #[test]

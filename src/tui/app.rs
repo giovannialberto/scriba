@@ -318,7 +318,10 @@ impl Dashboard {
         // Check if onboarding is needed (no world.md exists)
         if !WorldContext::exists() {
             self.current_view = DashboardView::Onboarding;
-            self.onboarding = Some(OnboardingState::new());
+            let mut ob = OnboardingState::new();
+            ob.pro_offered = crate::cloud::is_configured(&self.config)
+                && crate::cloud::proxy_url(&self.config).is_some();
+            self.onboarding = Some(ob);
         } else {
             // Initialize chat context for global view
             self.load_entities().ok();
@@ -701,6 +704,13 @@ impl Dashboard {
                         OnboardingTickResult::SaveWhisperKey(key) => {
                             self.config.transcription = self.config.api_mode_with_key(key);
                             let _ = self.config.save();
+                        }
+                        OnboardingTickResult::CloudEvent(event) => {
+                            crate::cloud::apply_event(&mut self.config, &event);
+                            let _ = self.config.save();
+                            if matches!(event, crate::cloud::AccountEvent::SignedIn { .. }) {
+                                self.finish_pro_onboarding();
+                            }
                         }
                         OnboardingTickResult::FetchOllamaModels => {
                             let endpoint = self.config.enrichment.ollama_endpoint();

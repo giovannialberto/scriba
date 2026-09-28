@@ -41,7 +41,7 @@ src/
     chat_prompts.rs    Chat system prompts (agent + fallback)
   agent/               Agent loop with tool use (any provider via llm/)
     provider.rs        AgentProvider trait + factory
-  cloud/               Scriba Pro account (closed beta): Supabase email-code sign-in, entitlements, beta request; refresh token in a user-only file under ~/scriba_recordings/.secrets/ (secrets.rs; no OS keychain, it prompts on every unsigned rebuild); project URL/anon key constants in mod.rs, overridable via SCRIBA_SUPABASE_URL/_ANON_KEY
+  cloud/               Scriba Pro account (closed beta): Supabase email-code sign-in, entitlements, beta request; refresh token in a user-only file under ~/scriba_recordings/.secrets/ (secrets.rs; no OS keychain, it prompts on every unsigned rebuild); project URL/anon key/proxy URL constants in mod.rs, overridable via SCRIBA_SUPABASE_URL/_ANON_KEY/SCRIBA_PRO_PROXY_URL. Endpoints under the proxy (`{proxy}/openai/v1`, `{proxy}/anthropic/v1`) use the session access token as the API key (process-wide store, refreshed by the TUI once a minute and by workflows before model calls)
   entities/            Entity registry and linking (LLM-driven, no fuzzy matching)
   tui/                 Terminal UI (ratatui)
     app.rs             Main dashboard, navigation, key handling
