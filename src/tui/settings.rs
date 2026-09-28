@@ -30,8 +30,6 @@ use crate::llm::{self, LlmTarget, ModelListEntry, Protocol};
 
 /// Label column width. Labels are fixed and short; provider names live in the value column.
 const LABEL_WIDTH: usize = 14;
-/// One line under the SCRIBA PRO header while signed out.
-const PRO_INTRO: &str = "Hosted Scriba \u{00B7} account, cloud models without API keys, backups, calendar \u{00B7} closed beta";
 /// Rows shown in a picker before it scrolls.
 const PICKER_VISIBLE: usize = 9;
 /// Pickers longer than this show the type-to-filter line up front.
@@ -1562,12 +1560,6 @@ impl Dashboard {
                         Span::raw("  "),
                         Span::styled(section, section_style),
                     ]));
-                    if row == Row::RequestAccess {
-                        lines.push(Line::from(Span::styled(
-                            format!("  {}", fit(PRO_INTRO, width.saturating_sub(2))),
-                            hint_style,
-                        )));
-                    }
                 }
                 last_section = row.section();
             }
@@ -2089,7 +2081,7 @@ impl Dashboard {
                 ),
                 None => (
                     "Request".to_string(),
-                    "leave your email".to_string(),
+                    "hosted Scriba, closed beta \u{00B7} models without API keys, backups, calendar".to_string(),
                     DetailTone::Neutral,
                     "\u{2190} Enter to request access",
                     false,
