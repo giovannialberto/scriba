@@ -122,7 +122,7 @@ fn known_proxy_url() -> Option<String> {
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| PRO_PROXY_URL.to_string());
     let url = url.trim().trim_end_matches('/');
-    (!url.is_empty()).then(|| url.to_string())
+    (!url.is_empty() && is_safe_endpoint(url)).then(|| url.to_string())
 }
 
 /// Whether `url` points at the Scriba Pro proxy, meaning the session token
@@ -176,6 +176,13 @@ pub async fn ensure_session(config: &ScribaConfig) -> Result<(), CloudError> {
             "Scriba Pro is not configured in this build".into(),
         ));
     };
+    // Another caller may have refreshed while this one waited for the lock.
+    {
+        let _guard = refresh_lock().lock().await;
+        if token_is_fresh() {
+            return Ok(());
+        }
+    }
     match resume_session(&client).await {
         Ok(_) => Ok(()),
         Err(CloudError::SessionExpired) => {
@@ -390,8 +397,16 @@ pub async fn verify_code(
     })
 }
 
+/// Refreshes rotate the stored token, so two at once would invalidate each
+/// other's result. One at a time, process-wide.
+fn refresh_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 /// Get a live session from the stored refresh token, rotating it.
 pub async fn resume_session(client: &SupabaseClient) -> Result<Session, CloudError> {
+    let _guard = refresh_lock().lock().await;
     let key = secrets::session_key(client.url());
     let token = secrets::load(&key)
         .map_err(|e| CloudError::Other(format!("could not read the session: {e:#}")))?

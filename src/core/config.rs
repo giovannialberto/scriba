@@ -50,7 +50,10 @@ pub const OPENAI_TRANSCRIPTION_MODELS: &[(&str, &str)] = &[
     ("gpt-4o-mini-transcribe", "GPT-4o mini transcribe"),
     ("gpt-4o-transcribe", "GPT-4o transcribe"),
     ("gpt-transcribe", "GPT transcribe"),
-    ("gpt-4o-transcribe-diarize", "GPT-4o transcribe with speaker labels"),
+    (
+        "gpt-4o-transcribe-diarize",
+        "GPT-4o transcribe with speaker labels",
+    ),
 ];
 
 /// A known host for OpenAI-compatible speech-to-text.
@@ -192,7 +195,10 @@ impl std::str::FromStr for LocalModel {
             "turbo" | "whisperturbo" => Ok(LocalModel::WhisperTurbo),
             "sensevoice" => Ok(LocalModel::SenseVoice),
             "parakeet" | "parakeettdt" => Ok(LocalModel::ParakeetTdt),
-            _ => Err(anyhow::anyhow!("Invalid model: {}. Use: tiny, base, small, medium, large, turbo, sensevoice, parakeet", s)),
+            _ => Err(anyhow::anyhow!(
+                "Invalid model: {}. Use: tiny, base, small, medium, large, turbo, sensevoice, parakeet",
+                s
+            )),
         }
     }
 }
@@ -533,21 +539,54 @@ impl CloudProvider {
     pub fn available_models(&self) -> Vec<ModelDef> {
         match self {
             CloudProvider::Anthropic => vec![
-                ModelDef { display_name: "Claude Opus 4.6".into(), model_id: "claude-opus-4-6".into() },
-                ModelDef { display_name: "Claude Sonnet 4.6".into(), model_id: "claude-sonnet-4-6".into() },
-                ModelDef { display_name: "Claude Haiku 4.5".into(), model_id: "claude-haiku-4-5-20251001".into() },
+                ModelDef {
+                    display_name: "Claude Opus 4.6".into(),
+                    model_id: "claude-opus-4-6".into(),
+                },
+                ModelDef {
+                    display_name: "Claude Sonnet 4.6".into(),
+                    model_id: "claude-sonnet-4-6".into(),
+                },
+                ModelDef {
+                    display_name: "Claude Haiku 4.5".into(),
+                    model_id: "claude-haiku-4-5-20251001".into(),
+                },
             ],
             CloudProvider::OpenAI => vec![
-                ModelDef { display_name: "GPT-5.2".into(), model_id: "gpt-5.2".into() },
-                ModelDef { display_name: "GPT-5.1 Mini".into(), model_id: "gpt-5.1-mini".into() },
-                ModelDef { display_name: "o3".into(), model_id: "o3".into() },
-                ModelDef { display_name: "o4-mini".into(), model_id: "o4-mini".into() },
+                ModelDef {
+                    display_name: "GPT-5.2".into(),
+                    model_id: "gpt-5.2".into(),
+                },
+                ModelDef {
+                    display_name: "GPT-5.1 Mini".into(),
+                    model_id: "gpt-5.1-mini".into(),
+                },
+                ModelDef {
+                    display_name: "o3".into(),
+                    model_id: "o3".into(),
+                },
+                ModelDef {
+                    display_name: "o4-mini".into(),
+                    model_id: "o4-mini".into(),
+                },
             ],
             CloudProvider::Google => vec![
-                ModelDef { display_name: "Gemini 2.5 Pro".into(), model_id: "gemini-2.5-pro".into() },
-                ModelDef { display_name: "Gemini 2.5 Flash".into(), model_id: "gemini-2.5-flash".into() },
-                ModelDef { display_name: "Gemini 2.5 Flash-Lite".into(), model_id: "gemini-2.5-flash-lite".into() },
-                ModelDef { display_name: "Gemini 3.1 Pro Preview".into(), model_id: "gemini-3.1-pro-preview".into() },
+                ModelDef {
+                    display_name: "Gemini 2.5 Pro".into(),
+                    model_id: "gemini-2.5-pro".into(),
+                },
+                ModelDef {
+                    display_name: "Gemini 2.5 Flash".into(),
+                    model_id: "gemini-2.5-flash".into(),
+                },
+                ModelDef {
+                    display_name: "Gemini 2.5 Flash-Lite".into(),
+                    model_id: "gemini-2.5-flash-lite".into(),
+                },
+                ModelDef {
+                    display_name: "Gemini 3.1 Pro Preview".into(),
+                    model_id: "gemini-3.1-pro-preview".into(),
+                },
             ],
             // Model catalogs differ per host; the UI lists them live from `{base_url}/models`.
             CloudProvider::OpenAICompatible => vec![],
@@ -752,7 +791,10 @@ impl EnrichmentConfig {
         // If legacy fields are present and mode is the default Cloud with empty key,
         // this was an old config — convert to Local mode.
         if let Some(endpoint) = self.ollama_endpoint.take() {
-            let model = self.ollama_model.take().unwrap_or_else(|| DEFAULT_OLLAMA_MODEL.to_string());
+            let model = self
+                .ollama_model
+                .take()
+                .unwrap_or_else(|| DEFAULT_OLLAMA_MODEL.to_string());
             // Only migrate if mode looks like the default (empty cloud key)
             if matches!(&self.mode, EnrichmentMode::Cloud { api_key, .. } if api_key.is_empty()) {
                 self.mode = EnrichmentMode::Local {
@@ -767,9 +809,13 @@ impl EnrichmentConfig {
         // to the correct provider instead of being carried to the wrong one on
         // the first provider cycle.
         if self.cloud_api_keys.is_empty() {
-            if let EnrichmentMode::Cloud { provider, api_key, .. } = &self.mode {
+            if let EnrichmentMode::Cloud {
+                provider, api_key, ..
+            } = &self.mode
+            {
                 if !api_key.is_empty() {
-                    self.cloud_api_keys.insert(provider.to_string(), api_key.clone());
+                    self.cloud_api_keys
+                        .insert(provider.to_string(), api_key.clone());
                 }
             }
         }
@@ -797,16 +843,22 @@ impl EnrichmentConfig {
     /// Slot of the current cloud configuration, if any.
     pub fn current_slot(&self) -> Option<String> {
         match &self.mode {
-            EnrichmentMode::Cloud { provider, base_url, .. } => {
-                Some(Self::provider_slot(provider, base_url.as_deref()))
-            }
+            EnrichmentMode::Cloud {
+                provider, base_url, ..
+            } => Some(Self::provider_slot(provider, base_url.as_deref())),
             EnrichmentMode::Local { .. } => None,
         }
     }
 
     /// Remember the current cloud key, model and endpoint under their slot.
     pub fn remember_cloud_settings(&mut self) {
-        if let EnrichmentMode::Cloud { provider, api_key, model, base_url } = self.mode.clone() {
+        if let EnrichmentMode::Cloud {
+            provider,
+            api_key,
+            model,
+            base_url,
+        } = self.mode.clone()
+        {
             let slot = Self::provider_slot(&provider, base_url.as_deref());
             self.save_key_for_slot(&slot, &api_key);
             self.save_model_for_slot(&slot, &model);
@@ -820,7 +872,8 @@ impl EnrichmentConfig {
         if key.trim().is_empty() {
             self.cloud_api_keys.remove(slot);
         } else {
-            self.cloud_api_keys.insert(slot.to_string(), key.trim().to_string());
+            self.cloud_api_keys
+                .insert(slot.to_string(), key.trim().to_string());
         }
     }
 
@@ -829,7 +882,13 @@ impl EnrichmentConfig {
     pub fn load_key_for_slot(&self, slot: &str) -> String {
         self.cloud_api_keys
             .get(slot)
-            .or_else(|| if slot != "custom" { self.cloud_api_keys.get("custom") } else { None })
+            .or_else(|| {
+                if slot != "custom" {
+                    self.cloud_api_keys.get("custom")
+                } else {
+                    None
+                }
+            })
             .cloned()
             .unwrap_or_default()
     }
@@ -893,10 +952,15 @@ impl EnrichmentConfig {
     }
 
     /// Save a base URL for a specific provider into the per-provider map.
-    pub fn save_base_url_for_provider(&mut self, provider: &CloudProvider, base_url: &Option<String>) {
+    pub fn save_base_url_for_provider(
+        &mut self,
+        provider: &CloudProvider,
+        base_url: &Option<String>,
+    ) {
         match base_url.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
             Some(u) => {
-                self.cloud_base_urls.insert(provider.to_string(), u.to_string());
+                self.cloud_base_urls
+                    .insert(provider.to_string(), u.to_string());
             }
             None => {
                 self.cloud_base_urls.remove(&provider.to_string());
@@ -912,7 +976,9 @@ impl EnrichmentConfig {
     /// Explicitly configured base URL, if any.
     pub fn base_url(&self) -> Option<&str> {
         match &self.mode {
-            EnrichmentMode::Cloud { base_url: Some(u), .. } if !u.trim().is_empty() => Some(u.trim()),
+            EnrichmentMode::Cloud {
+                base_url: Some(u), ..
+            } if !u.trim().is_empty() => Some(u.trim()),
             _ => None,
         }
     }
@@ -935,7 +1001,9 @@ impl EnrichmentConfig {
     /// Set the base URL (only effective in Cloud mode). Empty clears it.
     pub fn set_base_url(&mut self, url: Option<String>) {
         if let EnrichmentMode::Cloud { base_url, .. } = &mut self.mode {
-            *base_url = url.map(|u| u.trim().trim_end_matches('/').to_string()).filter(|u| !u.is_empty());
+            *base_url = url
+                .map(|u| u.trim().trim_end_matches('/').to_string())
+                .filter(|u| !u.is_empty());
         }
     }
 
@@ -954,7 +1022,10 @@ impl EnrichmentConfig {
         match &self.mode {
             EnrichmentMode::Cloud { provider, .. } => {
                 if provider.uses_custom_endpoint()
-                    && let Some(preset) = self.effective_base_url().as_deref().and_then(EndpointPreset::for_url)
+                    && let Some(preset) = self
+                        .effective_base_url()
+                        .as_deref()
+                        .and_then(EndpointPreset::for_url)
                 {
                     return Some(preset.env_var.to_string());
                 }
@@ -972,9 +1043,20 @@ impl EnrichmentConfig {
         }
     }
 
-    /// Whether assistant calls go through the Scriba Pro proxy.
+    /// Whether assistant calls go through the Scriba Pro proxy. Only the
+    /// Anthropic adapter is wired to the proxy, so other providers pointed
+    /// at it are treated as a custom host and never receive the session.
     pub fn is_pro(&self) -> bool {
-        self.base_url().map(crate::cloud::is_pro_url).unwrap_or(false)
+        matches!(
+            &self.mode,
+            EnrichmentMode::Cloud {
+                provider: CloudProvider::Anthropic,
+                ..
+            }
+        ) && self
+            .base_url()
+            .map(crate::cloud::is_pro_url)
+            .unwrap_or(false)
     }
 
     /// Get the provider display name. For OpenAI-compatible endpoints this
@@ -984,12 +1066,14 @@ impl EnrichmentConfig {
             return "Scriba Pro".to_string();
         }
         match &self.mode {
-            EnrichmentMode::Cloud { provider, .. } if provider.uses_custom_endpoint() => {
-                match self.effective_base_url().as_deref().and_then(EndpointPreset::for_url) {
-                    Some(preset) => format!("{} (OpenAI-compatible)", preset.display),
-                    None => provider.display_name().to_string(),
-                }
-            }
+            EnrichmentMode::Cloud { provider, .. } if provider.uses_custom_endpoint() => match self
+                .effective_base_url()
+                .as_deref()
+                .and_then(EndpointPreset::for_url)
+            {
+                Some(preset) => format!("{} (OpenAI-compatible)", preset.display),
+                None => provider.display_name().to_string(),
+            },
             EnrichmentMode::Cloud { provider, .. } => provider.display_name().to_string(),
             EnrichmentMode::Local { .. } => "Ollama (Local)".to_string(),
         }
@@ -1030,9 +1114,9 @@ impl EnrichmentConfig {
     /// Get the model name in use (explicit or provider default).
     pub fn model_name(&self) -> &str {
         match &self.mode {
-            EnrichmentMode::Cloud { provider, model, .. } => {
-                model.as_deref().unwrap_or_else(|| provider.default_model())
-            }
+            EnrichmentMode::Cloud {
+                provider, model, ..
+            } => model.as_deref().unwrap_or_else(|| provider.default_model()),
             EnrichmentMode::Local { ollama_model, .. } => ollama_model,
         }
     }
@@ -1046,7 +1130,9 @@ impl EnrichmentConfig {
     /// Returns a default if not in Local mode.
     pub fn ollama_endpoint(&self) -> String {
         match &self.mode {
-            EnrichmentMode::Local { ollama_endpoint, .. } => ollama_endpoint.clone(),
+            EnrichmentMode::Local {
+                ollama_endpoint, ..
+            } => ollama_endpoint.clone(),
             _ => DEFAULT_OLLAMA_ENDPOINT.to_string(),
         }
     }
@@ -1069,7 +1155,10 @@ impl EnrichmentConfig {
 
     /// Set the Ollama endpoint (only effective in Local mode).
     pub fn set_ollama_endpoint(&mut self, endpoint: String) {
-        if let EnrichmentMode::Local { ollama_endpoint, .. } = &mut self.mode {
+        if let EnrichmentMode::Local {
+            ollama_endpoint, ..
+        } = &mut self.mode
+        {
             *ollama_endpoint = endpoint;
         }
     }
@@ -1172,7 +1261,8 @@ impl ScribaConfig {
         }
 
         let content = fs::read_to_string(&config_path).context("Failed to read config file")?;
-        let mut config: Self = serde_json::from_str(&content).context("Failed to parse config file")?;
+        let mut config: Self =
+            serde_json::from_str(&content).context("Failed to parse config file")?;
 
         // Migrate legacy enrichment config (ollama_endpoint/ollama_model fields → EnrichmentMode::Local)
         config.enrichment.migrate_legacy();
@@ -1197,7 +1287,12 @@ impl ScribaConfig {
     /// Set the transcription mode and save.
     pub fn set_transcription_mode(&mut self, mode: TranscriptionMode) -> Result<()> {
         // Save current API settings if switching away from API mode
-        if let TranscriptionMode::Api { api_key, base_url, model } = &self.transcription {
+        if let TranscriptionMode::Api {
+            api_key,
+            base_url,
+            model,
+        } = &self.transcription
+        {
             if !api_key.is_empty() {
                 self.last_api_key = Some(api_key.clone());
             }
@@ -1229,9 +1324,9 @@ impl ScribaConfig {
     /// Effective cloud transcription API root.
     pub fn transcription_base_url(&self) -> String {
         match &self.transcription {
-            TranscriptionMode::Api { base_url: Some(u), .. } if !u.trim().is_empty() => {
-                u.trim().trim_end_matches('/').to_string()
-            }
+            TranscriptionMode::Api {
+                base_url: Some(u), ..
+            } if !u.trim().is_empty() => u.trim().trim_end_matches('/').to_string(),
             _ => DEFAULT_TRANSCRIPTION_BASE_URL.to_string(),
         }
     }
@@ -1239,7 +1334,9 @@ impl ScribaConfig {
     /// Effective cloud transcription model.
     pub fn transcription_model(&self) -> String {
         match &self.transcription {
-            TranscriptionMode::Api { model: Some(m), .. } if !m.trim().is_empty() => m.trim().to_string(),
+            TranscriptionMode::Api { model: Some(m), .. } if !m.trim().is_empty() => {
+                m.trim().to_string()
+            }
             _ => DEFAULT_TRANSCRIPTION_MODEL.to_string(),
         }
     }
@@ -1265,7 +1362,9 @@ impl ScribaConfig {
             return crate::cloud::access_token();
         }
         match &self.transcription {
-            TranscriptionMode::Api { api_key, .. } if !api_key.trim().is_empty() => Some(api_key.clone()),
+            TranscriptionMode::Api { api_key, .. } if !api_key.trim().is_empty() => {
+                Some(api_key.clone())
+            }
             TranscriptionMode::Api { .. } => std::env::var(self.transcription_api_key_env())
                 .ok()
                 .filter(|k| !k.trim().is_empty()),
@@ -1294,7 +1393,9 @@ impl ScribaConfig {
     pub fn stt_slot(&self) -> Option<String> {
         match &self.transcription {
             TranscriptionMode::Local { .. } => None,
-            TranscriptionMode::Api { .. } => Some(Self::stt_slot_for_url(&self.transcription_base_url())),
+            TranscriptionMode::Api { .. } => {
+                Some(Self::stt_slot_for_url(&self.transcription_base_url()))
+            }
         }
     }
 
@@ -1311,7 +1412,12 @@ impl ScribaConfig {
     /// Remember the current cloud transcription key, model and custom endpoint
     /// under their host slot so switching hosts never loses them.
     pub fn remember_stt_settings(&mut self) {
-        if let TranscriptionMode::Api { api_key, model, base_url } = &self.transcription {
+        if let TranscriptionMode::Api {
+            api_key,
+            model,
+            base_url,
+        } = &self.transcription
+        {
             let slot = Self::stt_slot_for_url(&self.transcription_base_url());
             if api_key.trim().is_empty() {
                 self.stt_api_keys.remove(&slot);
@@ -1334,7 +1440,10 @@ impl ScribaConfig {
 
     /// Stored transcription key for a host slot.
     pub fn stt_key_for_slot(&self, slot: &str) -> Option<String> {
-        self.stt_api_keys.get(slot).cloned().filter(|k| !k.is_empty())
+        self.stt_api_keys
+            .get(slot)
+            .cloned()
+            .filter(|k| !k.is_empty())
     }
 
     /// Stored transcription model for a host slot.
@@ -1345,13 +1454,19 @@ impl ScribaConfig {
     /// API mode with `key`, keeping the configured (or last used) endpoint and model.
     pub fn api_mode_with_key(&self, key: String) -> TranscriptionMode {
         let (base_url, model) = match &self.transcription {
-            TranscriptionMode::Api { base_url, model, .. } => (base_url.clone(), model.clone()),
+            TranscriptionMode::Api {
+                base_url, model, ..
+            } => (base_url.clone(), model.clone()),
             TranscriptionMode::Local { .. } => (
                 self.last_transcription_base_url.clone(),
                 self.last_transcription_model.clone(),
             ),
         };
-        TranscriptionMode::Api { api_key: key, base_url, model }
+        TranscriptionMode::Api {
+            api_key: key,
+            base_url,
+            model,
+        }
     }
 
     /// Set the cloud transcription endpoint (only effective in API mode; empty clears).
@@ -1366,7 +1481,9 @@ impl ScribaConfig {
     /// Set the cloud transcription model (only effective in API mode; empty clears).
     pub fn set_transcription_model(&mut self, model: Option<String>) {
         if let TranscriptionMode::Api { model: m, .. } = &mut self.transcription {
-            *m = model.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+            *m = model
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty());
         }
     }
 
@@ -1432,15 +1549,24 @@ mod tests {
     fn transcription_defaults_and_overrides() {
         let mut config = ScribaConfig::default();
         config.transcription = TranscriptionMode::api("sk-openai");
-        assert_eq!(config.transcription_base_url(), DEFAULT_TRANSCRIPTION_BASE_URL);
+        assert_eq!(
+            config.transcription_base_url(),
+            DEFAULT_TRANSCRIPTION_BASE_URL
+        );
         assert_eq!(config.transcription_model(), DEFAULT_TRANSCRIPTION_MODEL);
         assert_eq!(config.transcription_host_display(), "OpenAI");
         assert_eq!(config.transcription_api_key_env(), "OPENAI_API_KEY");
-        assert_eq!(config.resolve_transcription_api_key().as_deref(), Some("sk-openai"));
+        assert_eq!(
+            config.resolve_transcription_api_key().as_deref(),
+            Some("sk-openai")
+        );
 
         config.set_transcription_base_url(Some("https://api.groq.com/openai/v1/".into()));
         config.set_transcription_model(Some(" whisper-large-v3-turbo ".into()));
-        assert_eq!(config.transcription_base_url(), "https://api.groq.com/openai/v1");
+        assert_eq!(
+            config.transcription_base_url(),
+            "https://api.groq.com/openai/v1"
+        );
         assert_eq!(config.transcription_model(), "whisper-large-v3-turbo");
         assert_eq!(config.transcription_host_display(), "Groq");
         assert_eq!(config.transcription_api_key_env(), "GROQ_API_KEY");
@@ -1462,14 +1588,23 @@ mod tests {
             model: Some("whisper-large-v3-turbo".into()),
         };
         // Switching to Local must remember the endpoint/model (without saving to disk).
-        if let TranscriptionMode::Api { base_url, model, .. } = &config.transcription {
+        if let TranscriptionMode::Api {
+            base_url, model, ..
+        } = &config.transcription
+        {
             config.last_transcription_base_url = base_url.clone();
             config.last_transcription_model = model.clone();
         }
-        config.transcription = TranscriptionMode::Local { model: LocalModel::ParakeetTdt };
+        config.transcription = TranscriptionMode::Local {
+            model: LocalModel::ParakeetTdt,
+        };
         let restored = config.api_mode_with_key("k2".into());
         match restored {
-            TranscriptionMode::Api { api_key, base_url, model } => {
+            TranscriptionMode::Api {
+                api_key,
+                base_url,
+                model,
+            } => {
                 assert_eq!(api_key, "k2");
                 assert_eq!(base_url.as_deref(), Some("https://api.groq.com/openai/v1"));
                 assert_eq!(model.as_deref(), Some("whisper-large-v3-turbo"));
@@ -1482,30 +1617,62 @@ mod tests {
     fn legacy_api_transcription_config_deserializes() {
         let json = r#"{"Api":{"api_key":"sk"}}"#;
         let mode: TranscriptionMode = serde_json::from_str(json).unwrap();
-        assert!(matches!(mode, TranscriptionMode::Api { base_url: None, model: None, .. }));
-        assert_eq!(TranscriptionPreset::by_name("Groq").unwrap().model, "whisper-large-v3");
+        assert!(matches!(
+            mode,
+            TranscriptionMode::Api {
+                base_url: None,
+                model: None,
+                ..
+            }
+        ));
+        assert_eq!(
+            TranscriptionPreset::by_name("Groq").unwrap().model,
+            "whisper-large-v3"
+        );
         assert!(TranscriptionPreset::for_url("https://api.deepinfra.com/v1/openai/").is_some());
     }
 
     #[test]
     fn slots_keep_compatible_hosts_apart() {
-        assert_eq!(EnrichmentConfig::provider_slot(&CloudProvider::Anthropic, None), "anthropic");
         assert_eq!(
-            EnrichmentConfig::provider_slot(&CloudProvider::OpenAICompatible, Some("https://api.groq.com/openai/v1")),
+            EnrichmentConfig::provider_slot(&CloudProvider::Anthropic, None),
+            "anthropic"
+        );
+        assert_eq!(
+            EnrichmentConfig::provider_slot(
+                &CloudProvider::OpenAICompatible,
+                Some("https://api.groq.com/openai/v1")
+            ),
             "groq"
         );
-        assert_eq!(EnrichmentConfig::provider_slot(&CloudProvider::OpenAICompatible, None), "deepinfra");
         assert_eq!(
-            EnrichmentConfig::provider_slot(&CloudProvider::OpenAICompatible, Some("http://box:8000/v1")),
+            EnrichmentConfig::provider_slot(&CloudProvider::OpenAICompatible, None),
+            "deepinfra"
+        );
+        assert_eq!(
+            EnrichmentConfig::provider_slot(
+                &CloudProvider::OpenAICompatible,
+                Some("http://box:8000/v1")
+            ),
             "custom"
         );
         let mut e = EnrichmentConfig::default();
         e.save_key_for_slot("custom", "old-shared-key");
-        assert_eq!(e.load_key_for_slot("groq"), "old-shared-key", "legacy shared slot is a fallback");
+        assert_eq!(
+            e.load_key_for_slot("groq"),
+            "old-shared-key",
+            "legacy shared slot is a fallback"
+        );
         e.save_key_for_slot("groq", "gsk");
         assert_eq!(e.load_key_for_slot("groq"), "gsk");
-        assert_eq!(ScribaConfig::stt_slot_for_url("https://api.deepinfra.com/v1/openai"), "deepinfra");
-        assert_eq!(ScribaConfig::stt_slot_for_url("http://stt.local/v1"), "custom");
+        assert_eq!(
+            ScribaConfig::stt_slot_for_url("https://api.deepinfra.com/v1/openai"),
+            "deepinfra"
+        );
+        assert_eq!(
+            ScribaConfig::stt_slot_for_url("http://stt.local/v1"),
+            "custom"
+        );
     }
 
     #[test]
@@ -1520,16 +1687,31 @@ mod tests {
         config.remember_stt_settings();
         assert_eq!(config.stt_slot().as_deref(), Some("groq"));
         assert_eq!(config.stt_key_for_slot("groq").as_deref(), Some("gsk"));
-        assert_eq!(config.stt_model_for_slot("groq").as_deref(), Some("whisper-large-v3-turbo"));
+        assert_eq!(
+            config.stt_model_for_slot("groq").as_deref(),
+            Some("whisper-large-v3-turbo")
+        );
         assert!(config.stt_key_for_slot("openai").is_none());
     }
 
     #[test]
     fn provider_names_parse() {
-        assert_eq!("claude".parse::<CloudProvider>().unwrap(), CloudProvider::Anthropic);
-        assert_eq!("custom".parse::<CloudProvider>().unwrap(), CloudProvider::OpenAICompatible);
-        assert_eq!("DeepInfra".parse::<CloudProvider>().unwrap(), CloudProvider::OpenAICompatible);
-        assert_eq!("groq".parse::<CloudProvider>().unwrap(), CloudProvider::OpenAICompatible);
+        assert_eq!(
+            "claude".parse::<CloudProvider>().unwrap(),
+            CloudProvider::Anthropic
+        );
+        assert_eq!(
+            "custom".parse::<CloudProvider>().unwrap(),
+            CloudProvider::OpenAICompatible
+        );
+        assert_eq!(
+            "DeepInfra".parse::<CloudProvider>().unwrap(),
+            CloudProvider::OpenAICompatible
+        );
+        assert_eq!(
+            "groq".parse::<CloudProvider>().unwrap(),
+            CloudProvider::OpenAICompatible
+        );
         assert!("nope".parse::<CloudProvider>().is_err());
     }
 
@@ -1547,24 +1729,52 @@ mod tests {
 
     #[test]
     fn presets_match_urls_loosely() {
-        assert_eq!(EndpointPreset::for_url("https://api.deepinfra.com/v1/openai/").unwrap().name, "deepinfra");
-        assert_eq!(EndpointPreset::for_url("HTTPS://openrouter.ai/api/v1").unwrap().name, "openrouter");
+        assert_eq!(
+            EndpointPreset::for_url("https://api.deepinfra.com/v1/openai/")
+                .unwrap()
+                .name,
+            "deepinfra"
+        );
+        assert_eq!(
+            EndpointPreset::for_url("HTTPS://openrouter.ai/api/v1")
+                .unwrap()
+                .name,
+            "openrouter"
+        );
         assert!(EndpointPreset::for_url("http://localhost:8000/v1").is_none());
-        assert_eq!(EndpointPreset::by_name("Together").unwrap().base_url, "https://api.together.xyz/v1");
+        assert_eq!(
+            EndpointPreset::by_name("Together").unwrap().base_url,
+            "https://api.together.xyz/v1"
+        );
     }
 
     #[test]
     fn compatible_provider_defaults_and_env_var() {
         let config = cloud(CloudProvider::OpenAICompatible, None);
         assert!(config.has_custom_endpoint());
-        assert_eq!(config.effective_base_url().as_deref(), Some(DEFAULT_COMPATIBLE_BASE_URL));
-        assert_eq!(config.api_key_env_var().as_deref(), Some("DEEPINFRA_API_KEY"));
-        assert_eq!(config.provider_display_name(), "DeepInfra (OpenAI-compatible)");
+        assert_eq!(
+            config.effective_base_url().as_deref(),
+            Some(DEFAULT_COMPATIBLE_BASE_URL)
+        );
+        assert_eq!(
+            config.api_key_env_var().as_deref(),
+            Some("DEEPINFRA_API_KEY")
+        );
+        assert_eq!(
+            config.provider_display_name(),
+            "DeepInfra (OpenAI-compatible)"
+        );
         assert_eq!(config.model_name(), DEFAULT_COMPATIBLE_MODEL);
 
-        let config = cloud(CloudProvider::OpenAICompatible, Some("http://localhost:8000/v1/"));
+        let config = cloud(
+            CloudProvider::OpenAICompatible,
+            Some("http://localhost:8000/v1/"),
+        );
         assert_eq!(config.base_url(), Some("http://localhost:8000/v1/"));
-        assert_eq!(config.api_key_env_var().as_deref(), Some("SCRIBA_LLM_API_KEY"));
+        assert_eq!(
+            config.api_key_env_var().as_deref(),
+            Some("SCRIBA_LLM_API_KEY")
+        );
         assert_eq!(config.provider_display_name(), "OpenAI-compatible");
     }
 
@@ -1573,7 +1783,10 @@ mod tests {
         let config = cloud(CloudProvider::Anthropic, None);
         assert!(!config.has_custom_endpoint());
         assert!(config.effective_base_url().is_none());
-        assert_eq!(config.api_key_env_var().as_deref(), Some("ANTHROPIC_API_KEY"));
+        assert_eq!(
+            config.api_key_env_var().as_deref(),
+            Some("ANTHROPIC_API_KEY")
+        );
         assert_eq!(config.provider_display_name(), "Anthropic (Claude)");
     }
 
@@ -1582,7 +1795,10 @@ mod tests {
         let mut config = cloud(CloudProvider::OpenAICompatible, None);
         config.set_base_url(Some("  https://openrouter.ai/api/v1/  ".to_string()));
         assert_eq!(config.base_url(), Some("https://openrouter.ai/api/v1"));
-        assert_eq!(config.provider_display_name(), "OpenRouter (OpenAI-compatible)");
+        assert_eq!(
+            config.provider_display_name(),
+            "OpenRouter (OpenAI-compatible)"
+        );
         config.set_base_url(Some("   ".to_string()));
         assert!(config.base_url().is_none());
     }
@@ -1592,7 +1808,10 @@ mod tests {
         let mut config = cloud(CloudProvider::OpenAICompatible, None);
         let p = CloudProvider::OpenAICompatible;
         config.save_base_url_for_provider(&p, &Some("http://box:8000/v1".to_string()));
-        assert_eq!(config.load_base_url_for_provider(&p).as_deref(), Some("http://box:8000/v1"));
+        assert_eq!(
+            config.load_base_url_for_provider(&p).as_deref(),
+            Some("http://box:8000/v1")
+        );
         config.save_base_url_for_provider(&p, &None);
         assert!(config.load_base_url_for_provider(&p).is_none());
     }
@@ -1601,7 +1820,10 @@ mod tests {
     fn legacy_cloud_config_without_base_url_deserializes() {
         let json = r#"{"enabled":true,"mode":{"Cloud":{"provider":"Anthropic","api_key":"k","model":null}},"auto_link_threshold":0.8}"#;
         let config: EnrichmentConfig = serde_json::from_str(json).unwrap();
-        assert!(matches!(config.mode, EnrichmentMode::Cloud { base_url: None, .. }));
+        assert!(matches!(
+            config.mode,
+            EnrichmentMode::Cloud { base_url: None, .. }
+        ));
         assert_eq!(config.api_key(), Some("k"));
     }
 }

@@ -471,9 +471,21 @@ impl GenaiProvider {
     /// Build a provider for a resolved target.
     pub fn new(target: LlmTarget) -> Self {
         let service_target = target.service_target();
-        let client = Client::builder()
-            .with_web_config(WebConfig::default().with_timeout(REQUEST_TIMEOUT))
-            .build();
+        // Credentials travel in headers reqwest does not strip on redirect
+        // (x-api-key), so never follow one: providers do not redirect.
+        let http = reqwest13::Client::builder()
+            .redirect(reqwest13::redirect::Policy::none())
+            .timeout(REQUEST_TIMEOUT)
+            .gzip(true)
+            .tcp_nodelay(true)
+            .build()
+            .ok();
+        let mut builder = Client::builder();
+        builder = match http {
+            Some(http) => builder.with_reqwest(http),
+            None => builder.with_web_config(WebConfig::default().with_timeout(REQUEST_TIMEOUT)),
+        };
+        let client = builder.build();
         Self {
             target,
             service_target,
