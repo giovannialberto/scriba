@@ -9,8 +9,14 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-/// The Supabase refresh token of the signed-in Scriba Pro account.
-pub const SESSION_TOKEN: &str = "cloud-session";
+/// Name under which the refresh token for `project_url` is stored. Keyed by
+/// the project so a token issued by one Supabase project is never sent to
+/// another (for instance after switching to a development override).
+pub fn session_key(project_url: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(project_url.trim().trim_end_matches('/').to_lowercase());
+    format!("cloud-session-{:x}", digest)[..28].to_string()
+}
 
 fn secrets_dir() -> Result<PathBuf> {
     let home = dirs::home_dir().context("Failed to get home directory")?;
@@ -104,6 +110,19 @@ mod tests {
         file_delete(&dir, "x").unwrap();
         assert_eq!(file_load(&dir, "x").unwrap(), None);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_keys_follow_the_project() {
+        let a = session_key("https://a.supabase.co");
+        assert_eq!(
+            a,
+            session_key("https://A.supabase.co/"),
+            "case and slash do not matter"
+        );
+        assert_ne!(a, session_key("https://b.supabase.co"));
+        assert!(a.starts_with("cloud-session-"));
+        assert!(!a.contains('/'));
     }
 
     #[cfg(unix)]

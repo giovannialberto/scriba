@@ -41,10 +41,24 @@ pub fn client_for(config: &ScribaConfig) -> Option<SupabaseClient> {
         .filter(|s| !s.trim().is_empty())
         .or_else(|| config.cloud.supabase_anon_key.clone())
         .unwrap_or_else(|| SUPABASE_ANON_KEY.to_string());
-    if url.trim().is_empty() || key.trim().is_empty() {
+    let url = url.trim();
+    if url.is_empty() || key.trim().is_empty() || !is_safe_endpoint(url) {
         return None;
     }
-    Some(SupabaseClient::new(url.trim(), key.trim()))
+    Some(SupabaseClient::new(url, key.trim()))
+}
+
+/// Tokens only travel over TLS, except to a local Supabase for development.
+fn is_safe_endpoint(url: &str) -> bool {
+    if url.starts_with("https://") {
+        return true;
+    }
+    url.strip_prefix("http://")
+        .map(|rest| {
+            let host = rest.split(['/', ':']).next().unwrap_or("");
+            host == "localhost" || host == "127.0.0.1" || host == "[::1]"
+        })
+        .unwrap_or(false)
 }
 
 /// Whether Scriba Pro is reachable at all from this build.
@@ -191,7 +205,7 @@ pub async fn verify_code(
 ) -> Result<AccountEvent, CloudError> {
     let email = normalize_email(email);
     let session = client.verify_code(&email, code.trim()).await?;
-    secrets::store(secrets::SESSION_TOKEN, &session.refresh_token)
+    secrets::store(&secrets::session_key(client.url()), &session.refresh_token)
         .map_err(|e| CloudError::Other(format!("could not store the session: {e:#}")))?;
     let entitlements = client
         .entitlements(&session.access_token)
@@ -210,11 +224,12 @@ pub async fn verify_code(
 
 /// Get a live session from the stored refresh token, rotating it.
 pub async fn resume_session(client: &SupabaseClient) -> Result<Session, CloudError> {
-    let token = secrets::load(secrets::SESSION_TOKEN)
+    let key = secrets::session_key(client.url());
+    let token = secrets::load(&key)
         .map_err(|e| CloudError::Other(format!("could not read the session: {e:#}")))?
         .ok_or(CloudError::SessionExpired)?;
     let session = client.refresh(&token).await?;
-    secrets::store(secrets::SESSION_TOKEN, &session.refresh_token)
+    secrets::store(&key, &session.refresh_token)
         .map_err(|e| CloudError::Other(format!("could not store the session: {e:#}")))?;
     Ok(session)
 }
@@ -231,7 +246,7 @@ pub async fn refresh_entitlements(client: &SupabaseClient) -> Result<AccountEven
             })
         }
         Err(CloudError::SessionExpired) => {
-            let _ = secrets::delete(secrets::SESSION_TOKEN);
+            let _ = secrets::delete(&secrets::session_key(client.url()));
             Ok(AccountEvent::SessionLost)
         }
         Err(e) => Err(e),
@@ -243,7 +258,7 @@ pub async fn sign_out(client: &SupabaseClient) -> Result<AccountEvent, CloudErro
     if let Ok(session) = resume_session(client).await {
         let _ = client.sign_out(&session.access_token).await;
     }
-    secrets::delete(secrets::SESSION_TOKEN)
+    secrets::delete(&secrets::session_key(client.url()))
         .map_err(|e| CloudError::Other(format!("could not forget the session: {e:#}")))?;
     Ok(AccountEvent::SignedOut)
 }
@@ -303,6 +318,23 @@ mod tests {
         assert!(
             config.cloud.beta_requested_at.is_some(),
             "the request survives sign-out"
+        );
+    }
+
+    #[test]
+    fn overrides_must_use_tls_unless_local() {
+        assert!(is_safe_endpoint("https://x.supabase.co"));
+        assert!(is_safe_endpoint("http://localhost:54321"));
+        assert!(is_safe_endpoint("http://127.0.0.1:54321/"));
+        assert!(!is_safe_endpoint("http://x.supabase.co"));
+        assert!(!is_safe_endpoint("http://localhost.evil.com"));
+        assert!(!is_safe_endpoint("ftp://x"));
+        let mut config = ScribaConfig::default();
+        config.cloud.supabase_url = Some("http://x.supabase.co".into());
+        config.cloud.supabase_anon_key = Some("anon".into());
+        assert!(
+            client_for(&config).is_none(),
+            "plain http override is ignored"
         );
     }
 
