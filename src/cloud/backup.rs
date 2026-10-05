@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -29,6 +30,10 @@ const AUDIO_EXTENSIONS: &[&str] = &[
 const TOP_LEVEL_FILES: &[&str] = &["world.md", "scriba_mcp.json"];
 /// Files per signing request.
 const BATCH: usize = 200;
+/// Parallel transfers to object storage.
+const PARALLEL: usize = 6;
+/// Files up to this size are sent as one in-memory body; larger ones stream.
+const BUFFERED_UPLOAD_MAX: u64 = 64 * 1024 * 1024;
 
 /// One entry of a manifest, local or remote.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -315,21 +320,23 @@ struct SignedDownload {
     url: String,
 }
 
-/// Client for the proxy's backup endpoints.
+/// Client for the proxy's backup endpoints and for the signed storage URLs.
+/// Uses the newer HTTP client (`reqwest13`): the crate's default one stalls
+/// on streamed request bodies.
 #[derive(Debug, Clone)]
 pub struct BackupApi {
     base: String,
-    http: reqwest::Client,
+    http: reqwest13::Client,
 }
 
 impl BackupApi {
     /// `None` when the proxy is not configured in this build.
     pub fn from_config(config: &ScribaConfig) -> Option<Self> {
         let proxy = proxy_url(config)?;
-        let http = reqwest::Client::builder()
+        let http = reqwest13::Client::builder()
             .timeout(Duration::from_secs(600))
             .connect_timeout(Duration::from_secs(20))
-            .redirect(reqwest::redirect::Policy::none())
+            .redirect(reqwest13::redirect::Policy::none())
             .build()
             .ok()?;
         Some(Self {
@@ -342,7 +349,7 @@ impl BackupApi {
         access_token().ok_or_else(|| CloudError::Other(SESSION_HINT.to_string()))
     }
 
-    async fn send(&self, req: reqwest::RequestBuilder) -> Result<(u16, String), CloudError> {
+    async fn send(&self, req: reqwest13::RequestBuilder) -> Result<(u16, String), CloudError> {
         let resp = req
             .bearer_auth(Self::token()?)
             .send()
@@ -453,13 +460,18 @@ impl BackupApi {
     }
 
     async fn put_file(&self, upload: &SignedUpload, source: &Path) -> Result<()> {
-        let file = tokio::fs::File::open(source).await?;
-        let len = file.metadata().await?.len();
+        let len = tokio::fs::metadata(source).await?.len();
+        let body = if len <= BUFFERED_UPLOAD_MAX {
+            reqwest13::Body::from(tokio::fs::read(source).await?)
+        } else {
+            let file = tokio::fs::File::open(source).await?;
+            reqwest13::Body::wrap_stream(tokio_util::io::ReaderStream::new(file))
+        };
         let mut req = self
             .http
             .put(&upload.url)
-            .header(reqwest::header::CONTENT_LENGTH, len)
-            .body(reqwest::Body::from(file));
+            .header(reqwest13::header::CONTENT_LENGTH, len)
+            .body(body);
         for (k, v) in &upload.headers {
             req = req.header(k.as_str(), v.as_str());
         }
@@ -544,15 +556,35 @@ async fn backup_scanned(
         let signed = api.uploads(&entries).await?;
         let by_hash: HashMap<&str, &SignedUpload> =
             signed.iter().map(|u| (u.sha256.as_str(), u)).collect();
-        for file in chunk {
-            if let Some(upload) = by_hash.get(file.sha256.as_str()) {
-                api.put_file(upload, &file.source)
-                    .await
-                    .with_context(|| format!("upload {}", file.path))?;
+        // Not signed means already stored: nothing to send for those. Each
+        // job owns its data so the futures carry no borrows.
+        let jobs: Vec<(String, PathBuf, u64, Option<SignedUpload>)> = chunk
+            .iter()
+            .map(|file| {
+                (
+                    file.path.clone(),
+                    file.source.clone(),
+                    file.size,
+                    by_hash.get(file.sha256.as_str()).map(|u| (*u).clone()),
+                )
+            })
+            .collect();
+        let mut transfers = futures_util::stream::iter(jobs.into_iter().map(|(path, source, size, upload)| {
+            let api = api.clone();
+            async move {
+                if let Some(upload) = upload {
+                    api.put_file(&upload, &source)
+                        .await
+                        .with_context(|| format!("upload {path}"))?;
+                }
+                Ok::<u64, anyhow::Error>(size)
             }
-            // Not signed means already stored: nothing to send.
+        }))
+        .buffer_unordered(PARALLEL);
+        while let Some(result) = transfers.next().await {
+            let size = result?;
             done += 1;
-            bytes_done += file.size;
+            bytes_done += size;
             progress(Progress::Transferring {
                 done,
                 total,
@@ -610,17 +642,29 @@ pub async fn run_restore(
         let signed = api.downloads(&hashes).await?;
         let by_hash: HashMap<&str, &SignedDownload> =
             signed.iter().map(|d| (d.sha256.as_str(), d)).collect();
+        let mut jobs: Vec<(String, PathBuf, String, String, u64)> = Vec::with_capacity(chunk.len());
         for file in chunk {
             let dest = restore_destination(base, &file.path)?;
             let url = by_hash
                 .get(file.sha256.as_str())
                 .map(|d| d.url.clone())
                 .ok_or_else(|| anyhow::anyhow!("no download for {}", file.path))?;
-            api.get_to_file(&url, &dest, &file.sha256)
-                .await
-                .with_context(|| format!("restore {}", file.path))?;
+            jobs.push((file.path.clone(), dest, url, file.sha256.clone(), file.size));
+        }
+        let mut transfers = futures_util::stream::iter(jobs.into_iter().map(|(path, dest, url, sha, size)| {
+            let api = api.clone();
+            async move {
+                api.get_to_file(&url, &dest, &sha)
+                    .await
+                    .with_context(|| format!("restore {path}"))?;
+                Ok::<u64, anyhow::Error>(size)
+            }
+        }))
+        .buffer_unordered(PARALLEL);
+        while let Some(result) = transfers.next().await {
+            let size = result?;
             done += 1;
-            bytes_done += file.size;
+            bytes_done += size;
             progress(Progress::Transferring {
                 done,
                 total,
