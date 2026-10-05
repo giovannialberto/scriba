@@ -368,9 +368,11 @@ pub async fn run_autopilot(
     let mut watcher = spawn_watcher(watcher_cfg.clone());
 
     // Set when an auto-recording ended on its own (silence fallback or error)
-    // before the meeting app released the mic: the next MeetingEnded should
-    // still notify. Never set after a manual stop from the TUI (#109).
-    let mut pending_end_notify = false;
+    // before the meeting app released the mic: the next MeetingEnded still
+    // closes this meeting (and ends a `--once` run). Never set after a manual
+    // stop from the TUI (#109). The end itself is silent: only the start of
+    // a meeting notifies.
+    let mut pending_end = false;
     // After a recording finishes, suppress new detections until this instant
     // (breaks feedback loops with other recording tools reacting to us).
     let mut cooldown_until: Option<tokio::time::Instant> = None;
@@ -409,9 +411,8 @@ pub async fn run_autopilot(
                         }
                     }
                     Some(MeetingEvent::MeetingEnded) => {
-                        if pending_end_notify {
-                            pending_end_notify = false;
-                            notify_event(MeetingEvent::MeetingEnded, true, None);
+                        if pending_end {
+                            pending_end = false;
                             if opts.once {
                                 break 'outer;
                             }
@@ -516,7 +517,6 @@ pub async fn run_autopilot(
 
         match decision {
             MeetingDecision::AlreadyEnded => {
-                notify_event(MeetingEvent::MeetingEnded, false, None);
                 if opts.once {
                     break;
                 }
@@ -645,9 +645,6 @@ pub async fn run_autopilot(
                     Some(MeetingEvent::MeetingEnded) => {
                         meeting_ended = true;
                         recording_guard.set_phase(RecordingPhase::Processing);
-                        // Notify right away — finalization (encode, DB,
-                        // transcription) can take a while.
-                        notify_event(MeetingEvent::MeetingEnded, true, None);
                         if verbose {
                             say!("📴 Meeting app released the mic — stopping recording.");
                         }
@@ -688,7 +685,7 @@ pub async fn run_autopilot(
             } else {
                 // The watcher is still tracking this meeting and only emits
                 // MeetingStarted again if the app drops and re-grabs the mic.
-                pending_end_notify = true;
+                pending_end = true;
             }
         } else {
             // The watcher was paused. Give our own just-closed stream a
@@ -697,7 +694,7 @@ pub async fn run_autopilot(
             if !user_stopped {
                 // The silence fallback (or an error) ended the recording while
                 // the meeting app still held the mic: poll for the release
-                // ourselves and announce it.
+                // ourselves so this meeting closes cleanly.
                 loop {
                     if !meeting_signal(&watcher_cfg).unwrap_or(false) {
                         break;
@@ -708,7 +705,6 @@ pub async fn run_autopilot(
                         _ = tokio::time::sleep(Duration::from_secs(1)) => {}
                     }
                 }
-                notify_event(MeetingEvent::MeetingEnded, true, None);
             }
             // After a manual stop there is nothing to announce (#109) and no
             // reason to sit here for the rest of the meeting: the respawned
@@ -738,10 +734,7 @@ async fn wait_for_meeting_end(
             biased;
             _ = wait_shutdown(shutdown) => return Ok(false),
             evt = watcher.events.recv() => match evt {
-                Some(MeetingEvent::MeetingEnded) => {
-                    notify_event(MeetingEvent::MeetingEnded, false, None);
-                    return Ok(true);
-                }
+                Some(MeetingEvent::MeetingEnded) => return Ok(true),
                 Some(_) => {}
                 None => {
                     let err = watcher_exit_error(watcher).await;
