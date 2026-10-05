@@ -737,7 +737,7 @@ async fn main() -> Result<()> {
                         eprintln!("Backups need a Scriba Pro account. Sign in from Settings first.");
                         std::process::exit(1);
                     }
-                    if let Err(e) = scriba::cloud::ensure_session(&config).await {
+                    if let Err(e) = scriba::cloud::ensure_account_session(&config).await {
                         eprintln!("Could not sign in: {e}");
                         std::process::exit(1);
                     }
@@ -776,7 +776,7 @@ async fn main() -> Result<()> {
                         eprintln!("Restore needs a Scriba Pro account. Sign in from Settings first.");
                         std::process::exit(1);
                     }
-                    if let Err(e) = scriba::cloud::ensure_session(&config).await {
+                    if let Err(e) = scriba::cloud::ensure_account_session(&config).await {
                         eprintln!("Could not sign in: {e}");
                         std::process::exit(1);
                     }

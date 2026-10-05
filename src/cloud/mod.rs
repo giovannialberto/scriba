@@ -169,7 +169,17 @@ pub fn pro_available(config: &ScribaConfig) -> bool {
 /// proxy. Cheap when the token is fresh. Errors are the caller's to report;
 /// a missing token then surfaces as a clear message at the model call.
 pub async fn ensure_session(config: &ScribaConfig) -> Result<(), CloudError> {
-    if !uses_pro(config) || token_is_fresh() {
+    if !uses_pro(config) {
+        return Ok(());
+    }
+    ensure_account_session(config).await
+}
+
+/// Like [`ensure_session`] but regardless of whether model calls use the
+/// proxy: backups and other account features need a token on their own.
+pub async fn ensure_account_session(config: &ScribaConfig) -> Result<(), CloudError> {
+    init(config);
+    if token_is_fresh() {
         return Ok(());
     }
     let Some(client) = client_for(config) else {

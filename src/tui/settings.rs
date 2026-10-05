@@ -1112,7 +1112,7 @@ impl Dashboard {
                 Some(api) => {
                     let config = self.config.clone();
                     ob.restore_check = Some(tokio::spawn(async move {
-                        crate::cloud::ensure_session(&config)
+                        crate::cloud::ensure_account_session(&config)
                             .await
                             .map_err(|e| e.to_string())?;
                         api.manifest().await.map_err(|e| e.to_string())
@@ -1157,7 +1157,7 @@ impl Dashboard {
         self.cloud_session_checked = Some(std::time::Instant::now());
         let config = self.config.clone();
         self.cloud_session_task = Some(tokio::spawn(async move {
-            crate::cloud::ensure_session(&config).await
+            crate::cloud::ensure_account_session(&config).await
         }));
     }
 
@@ -1200,7 +1200,7 @@ impl Dashboard {
         self.backup_progress = Some(crate::cloud::backup::Progress::Scanning);
         self.backup_error = None;
         self.backup_task = Some(tokio::spawn(async move {
-            crate::cloud::ensure_session(&config)
+            crate::cloud::ensure_account_session(&config)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             let report = crate::cloud::backup::run_backup(
@@ -1240,7 +1240,7 @@ impl Dashboard {
                 let config = self.config.clone();
                 self.backup_error = None;
                 self.backup_task = Some(tokio::spawn(async move {
-                    crate::cloud::ensure_session(&config)
+                    crate::cloud::ensure_account_session(&config)
                         .await
                         .map_err(|e| anyhow::anyhow!("{e}"))?;
                     api.delete_all().await.map_err(|e| anyhow::anyhow!("{e}"))?;

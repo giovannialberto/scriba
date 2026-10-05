@@ -1492,7 +1492,7 @@ impl Dashboard {
                         ob.restore_progress = Some(crate::cloud::backup::Progress::Scanning);
                         let config = self.config.clone();
                         ob.restore_task = Some(tokio::spawn(async move {
-                            crate::cloud::ensure_session(&config)
+                            crate::cloud::ensure_account_session(&config)
                                 .await
                                 .map_err(|e| e.to_string())?;
                             crate::cloud::backup::run_restore(
