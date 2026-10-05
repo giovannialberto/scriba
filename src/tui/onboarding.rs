@@ -54,6 +54,12 @@ pub(super) enum OnboardingStep {
     ModeSelection,
     /// Scriba Pro flow: sign in with the approved email and the emailed code.
     ProSignIn,
+    /// Scriba Pro flow: looking for a backup in the account.
+    ProRestoreCheck,
+    /// Scriba Pro flow: a backup exists; restore it or start fresh.
+    ProRestoreOffer,
+    /// Scriba Pro flow: downloading the backup.
+    ProRestoring,
     // Cloud flow
     WhisperApiKey,
     WhisperApiKeyValidation,
@@ -110,6 +116,9 @@ pub(super) enum OnboardingTickResult {
     SaveWhisperKey(String),
     /// The Scriba Pro sign-in flow produced an account event.
     CloudEvent(crate::cloud::AccountEvent),
+    /// The backup restore finished (files are on disk; the database and
+    /// config still have to be loaded by the dashboard).
+    RestoreFinished(Result<crate::cloud::backup::RestoreReport, String>),
 }
 
 pub(super) const LOCAL_MODELS: &[(LocalModel, &str, &str)] = &[
@@ -194,6 +203,13 @@ pub(super) struct OnboardingState {
     pub(super) pro: Option<super::cloud::CloudFlow>,
     /// Whether "Scriba Pro" is offered at mode selection (project and proxy configured).
     pub(super) pro_offered: bool,
+    pub(super) restore_check: Option<tokio::task::JoinHandle<Result<Option<crate::cloud::backup::Manifest>, String>>>,
+    pub(super) restore_manifest: Option<crate::cloud::backup::Manifest>,
+    /// 0 = restore, 1 = start fresh.
+    pub(super) restore_choice: usize,
+    pub(super) restore_task: Option<tokio::task::JoinHandle<Result<crate::cloud::backup::RestoreReport, String>>>,
+    pub(super) restore_rx: Option<mpsc::Receiver<crate::cloud::backup::Progress>>,
+    pub(super) restore_progress: Option<crate::cloud::backup::Progress>,
     /// True when this is the "what's new" voice introduction for an existing
     /// user: no world setup, no step dots, Esc leaves instead of quitting.
     pub(super) upgrade_intro: bool,
@@ -250,6 +266,12 @@ impl OnboardingState {
             voice: None,
             pro: None,
             pro_offered: false,
+            restore_check: None,
+            restore_manifest: None,
+            restore_choice: 0,
+            restore_task: None,
+            restore_rx: None,
+            restore_progress: None,
             upgrade_intro: false,
         }
     }
@@ -272,6 +294,20 @@ impl OnboardingState {
             true,
         );
         ob
+    }
+
+    /// After a Pro sign-in with nothing to restore: on to the questions.
+    pub(super) fn continue_after_pro(&mut self) {
+        self.step = OnboardingStep::AskName;
+        self.anim_frame = 0;
+        self.set_step_text(
+            "You're signed in. Speech and the assistant now run\n\
+             through your Scriba Pro account.\n\n\
+             Scriba uses your name and role to better\n\
+             understand your recordings.\n\n\
+             What's your name?",
+            true,
+        );
     }
 
     /// Choices at mode selection, in display order.
@@ -388,6 +424,57 @@ impl OnboardingState {
                     && let Some(event) = flow.tick()
                 {
                     return Some(OnboardingTickResult::CloudEvent(event));
+                }
+            }
+            OnboardingStep::ProRestoreOffer => {}
+            OnboardingStep::ProRestoreCheck => {
+                if let Some(task) = &self.restore_check
+                    && task.is_finished()
+                {
+                    let task = self.restore_check.take().unwrap();
+                    let found = match futures_util::FutureExt::now_or_never(task) {
+                        Some(Ok(Ok(Some(m)))) if !m.files.is_empty() => Some(m),
+                        _ => None,
+                    };
+                    match found {
+                        Some(m) => {
+                            let audio = if m.has_audio() { ", audio included" } else { "" };
+                            self.set_step_text(
+                                &format!(
+                                    "Your account has a backup from {}:\n{} recordings, {} files{audio}.\n\nRestore it on this computer?",
+                                    m.updated_at.split('T').next().unwrap_or(&m.updated_at),
+                                    m.recording_count(),
+                                    m.files.len(),
+                                ),
+                                false,
+                            );
+                            self.restore_manifest = Some(m);
+                            self.restore_choice = 0;
+                            self.step = OnboardingStep::ProRestoreOffer;
+                        }
+                        None => self.continue_after_pro(),
+                    }
+                    self.anim_frame = 0;
+                }
+            }
+            OnboardingStep::ProRestoring => {
+                if let Some(rx) = &mut self.restore_rx {
+                    while let Ok(p) = rx.try_recv() {
+                        self.restore_progress = Some(p);
+                    }
+                }
+                if let Some(task) = &self.restore_task
+                    && task.is_finished()
+                {
+                    let task = self.restore_task.take().unwrap();
+                    self.restore_rx = None;
+                    self.restore_progress = None;
+                    let result = match futures_util::FutureExt::now_or_never(task) {
+                        Some(Ok(r)) => r,
+                        Some(Err(e)) => Err(e.to_string()),
+                        None => Err("restore did not finish".into()),
+                    };
+                    return Some(OnboardingTickResult::RestoreFinished(result));
                 }
             }
             OnboardingStep::ModelSetup => {
@@ -1388,6 +1475,44 @@ impl Dashboard {
                     }
                 }
             }
+            OnboardingStep::ProRestoreCheck | OnboardingStep::ProRestoring => {}
+            OnboardingStep::ProRestoreOffer => match key_code {
+                KeyCode::Up | KeyCode::Char('k') => ob.restore_choice = 0,
+                KeyCode::Down | KeyCode::Char('j') => ob.restore_choice = 1,
+                KeyCode::Enter => {
+                    if ob.restore_choice == 1 {
+                        ob.restore_manifest = None;
+                        ob.continue_after_pro();
+                    } else if let (Some(manifest), Some(api)) = (
+                        ob.restore_manifest.clone(),
+                        crate::cloud::backup::BackupApi::from_config(&self.config),
+                    ) {
+                        let (tx, rx) = mpsc::channel(64);
+                        ob.restore_rx = Some(rx);
+                        ob.restore_progress = Some(crate::cloud::backup::Progress::Scanning);
+                        let config = self.config.clone();
+                        ob.restore_task = Some(tokio::spawn(async move {
+                            crate::cloud::ensure_session(&config)
+                                .await
+                                .map_err(|e| e.to_string())?;
+                            crate::cloud::backup::run_restore(
+                                &api,
+                                &crate::utils::BASE_PATH,
+                                &manifest,
+                                |p| {
+                                    let _ = tx.try_send(p);
+                                },
+                            )
+                            .await
+                            .map_err(|e| format!("{e:#}"))
+                        }));
+                        ob.step = OnboardingStep::ProRestoring;
+                        ob.anim_frame = 0;
+                        ob.set_step_text("Restoring your Scriba\u{2026}", false);
+                    }
+                }
+                _ => {}
+            },
             OnboardingStep::ProSignIn => {
                 if let Some(flow) = ob.pro.as_mut()
                     && flow.handle_key(key_code) == super::cloud::CloudAction::Finished
@@ -1625,6 +1750,7 @@ impl Dashboard {
             OnboardingStep::Entrance | OnboardingStep::Intro => "Welcome",
             OnboardingStep::ModeSelection => "Setup",
             OnboardingStep::ProSignIn => "Setup \u{00B7} Scriba Pro",
+            OnboardingStep::ProRestoreCheck | OnboardingStep::ProRestoreOffer | OnboardingStep::ProRestoring => "Setup \u{00B7} Restore",
             OnboardingStep::WhisperApiKey | OnboardingStep::WhisperApiKeyValidation => "Setup \u{00B7} Transcription",
             OnboardingStep::ProviderSelection => "Setup \u{00B7} Provider",
             OnboardingStep::EndpointEntry => "Setup \u{00B7} Endpoint",
@@ -2024,6 +2150,44 @@ impl Dashboard {
             if let Some(flow) = &ob.pro {
                 lines.extend(flow.render_lines(body.width as usize));
             }
+        } else if ob.step == OnboardingStep::ProRestoreOffer {
+            for text_line in visible.split('\n') {
+                lines.push(Line::from(Span::styled(text_line, Style::default().fg(Color::White))));
+            }
+            lines.push(Line::from(""));
+            let sel_bg = Color::Indexed(236);
+            let choices = [
+                ("Restore", "bring back your world, transcripts and database"),
+                ("Start fresh", "keep the backup in your account, set up this computer from scratch"),
+            ];
+            for (i, (title, desc)) in choices.iter().enumerate() {
+                if i > 0 {
+                    lines.push(Line::from(""));
+                }
+                if ob.restore_choice == i {
+                    lines.push(Line::from(vec![
+                        Span::styled("\u{25B8} ", Style::default().fg(ACCENT).bg(sel_bg)),
+                        Span::styled(title.to_string(), Style::default().fg(Color::White).bg(sel_bg)),
+                    ]));
+                    lines.push(Line::from(Span::styled(format!("  {desc}"), Style::default().fg(Color::Indexed(245)).bg(sel_bg))));
+                } else {
+                    lines.push(Line::from(Span::styled(format!("  {title}"), Style::default().fg(Color::DarkGray))));
+                    lines.push(Line::from(Span::styled(format!("  {desc}"), Style::default().fg(Color::DarkGray))));
+                }
+            }
+        } else if matches!(ob.step, OnboardingStep::ProRestoreCheck | OnboardingStep::ProRestoring) {
+            for text_line in visible.split('\n') {
+                lines.push(Line::from(Span::styled(text_line, Style::default().fg(Color::White))));
+            }
+            if let Some(crate::cloud::backup::Progress::Transferring { done, total, bytes_done, bytes_total }) = &ob.restore_progress {
+                let width = (body.width as usize).saturating_sub(12).clamp(10, 40);
+                let filled = if *bytes_total > 0 { ((*bytes_done as f64 / *bytes_total as f64) * width as f64) as usize } else { 0 };
+                lines.push(Line::from(""));
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{}{}", "\u{2593}".repeat(filled.min(width)), "\u{2591}".repeat(width - filled.min(width))), Style::default().fg(ACCENT)),
+                    Span::styled(format!("  {done}/{total} files"), Style::default().fg(Color::DarkGray)),
+                ]));
+            }
         } else if ob.step == OnboardingStep::Confirmation {
             // Structured label/value layout
             for text_line in visible.split('\n') {
@@ -2163,7 +2327,8 @@ impl Dashboard {
         // Cloud:   Intro(0) → Mode(1) → WhisperKey(2) → Provider(3) → ApiKey(4) → Name(5) → Role(6) → Processing(7) → Confirm(8) → Done(9) = 10
         let is_cloud = matches!(ob.step,
             OnboardingStep::WhisperApiKey | OnboardingStep::ProviderSelection
-            | OnboardingStep::ProSignIn
+            | OnboardingStep::ProSignIn | OnboardingStep::ProRestoreCheck
+            | OnboardingStep::ProRestoreOffer | OnboardingStep::ProRestoring
             | OnboardingStep::EndpointEntry | OnboardingStep::ModelEntry
             | OnboardingStep::ApiKeyEntry | OnboardingStep::ApiKeyValidation
         ) || matches!(self.config.enrichment.mode, EnrichmentMode::Cloud { .. });
@@ -2173,6 +2338,7 @@ impl Dashboard {
                 OnboardingStep::Entrance | OnboardingStep::Intro => 0,
                 OnboardingStep::ModeSelection => 1,
                 OnboardingStep::ProSignIn => 2,
+                OnboardingStep::ProRestoreCheck | OnboardingStep::ProRestoreOffer | OnboardingStep::ProRestoring => 3,
                 OnboardingStep::WhisperApiKey | OnboardingStep::WhisperApiKeyValidation => 2,
                 OnboardingStep::ProviderSelection | OnboardingStep::EndpointEntry | OnboardingStep::ModelEntry => 3,
                 OnboardingStep::ApiKeyEntry | OnboardingStep::ApiKeyValidation => 4,
@@ -2239,6 +2405,8 @@ impl Dashboard {
             OnboardingStep::ModeSelection | OnboardingStep::ProviderSelection
             | OnboardingStep::Confirmation => "[Up/Down] Select  [Enter] Confirm",
             OnboardingStep::ProSignIn => "[Enter] Continue  [Esc] Back",
+            OnboardingStep::ProRestoreOffer => "[Up/Down] Select  [Enter] Confirm",
+            OnboardingStep::ProRestoreCheck | OnboardingStep::ProRestoring => "",
             OnboardingStep::WhisperApiKey => "[Enter] Validate",
             OnboardingStep::WhisperApiKeyValidation => {
                 if ob.whisper_validation_task.is_some() { "Validating..." }

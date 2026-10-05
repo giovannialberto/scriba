@@ -67,6 +67,8 @@ pub(super) enum Row {
     Account,
     /// Scriba Pro: this month's proxy usage (signed in, once known).
     Usage,
+    /// Scriba Pro: backup of the knowledge layer to the account.
+    Backup,
 }
 
 impl Row {
@@ -88,6 +90,7 @@ impl Row {
             Row::RequestAccess => "Beta access",
             Row::Account => "Account",
             Row::Usage => "Usage",
+            Row::Backup => "Backup",
         }
     }
 
@@ -108,7 +111,9 @@ impl Row {
             | Row::AssistantKey => Some("ASSISTANT"),
             Row::AutoStop | Row::Timeout | Row::MeetingWatch => Some("RECORDING"),
             Row::CheckUpdates => Some("GENERAL"),
-            Row::SignIn | Row::RequestAccess | Row::Account | Row::Usage => Some("SCRIBA PRO"),
+            Row::SignIn | Row::RequestAccess | Row::Account | Row::Usage | Row::Backup => {
+                Some("SCRIBA PRO")
+            }
         }
     }
 }
@@ -137,6 +142,9 @@ fn settings_rows_with(config: &ScribaConfig, usage_known: bool) -> Vec<Row> {
             rows.push(Row::Account);
             if usage_known {
                 rows.push(Row::Usage);
+            }
+            if crate::cloud::pro_available(config) {
+                rows.push(Row::Backup);
             }
         }
         crate::cloud::AccountStatus::Unavailable => rows.push(Row::Account),
@@ -414,6 +422,23 @@ pub(super) enum PickerValue {
     TypeModel,
     Profile(Profile),
     Account(AccountChoice),
+    Backup(BackupChoice),
+}
+
+/// Actions on the Scriba Pro backup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BackupChoice {
+    BackUpNow,
+    Toggle,
+    ToggleAudio,
+    DeleteRemote,
+}
+
+/// What a finished backup task did.
+#[derive(Debug)]
+pub(super) enum BackupOutcome {
+    Backed(crate::cloud::backup::BackupReport),
+    Deleted,
 }
 
 /// Actions on the signed-in Scriba Pro account.
@@ -477,6 +502,20 @@ fn fit(text: &str, max: usize) -> String {
     let mut out: String = text.chars().take(max - 1).collect();
     out.push('\u{2026}');
     out
+}
+
+/// 1536 -> "1.5 KB", 5_300_000 -> "5.3 MB".
+fn human_bytes(n: u64) -> String {
+    let n = n as f64;
+    if n >= 1e9 {
+        format!("{:.1} GB", n / 1e9)
+    } else if n >= 1e6 {
+        format!("{:.1} MB", n / 1e6)
+    } else if n >= 1e3 {
+        format!("{:.0} KB", n / 1e3)
+    } else {
+        format!("{} B", n as u64)
+    }
 }
 
 /// 1234 -> "1.2k", 5_400_000 -> "5.4M".
@@ -723,6 +762,7 @@ impl Dashboard {
                 .email
                 .clone()
                 .unwrap_or_else(|| "Account".to_string()),
+            Row::Backup => "Backup".to_string(),
             Row::SpeechModel => format!(
                 "Choose a model \u{00B7} {}",
                 speech_provider(&self.config).label()
@@ -947,6 +987,32 @@ impl Dashboard {
                 }
             }
             Row::Usage => {}
+            Row::Backup => {
+                let c = &self.config.cloud;
+                let items = vec![
+                    PickerItem {
+                        label: "Back up now".into(),
+                        detail: "world, database, transcripts".into(),
+                        value: PickerValue::Backup(BackupChoice::BackUpNow),
+                    },
+                    PickerItem {
+                        label: if c.backup_enabled { "Turn off" } else { "Turn on" }.into(),
+                        detail: "automatic backup after every recording".into(),
+                        value: PickerValue::Backup(BackupChoice::Toggle),
+                    },
+                    PickerItem {
+                        label: if c.backup_audio { "Exclude audio" } else { "Include audio" }.into(),
+                        detail: "audio files are large; transcripts are always included".into(),
+                        value: PickerValue::Backup(BackupChoice::ToggleAudio),
+                    },
+                    PickerItem {
+                        label: "Delete cloud backup".into(),
+                        detail: "removes everything stored for this account".into(),
+                        value: PickerValue::Backup(BackupChoice::DeleteRemote),
+                    },
+                ];
+                self.open_picker(row, items, 0);
+            }
             Row::Account => {
                 if self.config.cloud.is_signed_in() {
                     let items = vec![
@@ -972,6 +1038,7 @@ impl Dashboard {
     /// closes itself: the row it sat under now shows the result.
     pub(super) fn tick_cloud(&mut self) {
         self.keep_pro_session_fresh();
+        self.tick_backup();
         let mut events = Vec::new();
         let mut close = false;
         if let SettingsEdit::Cloud(flow) = &mut self.settings_edit {
@@ -1041,15 +1108,20 @@ impl Dashboard {
         ob.pro = None;
         ob.anim_frame = 0;
         if entitled {
-            ob.step = super::onboarding::OnboardingStep::AskName;
-            ob.set_step_text(
-                "You're signed in. Speech and the assistant now run\n\
-                 through your Scriba Pro account.\n\n\
-                 Scriba uses your name and role to better\n\
-                 understand your recordings.\n\n\
-                 What's your name?",
-                true,
-            );
+            match crate::cloud::backup::BackupApi::from_config(&self.config) {
+                Some(api) => {
+                    let config = self.config.clone();
+                    ob.restore_check = Some(tokio::spawn(async move {
+                        crate::cloud::ensure_session(&config)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        api.manifest().await.map_err(|e| e.to_string())
+                    }));
+                    ob.step = super::onboarding::OnboardingStep::ProRestoreCheck;
+                    ob.set_step_text("Looking for a backup in your account\u{2026}", false);
+                }
+                None => ob.continue_after_pro(),
+            }
         } else {
             ob.step = super::onboarding::OnboardingStep::ModeSelection;
             ob.set_step_text(
@@ -1087,6 +1159,132 @@ impl Dashboard {
         self.cloud_session_task = Some(tokio::spawn(async move {
             crate::cloud::ensure_session(&config).await
         }));
+    }
+
+    /// Start a backup unless one is running or backups are off (`force`
+    /// ignores the toggle and the freshness check). Called after every
+    /// finished transcription and at startup.
+    pub(super) fn request_backup(&mut self, force: bool) {
+        let c = &self.config.cloud;
+        if !force {
+            if !c.backup_enabled {
+                return;
+            }
+            // Startup catch-up only when the last backup is old.
+            if self.active_transcription.is_none() && self.transcription_queue.is_empty() {
+                let stale = c
+                    .last_backup_at
+                    .as_deref()
+                    .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                    .map(|t| chrono::Utc::now().signed_duration_since(t).num_hours() >= 6)
+                    .unwrap_or(true);
+                if !stale {
+                    return;
+                }
+            }
+        }
+        if !crate::cloud::pro_available(&self.config) {
+            return;
+        }
+        if self.backup_task.is_some() {
+            self.backup_pending = true;
+            return;
+        }
+        let Some(api) = crate::cloud::backup::BackupApi::from_config(&self.config) else {
+            return;
+        };
+        let include_audio = self.config.cloud.backup_audio;
+        let config = self.config.clone();
+        let (tx, rx) = mpsc::channel(64);
+        self.backup_progress_rx = Some(rx);
+        self.backup_progress = Some(crate::cloud::backup::Progress::Scanning);
+        self.backup_error = None;
+        self.backup_task = Some(tokio::spawn(async move {
+            crate::cloud::ensure_session(&config)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let report = crate::cloud::backup::run_backup(
+                &api,
+                &crate::utils::BASE_PATH,
+                include_audio,
+                |p| {
+                    let _ = tx.try_send(p);
+                },
+            )
+            .await?;
+            Ok(BackupOutcome::Backed(report))
+        }));
+    }
+
+    fn apply_backup_choice(&mut self, choice: BackupChoice) {
+        match choice {
+            BackupChoice::BackUpNow => self.request_backup(true),
+            BackupChoice::Toggle => {
+                self.config.cloud.backup_enabled = !self.config.cloud.backup_enabled;
+                self.save_settings("backup");
+                if self.config.cloud.backup_enabled {
+                    self.request_backup(true);
+                }
+            }
+            BackupChoice::ToggleAudio => {
+                self.config.cloud.backup_audio = !self.config.cloud.backup_audio;
+                self.save_settings("backup");
+            }
+            BackupChoice::DeleteRemote => {
+                if self.backup_task.is_some() {
+                    return;
+                }
+                let Some(api) = crate::cloud::backup::BackupApi::from_config(&self.config) else {
+                    return;
+                };
+                let config = self.config.clone();
+                self.backup_error = None;
+                self.backup_task = Some(tokio::spawn(async move {
+                    crate::cloud::ensure_session(&config)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    api.delete_all().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+                    Ok(BackupOutcome::Deleted)
+                }));
+            }
+        }
+    }
+
+    /// Drain progress and collect the finished backup task.
+    fn tick_backup(&mut self) {
+        if let Some(rx) = &mut self.backup_progress_rx {
+            while let Ok(p) = rx.try_recv() {
+                self.backup_progress = Some(p);
+            }
+        }
+        let Some(task) = &self.backup_task else {
+            return;
+        };
+        if !task.is_finished() {
+            return;
+        }
+        let task = self.backup_task.take().unwrap();
+        self.backup_progress_rx = None;
+        self.backup_progress = None;
+        match futures_util::FutureExt::now_or_never(task) {
+            Some(Ok(Ok(BackupOutcome::Backed(report)))) => {
+                self.config.cloud.last_backup_at = Some(report.manifest.updated_at.clone());
+                self.config.cloud.last_backup_bytes = Some(report.manifest.bytes);
+                self.save_settings("backup");
+            }
+            Some(Ok(Ok(BackupOutcome::Deleted))) => {
+                self.config.cloud.last_backup_at = None;
+                self.config.cloud.last_backup_bytes = None;
+                self.config.cloud.backup_enabled = false;
+                self.save_settings("backup");
+            }
+            Some(Ok(Err(e))) => self.backup_error = Some(format!("{e:#}")),
+            Some(Err(e)) => self.backup_error = Some(e.to_string()),
+            None => self.backup_error = Some("backup task did not finish".into()),
+        }
+        if std::mem::take(&mut self.backup_pending) {
+            self.request_backup(true);
+        }
     }
 
     /// Run an account operation in the background; `tick_cloud` applies it.
@@ -1194,6 +1392,7 @@ impl Dashboard {
             }
             PickerValue::Model(id) => self.commit_text(row, id),
             PickerValue::Account(choice) => self.spawn_cloud_task(choice),
+            PickerValue::Backup(choice) => self.apply_backup_choice(choice),
             PickerValue::TypeModel => {
                 let current = match row {
                     Row::SpeechModel => self.config.transcription_model(),
@@ -2300,6 +2499,42 @@ impl Dashboard {
                     false,
                 )
             }
+            Row::Backup => {
+                use crate::cloud::backup::Progress;
+                let c = &config.cloud;
+                if let Some(p) = &self.backup_progress {
+                    let value = match p {
+                        Progress::Scanning => "Scanning\u{2026}".to_string(),
+                        Progress::Transferring { done, total, .. } => {
+                            format!("Uploading {done}/{total}")
+                        }
+                        Progress::Committing => "Finishing\u{2026}".to_string(),
+                    };
+                    return (value, String::new(), DetailTone::Neutral, "", false);
+                }
+                let value = if c.backup_enabled { "On" } else { "Off" }.to_string();
+                let (detail, tone) = if let Some(err) = &self.backup_error {
+                    (format!("last attempt failed: {}", first_line(err)), DetailTone::Bad)
+                } else if let Some(at) = &c.last_backup_at {
+                    let size = c
+                        .last_backup_bytes
+                        .map(|b| format!(" \u{00B7} {}", human_bytes(b)))
+                        .unwrap_or_default();
+                    let audio = if c.backup_audio { " \u{00B7} with audio" } else { "" };
+                    (
+                        format!("last {}{size}{audio}", super::cloud::short_date(at)),
+                        DetailTone::Good,
+                    )
+                } else if c.backup_enabled {
+                    ("no backup yet".to_string(), DetailTone::Neutral)
+                } else {
+                    (
+                        "keep your world, transcripts and database in your account".to_string(),
+                        DetailTone::Neutral,
+                    )
+                };
+                (value, detail, tone, "\u{2190} Enter for options", false)
+            }
             Row::Account => match crate::cloud::status(config) {
                 crate::cloud::AccountStatus::SignedIn { email, entitlements } => {
                     let (detail, tone) = if entitlements.is_empty() {
@@ -2591,6 +2826,7 @@ mod tests {
             Row::RequestAccess,
             Row::Account,
             Row::Usage,
+            Row::Backup,
         ];
         for row in all {
             assert!(row.label().chars().count() < LABEL_WIDTH, "{:?}", row);
