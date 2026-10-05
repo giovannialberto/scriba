@@ -297,6 +297,18 @@ pub struct CloudConfig {
     /// Override the model proxy URL baked into the binary (development).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
+    /// Back up the knowledge layer to the account after recordings finish.
+    #[serde(default)]
+    pub backup_enabled: bool,
+    /// Include audio files in backups (large; off by default).
+    #[serde(default)]
+    pub backup_audio: bool,
+    /// When the last backup completed (RFC 3339).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_backup_at: Option<String>,
+    /// Bytes stored remotely after the last backup, for display.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_backup_bytes: Option<u64>,
 }
 
 impl CloudConfig {

@@ -14,6 +14,7 @@
 //! be overridden for development with `SCRIBA_SUPABASE_URL` and
 //! `SCRIBA_SUPABASE_ANON_KEY`, or the matching fields in `config.json`.
 
+pub mod backup;
 pub mod secrets;
 pub mod supabase;
 

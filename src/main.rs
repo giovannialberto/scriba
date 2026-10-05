@@ -207,6 +207,16 @@ enum Command {
         #[structopt(subcommand)]
         cmd: VoiceCommand,
     },
+    /// Back up the knowledge layer (and optionally audio) to your Scriba Pro account
+    Backup {
+        #[structopt(long = "audio", help = "Include audio files")]
+        audio: bool,
+    },
+    /// Restore the latest Scriba Pro backup into this machine
+    Restore {
+        #[structopt(long = "yes", help = "Do not ask for confirmation")]
+        yes: bool,
+    },
     /// Manage entities (people, organizations)
     Entity {
         #[structopt(subcommand)]
@@ -718,6 +728,98 @@ async fn main() -> Result<()> {
                     };
 
                     workflow.enrich_existing_recording(&directory_name, true).await?;
+                    Ok(())
+                }
+                Command::Backup { audio } => {
+                    let config = ScribaConfig::load()?;
+                    scriba::cloud::init(&config);
+                    if !scriba::cloud::pro_available(&config) {
+                        eprintln!("Backups need a Scriba Pro account. Sign in from Settings first.");
+                        std::process::exit(1);
+                    }
+                    if let Err(e) = scriba::cloud::ensure_session(&config).await {
+                        eprintln!("Could not sign in: {e}");
+                        std::process::exit(1);
+                    }
+                    let api = scriba::cloud::backup::BackupApi::from_config(&config)
+                        .expect("proxy configured");
+                    let include_audio = audio || config.cloud.backup_audio;
+                    let report = scriba::cloud::backup::run_backup(
+                        &api,
+                        &scriba::utils::BASE_PATH,
+                        include_audio,
+                        |p| {
+                            if let scriba::cloud::backup::Progress::Transferring { done, total, .. } = p {
+                                eprint!("\r⬆️  {done}/{total} files");
+                            }
+                        },
+                    )
+                    .await?;
+                    eprintln!();
+                    let mut config = ScribaConfig::load()?;
+                    config.cloud.last_backup_at = Some(report.manifest.updated_at.clone());
+                    config.cloud.last_backup_bytes = Some(report.manifest.bytes);
+                    config.save()?;
+                    println!(
+                        "✅ Backup complete: {} uploaded, {} unchanged, {} stored (generation {}).",
+                        report.uploaded,
+                        report.unchanged,
+                        human_bytes(report.manifest.bytes),
+                        report.manifest.generation
+                    );
+                    Ok(())
+                }
+                Command::Restore { yes } => {
+                    let mut config = ScribaConfig::load()?;
+                    scriba::cloud::init(&config);
+                    if !scriba::cloud::pro_available(&config) {
+                        eprintln!("Restore needs a Scriba Pro account. Sign in from Settings first.");
+                        std::process::exit(1);
+                    }
+                    if let Err(e) = scriba::cloud::ensure_session(&config).await {
+                        eprintln!("Could not sign in: {e}");
+                        std::process::exit(1);
+                    }
+                    let api = scriba::cloud::backup::BackupApi::from_config(&config)
+                        .expect("proxy configured");
+                    let Some(manifest) = api.manifest().await? else {
+                        println!("This account has no backup yet.");
+                        return Ok(());
+                    };
+                    println!(
+                        "Backup from {} · {} recordings · {} files · {}{}",
+                        manifest.updated_at,
+                        manifest.recording_count(),
+                        manifest.files.len(),
+                        human_bytes(manifest.bytes),
+                        if manifest.has_audio() { " · includes audio" } else { "" }
+                    );
+                    if !yes {
+                        eprintln!(
+                            "This overwrites local files with the same names (world.md, the database, transcripts). Re-run with --yes to proceed."
+                        );
+                        return Ok(());
+                    }
+                    let report = scriba::cloud::backup::run_restore(
+                        &api,
+                        &scriba::utils::BASE_PATH,
+                        &manifest,
+                        |p| {
+                            if let scriba::cloud::backup::Progress::Transferring { done, total, .. } = p {
+                                eprint!("\r⬇️  {done}/{total} files");
+                            }
+                        },
+                    )
+                    .await?;
+                    eprintln!();
+                    let mut db = Database::new()?;
+                    scriba::cloud::backup::apply_restored(&scriba::utils::BASE_PATH, &mut db, &mut config)?;
+                    println!(
+                        "✅ Restored {} files ({}) across {} recordings.",
+                        report.files,
+                        human_bytes(report.bytes),
+                        report.recordings
+                    );
                     Ok(())
                 }
                 Command::Voice { cmd } => {
@@ -1384,4 +1486,18 @@ async fn run_watch(
         Arc::new(RecordingStatus::default()),
     )
     .await
+}
+
+/// 1536 -> "1.5 KB", 5_300_000 -> "5.3 MB".
+fn human_bytes(n: u64) -> String {
+    let n = n as f64;
+    if n >= 1e9 {
+        format!("{:.1} GB", n / 1e9)
+    } else if n >= 1e6 {
+        format!("{:.1} MB", n / 1e6)
+    } else if n >= 1e3 {
+        format!("{:.1} KB", n / 1e3)
+    } else {
+        format!("{} B", n as u64)
+    }
 }

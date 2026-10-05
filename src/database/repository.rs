@@ -119,6 +119,44 @@ pub struct Database {
 }
 
 impl Database {
+    /// Write a consistent copy of the database at `db_path` to `dest`
+    /// (`VACUUM INTO`), safe while other connections are open.
+    pub fn snapshot_to(db_path: &std::path::Path, dest: &std::path::Path) -> Result<()> {
+        let conn = Connection::open_with_flags(
+            db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .context("Failed to open database for snapshot")?;
+        let dest_str = dest
+            .to_str()
+            .context("snapshot destination is not valid UTF-8")?
+            .replace('\'', "''");
+        conn.execute_batch(&format!("VACUUM INTO '{dest_str}'"))
+            .context("Failed to snapshot database")?;
+        Ok(())
+    }
+
+    /// Replace this database's contents with those of the SQLite file at
+    /// `source`, through SQLite's online backup API, so the open connection
+    /// stays valid and the WAL is handled correctly.
+    pub fn restore_from_file(&mut self, source: &std::path::Path) -> Result<()> {
+        let src = Connection::open_with_flags(
+            source,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .context("Failed to open restored database")?;
+        {
+            let backup = rusqlite::backup::Backup::new(&src, &mut self.conn)
+                .context("Failed to start database restore")?;
+            backup
+                .run_to_completion(256, std::time::Duration::from_millis(5), None)
+                .context("Failed to restore database")?;
+        }
+        self.initialize()
+            .context("Failed to initialize the restored database")?;
+        Ok(())
+    }
+
     /// Create a new database connection.
     pub fn new() -> Result<Self> {
         let db_path = Self::get_database_path()?;
