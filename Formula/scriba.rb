@@ -5,7 +5,7 @@ class Scriba < Formula
   
   if Hardware::CPU.intel?
     url "https://github.com/giovannialberto/scriba/releases/download/v0.32.0/scriba-x86_64-apple-darwin"
-    sha256 "ca483c3f70a44438473158f7a8ce1852b7152e24e45dc22914a1d8d841d3dde9"
+    sha256 "cd8b4413761135b249593f22384e062ffa72bf4a60ce71c38f977e46b3da84ce"
   else
     url "https://github.com/giovannialberto/scriba/releases/download/v0.32.0/scriba-aarch64-apple-darwin"
     sha256 "c3ff0b32b2b7839582c50400e4fb434e69c7f76f9c56b3fbd6e88e555925d40a"
