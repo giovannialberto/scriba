@@ -45,6 +45,9 @@ const REFRESH_MARGIN_SECS: i64 = 120;
 #[derive(Debug, Default)]
 struct Store {
     proxy_url: Option<String>,
+    /// The account this device is signed in to; a session for anyone else
+    /// is refused.
+    user_id: Option<String>,
     access_token: Option<String>,
     expires_at: i64,
 }
@@ -60,11 +63,32 @@ pub fn init(config: &ScribaConfig) {
     let url = proxy_url(config);
     if let Ok(mut s) = store().lock() {
         s.proxy_url = url;
+        s.user_id = config.cloud.user_id.clone();
     }
 }
 
-fn remember_session(session: &Session) {
+/// Keep the session unless it belongs to a different user than the one
+/// this device is signed in to (a planted refresh token must not quietly
+/// re-point the account).
+fn remember_session(session: &Session) -> bool {
     if let Ok(mut s) = store().lock() {
+        if let Some(expected) = &s.user_id
+            && !expected.is_empty()
+            && *expected != session.user_id
+        {
+            return false;
+        }
+        s.access_token = Some(session.access_token.clone());
+        s.expires_at = session.expires_at;
+        return true;
+    }
+    false
+}
+
+/// A fresh sign-in defines who the device belongs to.
+fn adopt_session(session: &Session) {
+    if let Ok(mut s) = store().lock() {
+        s.user_id = Some(session.user_id.clone());
         s.access_token = Some(session.access_token.clone());
         s.expires_at = session.expires_at;
     }
@@ -392,7 +416,7 @@ pub async fn verify_code(
     let session = client.verify_code(&email, code.trim()).await?;
     secrets::store(&secrets::session_key(client.url()), &session.refresh_token)
         .map_err(|e| CloudError::Other(format!("could not store the session: {e:#}")))?;
-    remember_session(&session);
+    adopt_session(&session);
     let entitlements = client
         .entitlements(&session.access_token)
         .await
@@ -423,9 +447,12 @@ pub async fn resume_session(client: &SupabaseClient) -> Result<Session, CloudErr
         .map_err(|e| CloudError::Other(format!("could not read the session: {e:#}")))?
         .ok_or(CloudError::SessionExpired)?;
     let session = client.refresh(&token).await?;
+    if !remember_session(&session) {
+        let _ = secrets::delete(&key);
+        return Err(CloudError::SessionExpired);
+    }
     secrets::store(&key, &session.refresh_token)
         .map_err(|e| CloudError::Other(format!("could not store the session: {e:#}")))?;
-    remember_session(&session);
     Ok(session)
 }
 

@@ -144,11 +144,19 @@ fn is_recording_dir(name: &str) -> bool {
         && b[10] == b'_'
 }
 
+/// Files that never belong in a backup, and never come out of one: hidden
+/// files, scratch and partial files, SQLite sidecars, restore staging.
 fn skip_file(name: &str) -> bool {
     name.starts_with('.')
+        || name.starts_with("_tmp")
         || name.ends_with(".tmp")
         || name.ends_with(".part")
         || name.ends_with(".bak")
+        || name.ends_with(".restored")
+        || name.ends_with("-wal")
+        || name.ends_with("-shm")
+        || name.ends_with("-journal")
+        || name.contains(".part-")
 }
 
 fn sha256_file(path: &Path) -> Result<(String, u64)> {
@@ -171,7 +179,7 @@ fn modified_rfc3339(path: &Path) -> String {
     std::fs::metadata(path)
         .and_then(|m| m.modified())
         .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339())
-        .unwrap_or_default()
+        .unwrap_or_else(|_| chrono::Utc::now().to_rfc3339())
 }
 
 /// Strip every credential from the config before it leaves the machine.
@@ -199,7 +207,13 @@ pub fn sanitize_config(json: &str) -> Result<String> {
 /// Everything that should be in the backup, hashed. `staging` receives the
 /// sanitized config and a consistent snapshot of the database.
 pub fn scan_local(base: &Path, include_audio: bool, staging: &Path) -> Result<Vec<LocalFile>> {
+    let _ = std::fs::remove_dir_all(staging);
     std::fs::create_dir_all(staging)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(staging, std::fs::Permissions::from_mode(0o700))?;
+    }
     let mut files = Vec::new();
     let mut push = |path: String, source: PathBuf| -> Result<()> {
         let (sha256, size) = sha256_file(&source)?;
@@ -320,6 +334,13 @@ struct SignedDownload {
     url: String,
 }
 
+/// What the server said to a commit.
+enum CommitOutcome {
+    Committed(Manifest),
+    /// These referenced blobs are not in storage: upload them and retry.
+    BlobsMissing(Vec<String>),
+}
+
 /// Client for the proxy's backup endpoints and for the signed storage URLs.
 /// Uses the newer HTTP client (`reqwest13`): the crate's default one stalls
 /// on streamed request bodies.
@@ -354,7 +375,7 @@ impl BackupApi {
             .bearer_auth(Self::token()?)
             .send()
             .await
-            .map_err(|e| CloudError::Network(e.to_string()))?;
+            .map_err(|e| CloudError::Network(e.without_url().to_string()))?;
         let status = resp.status().as_u16();
         let body = resp.text().await.unwrap_or_default();
         Ok((status, body))
@@ -416,7 +437,7 @@ impl BackupApi {
         &self,
         expected_generation: Option<u64>,
         files: &[ManifestFile],
-    ) -> Result<Manifest, CloudError> {
+    ) -> Result<CommitOutcome, CloudError> {
         let body = serde_json::json!({
             "expected_generation": expected_generation,
             "client_version": super::client_version(),
@@ -425,10 +446,25 @@ impl BackupApi {
         let (status, text) = self
             .send(self.http.post(format!("{}/commit", self.base)).json(&body))
             .await?;
+        if status == 409 {
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+            if v["error"]["type"].as_str() == Some("blob_missing") {
+                let missing: Vec<String> = v["error"]["missing"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|h| h.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                return Ok(CommitOutcome::BlobsMissing(missing));
+            }
+        }
         if status != 200 {
             return Err(Self::error_from(status, &text));
         }
         serde_json::from_str(&text)
+            .map(CommitOutcome::Committed)
             .map_err(|e| CloudError::Other(format!("bad commit response: {e}")))
     }
 
@@ -475,7 +511,11 @@ impl BackupApi {
         for (k, v) in &upload.headers {
             req = req.header(k.as_str(), v.as_str());
         }
-        let resp = req.send().await.context("upload")?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| e.without_url())
+            .context("upload")?;
         if !resp.status().is_success() {
             bail!("storage refused the upload ({})", resp.status());
         }
@@ -484,14 +524,27 @@ impl BackupApi {
 
     async fn get_to_file(&self, url: &str, dest: &Path, expected_sha256: &str) -> Result<()> {
         use tokio::io::AsyncWriteExt;
-        let mut resp = self.http.get(url).send().await.context("download")?;
+        let mut resp = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| e.without_url())
+            .context("download")?;
         if !resp.status().is_success() {
             bail!("storage refused the download ({})", resp.status());
         }
         if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let tmp = dest.with_extension("part");
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = dest
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
+        let tmp = dest.with_file_name(format!("{name}.part-{}-{nonce}", std::process::id()));
         let mut out = tokio::fs::File::create(&tmp).await?;
         let mut hasher = Sha256::new();
         while let Some(chunk) = resp.chunk().await? {
@@ -520,7 +573,16 @@ pub async fn run_backup(
     mut progress: impl FnMut(Progress),
 ) -> Result<BackupReport> {
     progress(Progress::Scanning);
-    let staging = std::env::temp_dir().join(format!("scriba-backup-{}", std::process::id()));
+    // Staged copies live under the user's own tree (hidden, 0700), never in
+    // a shared temp directory, and are removed whatever happens.
+    let staging = base.join(".backup-staging");
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(staging.clone());
     let local = {
         let base = base.to_path_buf();
         let staging = staging.clone();
@@ -528,9 +590,7 @@ pub async fn run_backup(
             .await
             .context("scan task")??
     };
-    let result = backup_scanned(api, &local, &mut progress).await;
-    let _ = std::fs::remove_dir_all(&staging);
-    result
+    backup_scanned(api, &local, &mut progress).await
 }
 
 async fn backup_scanned(
@@ -569,18 +629,19 @@ async fn backup_scanned(
                 )
             })
             .collect();
-        let mut transfers = futures_util::stream::iter(jobs.into_iter().map(|(path, source, size, upload)| {
-            let api = api.clone();
-            async move {
-                if let Some(upload) = upload {
-                    api.put_file(&upload, &source)
-                        .await
-                        .with_context(|| format!("upload {path}"))?;
+        let mut transfers =
+            futures_util::stream::iter(jobs.into_iter().map(|(path, source, size, upload)| {
+                let api = api.clone();
+                async move {
+                    if let Some(upload) = upload {
+                        api.put_file(&upload, &source)
+                            .await
+                            .with_context(|| format!("upload {path}"))?;
+                    }
+                    Ok::<u64, anyhow::Error>(size)
                 }
-                Ok::<u64, anyhow::Error>(size)
-            }
-        }))
-        .buffer_unordered(PARALLEL);
+            }))
+            .buffer_unordered(PARALLEL);
         while let Some(result) = transfers.next().await {
             let size = result?;
             done += 1;
@@ -595,10 +656,58 @@ async fn backup_scanned(
     }
 
     progress(Progress::Committing);
-    let entries: Vec<ManifestFile> = local.iter().map(|f| f.manifest_entry()).collect();
-    let manifest = api
-        .commit(remote.as_ref().map(|m| m.generation), &entries)
-        .await?;
+    // Additive: paths that exist only in the remote manifest (recordings
+    // from another machine, or deleted here) stay in the backup. "Delete
+    // cloud backup" is the way to shrink it.
+    let mut entries: Vec<ManifestFile> = local.iter().map(|f| f.manifest_entry()).collect();
+    if let Some(remote) = &remote {
+        let local_paths: std::collections::HashSet<&str> =
+            local.iter().map(|f| f.path.as_str()).collect();
+        entries.extend(
+            remote
+                .files
+                .iter()
+                .filter(|f| !local_paths.contains(f.path.as_str()))
+                .cloned(),
+        );
+    }
+    let expected = remote.as_ref().map(|m| m.generation);
+    let manifest = match api.commit(expected, &entries).await? {
+        CommitOutcome::Committed(m) => m,
+        CommitOutcome::BlobsMissing(missing) => {
+            // Storage lost blobs the previous manifest referenced: re-upload
+            // the ones we still have locally, then commit once more.
+            let have: Vec<&LocalFile> = local
+                .iter()
+                .filter(|f| missing.contains(&f.sha256))
+                .collect();
+            if have.len() < missing.len() {
+                return Err(anyhow::anyhow!(
+                    "the backup references {} file(s) that are missing from storage and not on this machine; delete the cloud backup and back up again",
+                    missing.len() - have.len()
+                ));
+            }
+            for chunk in have.chunks(BATCH) {
+                let wanted: Vec<ManifestFile> = chunk.iter().map(|f| f.manifest_entry()).collect();
+                let signed = api.uploads(&wanted).await?;
+                for upload in &signed {
+                    if let Some(file) = chunk.iter().find(|f| f.sha256 == upload.sha256) {
+                        api.put_file(upload, &file.source)
+                            .await
+                            .with_context(|| format!("re-upload {}", file.path))?;
+                    }
+                }
+            }
+            match api.commit(expected, &entries).await? {
+                CommitOutcome::Committed(m) => m,
+                CommitOutcome::BlobsMissing(_) => {
+                    return Err(anyhow::anyhow!(
+                        "storage still reports missing files after re-upload"
+                    ));
+                }
+            }
+        }
+    };
     Ok(BackupReport {
         manifest,
         uploaded: total,
@@ -651,16 +760,17 @@ pub async fn run_restore(
                 .ok_or_else(|| anyhow::anyhow!("no download for {}", file.path))?;
             jobs.push((file.path.clone(), dest, url, file.sha256.clone(), file.size));
         }
-        let mut transfers = futures_util::stream::iter(jobs.into_iter().map(|(path, dest, url, sha, size)| {
-            let api = api.clone();
-            async move {
-                api.get_to_file(&url, &dest, &sha)
-                    .await
-                    .with_context(|| format!("restore {path}"))?;
-                Ok::<u64, anyhow::Error>(size)
-            }
-        }))
-        .buffer_unordered(PARALLEL);
+        let mut transfers =
+            futures_util::stream::iter(jobs.into_iter().map(|(path, dest, url, sha, size)| {
+                let api = api.clone();
+                async move {
+                    api.get_to_file(&url, &dest, &sha)
+                        .await
+                        .with_context(|| format!("restore {path}"))?;
+                    Ok::<u64, anyhow::Error>(size)
+                }
+            }))
+            .buffer_unordered(PARALLEL);
         while let Some(result) = transfers.next().await {
             let size = result?;
             done += 1;
@@ -680,22 +790,32 @@ pub async fn run_restore(
     })
 }
 
-/// Where a manifest path is written during restore. Rejects anything that
-/// would escape `base` even if a hostile manifest tried.
+/// Where a manifest path is written during restore. Only the shapes a
+/// backup can contain are accepted: the four top-level files, and one
+/// plain file inside a recording directory. Anything else in a manifest,
+/// hidden files, SQLite sidecars, nested paths, is refused, so a tampered
+/// manifest cannot write where the restore never intended to.
 fn restore_destination(base: &Path, path: &str) -> Result<PathBuf> {
-    if path.is_empty()
-        || path.starts_with('/')
-        || path
-            .split('/')
-            .any(|seg| seg.is_empty() || seg == "." || seg == "..")
-        || path.contains('\\')
-    {
-        bail!("refusing to restore suspicious path {path:?}");
-    }
     let rel = match path {
         "scriba.db" => "scriba.db.restored".to_string(),
         "config.json" => "config.json.restored".to_string(),
-        other => other.to_string(),
+        "world.md" | "scriba_mcp.json" => path.to_string(),
+        other => {
+            let Some((dir, file)) = other.split_once('/') else {
+                bail!("refusing to restore unexpected file {path:?}");
+            };
+            if !is_recording_dir(dir)
+                || dir.contains('\\')
+                || file.is_empty()
+                || file.contains('/')
+                || file.contains('\\')
+                || skip_file(file)
+                || file.chars().any(char::is_control)
+            {
+                bail!("refusing to restore unexpected file {path:?}");
+            }
+            other.to_string()
+        }
     };
     Ok(base.join(rel))
 }
@@ -718,6 +838,16 @@ pub fn apply_restored(base: &Path, db: &mut Database, config: &mut ScribaConfig)
             serde_json::from_str(&text).context("the restored config does not parse")?;
         restored.enrichment.migrate_legacy();
         restored.cloud = config.cloud.clone();
+        // The backup carries no credentials; keep the ones this machine has.
+        if restored.stt_api_keys.is_empty() {
+            restored.stt_api_keys = config.stt_api_keys.clone();
+        }
+        if restored.enrichment.cloud_api_keys.is_empty() {
+            restored.enrichment.cloud_api_keys = config.enrichment.cloud_api_keys.clone();
+        }
+        if restored.last_api_key.is_none() {
+            restored.last_api_key = config.last_api_key.clone();
+        }
         *config = restored;
         config.save()?;
         let _ = std::fs::remove_file(&cfg_file);
@@ -860,7 +990,22 @@ mod tests {
             restore_destination(base, "2026-01-01_00-00-00_x/transcript.txt").unwrap(),
             base.join("2026-01-01_00-00-00_x/transcript.txt")
         );
-        for bad in ["../etc/passwd", "/abs", "a//b", "a/./b", "a\\b", ""] {
+        for bad in [
+            "../etc/passwd",
+            "/abs",
+            "a//b",
+            "a/./b",
+            "a\\b",
+            "",
+            ".secrets/cloud-session-x",
+            "scriba.db-wal",
+            "scriba.db.restored",
+            "models/big.onnx",
+            "2026-01-01_00-00-00_x/.hidden",
+            "2026-01-01_00-00-00_x/scriba.db-journal",
+            "2026-01-01_00-00-00_x/sub/file.txt",
+            "notarecording/transcript.txt",
+        ] {
             assert!(restore_destination(base, bad).is_err(), "{bad}");
         }
     }
