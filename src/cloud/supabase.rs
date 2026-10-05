@@ -466,7 +466,8 @@ mod tests {
         assert_eq!(u.audio_display(), "2 min");
         u.audio_seconds = 9000;
         assert_eq!(u.audio_display(), "2.5 h");
-        let parsed: UsageSummary = serde_json::from_str(r#"{"requests":1,"unmetered_bytes":5}"#).unwrap();
+        let parsed: UsageSummary =
+            serde_json::from_str(r#"{"requests":1,"unmetered_bytes":5}"#).unwrap();
         assert_eq!(parsed.requests, 1, "unknown fields are ignored");
     }
 

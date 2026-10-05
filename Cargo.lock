@@ -3609,6 +3609,7 @@ dependencies = [
  "textwrap 0.16.2",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-util",
  "unicode-width 0.1.14",
 ]
 

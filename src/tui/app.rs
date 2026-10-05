@@ -83,6 +83,11 @@ pub struct Dashboard {
     pub(super) cloud_session_task: Option<tokio::task::JoinHandle<Result<(), crate::cloud::CloudError>>>, // Access token refresh for the Pro proxy
     pub(super) cloud_session_checked: Option<std::time::Instant>, // Last time the Pro session was checked
     pub(super) cloud_usage: Option<crate::cloud::UsageSummary>, // This month's proxy usage, once fetched
+    pub(super) backup_task: Option<tokio::task::JoinHandle<Result<super::settings::BackupOutcome, anyhow::Error>>>, // Backup / delete in flight
+    pub(super) backup_progress_rx: Option<mpsc::Receiver<crate::cloud::backup::Progress>>, // Progress of the running backup
+    pub(super) backup_progress: Option<crate::cloud::backup::Progress>, // Latest progress, for the Backup row
+    pub(super) backup_error: Option<String>,          // Why the last backup failed, for the Backup row
+    pub(super) backup_pending: bool,                  // A backup was requested while one was running
     pub(super) return_to_view: Option<DashboardView>, // View to return to after message dismissal
     // File import dialog state
     pub(super) show_file_dialog: bool,
@@ -217,6 +222,11 @@ impl Dashboard {
             cloud_session_task: None,
             cloud_session_checked: None,
             cloud_usage: None,
+            backup_task: None,
+            backup_progress_rx: None,
+            backup_progress: None,
+            backup_error: None,
+            backup_pending: false,
             return_to_view: None,
             // File import dialog state
             show_file_dialog: false,
@@ -291,6 +301,7 @@ impl Dashboard {
         self.load_recordings()?;
         self.load_stats()?;
         crate::cloud::init(&self.config);
+        self.request_backup(false);
 
         // Spawn async update check (non-blocking, silent on failure)
         if self.config.check_for_updates {
@@ -483,6 +494,7 @@ impl Dashboard {
                         Ok(Ok(())) => {
                             let _ = self.load_recordings();
                             let _ = self.load_stats();
+                            self.request_backup(false);
                         }
                         Ok(Err(err)) => {
                             // The row now carries the failed state and reason.
@@ -706,6 +718,50 @@ impl Dashboard {
                         OnboardingTickResult::SaveWhisperKey(key) => {
                             self.config.transcription = self.config.api_mode_with_key(key);
                             let _ = self.config.save();
+                        }
+                        OnboardingTickResult::RestoreFinished(result) => {
+                            let outcome = result.and_then(|report| {
+                                crate::cloud::backup::apply_restored(
+                                    &crate::utils::BASE_PATH,
+                                    &mut self.db,
+                                    &mut self.config,
+                                )
+                                .map(|_| report)
+                                .map_err(|e| format!("{e:#}"))
+                            });
+                            if let Some(ob) = self.onboarding.as_mut() {
+                                ob.anim_frame = 0;
+                                match outcome {
+                                    Ok(report) => {
+                                        self.config.cloud.last_backup_at = Some(chrono::Utc::now().to_rfc3339());
+                                        self.config.cloud.backup_enabled = true;
+                                        let _ = self.config.save();
+                                        ob.step = OnboardingStep::Done;
+                                        ob.set_step_text(
+                                            &format!(
+                                                "Your Scriba is back.\n\n\
+                                                 {} recordings and everything Scriba knew\n\
+                                                 are on this computer again, and backups\n\
+                                                 stay on.\n\n\
+                                                 Let's go.",
+                                                report.recordings
+                                            ),
+                                            true,
+                                        );
+                                    }
+                                    Err(e) => {
+                                        ob.step = OnboardingStep::AskName;
+                                        ob.set_step_text(
+                                            &format!(
+                                                "The restore did not finish: {e}\n\
+                                                 You can try again later with `scriba restore`.\n\n\
+                                                 What's your name?"
+                                            ),
+                                            true,
+                                        );
+                                    }
+                                }
+                            }
                         }
                         OnboardingTickResult::CloudEvent(event) => {
                             crate::cloud::apply_event(&mut self.config, &event);
